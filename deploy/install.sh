@@ -28,6 +28,7 @@ SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${SERVER_PORT:-8080}"
 FORCE_YES="${FORCE_YES:-false}"
 PURGE_CONFIG="${PURGE_CONFIG:-false}"
+SERVER_CONFIGURED="${SERVER_CONFIGURED:-false}"
 
 OS=""
 ARCH=""
@@ -57,6 +58,55 @@ print_error() {
     echo -e "${RED}[ERROR]${NC} $*" >&2
 }
 
+is_interactive() {
+    [ -e /dev/tty ] && [ -r /dev/tty ] && [ -w /dev/tty ]
+}
+
+validate_port() {
+    local port="$1"
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
+        return 0
+    fi
+    return 1
+}
+
+configure_server() {
+    if [ "$SERVER_CONFIGURED" = "true" ]; then
+        print_info "Server listen address: ${SERVER_HOST}:${SERVER_PORT}"
+        return 0
+    fi
+
+    if ! is_interactive; then
+        print_info "Server listen address: ${SERVER_HOST}:${SERVER_PORT}"
+        return 0
+    fi
+
+    echo ""
+    echo -e "${BLUE}Server configuration${NC}"
+    echo "0.0.0.0 listens on all network interfaces; 127.0.0.1 only listens locally."
+
+    local input_host=""
+    read -r -p "Server listen address [${SERVER_HOST}]: " input_host < /dev/tty
+    if [ -n "$input_host" ]; then
+        SERVER_HOST="$input_host"
+    fi
+
+    local input_port=""
+    while true; do
+        read -r -p "Server port [${SERVER_PORT}]: " input_port < /dev/tty
+        if [ -z "$input_port" ]; then
+            break
+        fi
+        if validate_port "$input_port"; then
+            SERVER_PORT="$input_port"
+            break
+        fi
+        print_error "Invalid port. Enter a number from 1 to 65535."
+    done
+
+    print_info "Server listen address: ${SERVER_HOST}:${SERVER_PORT}"
+}
+
 usage() {
     cat <<EOF
 Usage: $0 [install|upgrade|uninstall] [options]
@@ -70,6 +120,8 @@ Options:
   -y, --yes           Skip uninstall confirmation
   --purge             Also remove ${CONFIG_DIR}
   -v, --version VER   Install Pixel version, default ${PIXEL_VERSION}
+  --host HOST         Server listen address, default ${SERVER_HOST}
+  --port PORT         Server port, default ${SERVER_PORT}
 
 Environment overrides:
   RELEASE_REPO=${RELEASE_REPO}
@@ -294,6 +346,7 @@ do_install() {
     check_root
     detect_platform
     check_dependencies
+    configure_server
     download_and_extract
     create_user_if_needed
     install_files
@@ -360,6 +413,42 @@ main() {
                 PIXEL_VERSION="${2#v}"
                 RELEASE_TAG="v${PIXEL_VERSION}-pixel"
                 shift 2
+                ;;
+            --host)
+                if [ -z "${2:-}" ]; then
+                    print_error "--host requires a value"
+                    exit 1
+                fi
+                SERVER_HOST="$2"
+                SERVER_CONFIGURED="true"
+                shift 2
+                ;;
+            --host=*)
+                SERVER_HOST="${1#*=}"
+                SERVER_CONFIGURED="true"
+                shift
+                ;;
+            --port)
+                if [ -z "${2:-}" ]; then
+                    print_error "--port requires a value"
+                    exit 1
+                fi
+                if ! validate_port "$2"; then
+                    print_error "Invalid port. Enter a number from 1 to 65535."
+                    exit 1
+                fi
+                SERVER_PORT="$2"
+                SERVER_CONFIGURED="true"
+                shift 2
+                ;;
+            --port=*)
+                SERVER_PORT="${1#*=}"
+                if ! validate_port "$SERVER_PORT"; then
+                    print_error "Invalid port. Enter a number from 1 to 65535."
+                    exit 1
+                fi
+                SERVER_CONFIGURED="true"
+                shift
                 ;;
             --version=*)
                 PIXEL_VERSION="${1#*=}"
