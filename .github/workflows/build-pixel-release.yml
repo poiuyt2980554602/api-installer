@@ -66,7 +66,8 @@ jobs:
           mkdir -p dist
           for arch in amd64 arm64; do
             out="package-${arch}"
-            mkdir -p "$out"
+            agent_out="subsite-agent-package-${arch}"
+            mkdir -p "$out" "$agent_out"
             (
               cd pixel-src/backend
               GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
@@ -75,11 +76,23 @@ jobs:
                 -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=release" \
                 -o "../../${out}/sub2api" \
                 ./cmd/server
+              GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
+                -trimpath \
+                -ldflags="-s -w" \
+                -o "../../${agent_out}/sub2api-subsite-agent" \
+                ./cmd/subsite-agent
             )
             cp -R pixel-src/deploy "$out/deploy"
             cp pixel-src/README.md "$out/README.md"
             cp pixel-src/LICENSE "$out/LICENSE"
             tar -C "$out" -czf "dist/sub2api_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
+
+            mkdir -p "$agent_out/deploy"
+            cp pixel-src/deploy/sub2api-subsite-agent.service "$agent_out/deploy/sub2api-subsite-agent.service"
+            cp pixel-src/deploy/subsite-agent.env.example "$agent_out/deploy/subsite-agent.env.example"
+            cp pixel-src/README.md "$agent_out/README.md"
+            cp pixel-src/LICENSE "$agent_out/LICENSE"
+            tar -C "$agent_out" -czf "dist/sub2api-subsite-agent_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
           done
           (
             cd dist
