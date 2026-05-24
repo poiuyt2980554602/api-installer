@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 #
-# Pixel 1.0.12 installer for Sub2API-compatible deployment
+# Fast installer for Pixel-built Sub2API binaries.
 # Usage:
-#   curl -sSL <your-raw-install-sh-url> | sudo bash
-#   curl -sSL <your-raw-install-sh-url> | sudo env PIXEL_VERSION=1.0.12 bash
+#   curl -sSL https://raw.githubusercontent.com/poiuyt2980554602/api-installer/main/deploy/install.sh | sudo bash
 #
 
 set -euo pipefail
@@ -14,21 +13,16 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
+RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.12}"
+RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
+
 APP_NAME="sub2api"
 SERVICE_NAME="sub2api"
 SERVICE_USER="sub2api"
 INSTALL_DIR="/opt/sub2api"
 CONFIG_DIR="/etc/sub2api"
 SERVICE_FILE="/etc/systemd/system/sub2api.service"
-
-PIXEL_REPO="${PIXEL_REPO:-Pixel-API/Pixel}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.12}"
-PIXEL_TARBALL_URL="${PIXEL_TARBALL_URL:-https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_VERSION}.tar.gz}"
-
-GO_MIN_VERSION="${GO_MIN_VERSION:-1.26.2}"
-GO_INSTALL_VERSION="${GO_INSTALL_VERSION:-1.26.3}"
-NODE_INSTALL_VERSION="${NODE_INSTALL_VERSION:-24.16.0}"
-PNPM_INSTALL_VERSION="${PNPM_INSTALL_VERSION:-9.0.0}"
 
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${SERVER_PORT:-8080}"
@@ -37,8 +31,6 @@ PURGE_CONFIG="${PURGE_CONFIG:-false}"
 
 OS=""
 ARCH=""
-NODE_ARCH=""
-PKG_MANAGER=""
 TMP_DIR=""
 PUBLIC_IP=""
 
@@ -50,15 +42,15 @@ cleanup() {
 trap cleanup EXIT
 
 print_info() {
-    echo -e "${BLUE}[INFO]${NC} $*" >&2
+    echo -e "${BLUE}[INFO]${NC} $*"
 }
 
 print_success() {
-    echo -e "${GREEN}[OK]${NC} $*" >&2
+    echo -e "${GREEN}[OK]${NC} $*"
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $*" >&2
+    echo -e "${YELLOW}[WARN]${NC} $*"
 }
 
 print_error() {
@@ -70,18 +62,18 @@ usage() {
 Usage: $0 [install|upgrade|uninstall] [options]
 
 Commands:
-  install      Download, build, and install Pixel ${PIXEL_VERSION} (default)
+  install      Install Pixel ${PIXEL_VERSION} binary release (default)
   upgrade      Same as install
-  uninstall    Remove installed service and files
+  uninstall    Remove service and installed files
 
 Options:
   -y, --yes           Skip uninstall confirmation
   --purge             Also remove ${CONFIG_DIR}
-  -v, --version VER   Override Pixel version (default: ${PIXEL_VERSION})
+  -v, --version VER   Install Pixel version, default ${PIXEL_VERSION}
 
 Environment overrides:
-  PIXEL_VERSION=${PIXEL_VERSION}
-  PIXEL_TARBALL_URL=${PIXEL_TARBALL_URL}
+  RELEASE_REPO=${RELEASE_REPO}
+  RELEASE_TAG=${RELEASE_TAG}
   SERVER_HOST=${SERVER_HOST}
   SERVER_PORT=${SERVER_PORT}
 EOF
@@ -89,17 +81,13 @@ EOF
 
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
-        print_error "Please run this installer as root."
+        print_error "Please run as root, for example with sudo."
         exit 1
     fi
 }
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
-}
-
-version_ge() {
-    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n1)" = "$2" ]
 }
 
 detect_platform() {
@@ -115,11 +103,9 @@ detect_platform() {
     case "$(uname -m)" in
         x86_64|amd64)
             ARCH="amd64"
-            NODE_ARCH="x64"
             ;;
         aarch64|arm64)
             ARCH="arm64"
-            NODE_ARCH="arm64"
             ;;
         *)
             print_error "Unsupported architecture: $(uname -m)"
@@ -127,57 +113,11 @@ detect_platform() {
             ;;
     esac
 
-    print_info "Detected platform: ${OS}/${ARCH}"
+    print_info "Detected platform: ${OS}_${ARCH}"
 }
 
-detect_package_manager() {
-    for candidate in apt-get dnf yum zypper pacman apk; do
-        if command_exists "$candidate"; then
-            PKG_MANAGER="$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
-install_packages() {
-    if [ "$#" -eq 0 ]; then
-        return 0
-    fi
-
-    if ! detect_package_manager; then
-        print_error "No supported package manager found. Please install missing dependencies manually: $*"
-        exit 1
-    fi
-
-    print_info "Installing build dependencies with ${PKG_MANAGER}..."
-
-    case "$PKG_MANAGER" in
-        apt-get)
-            apt-get update
-            DEBIAN_FRONTEND=noninteractive apt-get install -y "$@"
-            ;;
-        dnf)
-            dnf install -y "$@"
-            ;;
-        yum)
-            yum install -y "$@"
-            ;;
-        zypper)
-            zypper --non-interactive install "$@"
-            ;;
-        pacman)
-            pacman -Sy --noconfirm "$@"
-            ;;
-        apk)
-            apk add --no-cache "$@"
-            ;;
-    esac
-}
-
-ensure_base_dependencies() {
+check_dependencies() {
     local missing=()
-    local packages=()
 
     for cmd in curl tar; do
         if ! command_exists "$cmd"; then
@@ -185,169 +125,54 @@ ensure_base_dependencies() {
         fi
     done
 
-    if ! command_exists xz && ! command_exists unxz; then
-        missing+=("xz")
+    if [ "${#missing[@]}" -gt 0 ]; then
+        print_error "Missing dependencies: ${missing[*]}"
+        print_info "Please install them first, then rerun this installer."
+        exit 1
     fi
-
-    if [ "${#missing[@]}" -eq 0 ]; then
-        return 0
-    fi
-
-    print_warning "Missing base dependencies: ${missing[*]}"
-
-    case "${PKG_MANAGER:-}" in
-        apt-get) packages=(curl tar xz-utils ca-certificates) ;;
-        dnf|yum) packages=(curl tar xz ca-certificates) ;;
-        zypper) packages=(curl tar xz ca-certificates) ;;
-        pacman) packages=(curl tar xz ca-certificates) ;;
-        apk) packages=(curl tar xz ca-certificates) ;;
-        *)
-            detect_package_manager || true
-            ;;
-    esac
-
-    install_packages "${packages[@]}"
 }
 
-ensure_build_toolchain_packages() {
-    case "${PKG_MANAGER:-}" in
-        apt-get)
-            install_packages build-essential git python3 xz-utils ca-certificates
-            ;;
-        dnf|yum)
-            install_packages gcc gcc-c++ make git python3 xz ca-certificates
-            ;;
-        zypper)
-            install_packages gcc gcc-c++ make git python3 xz ca-certificates
-            ;;
-        pacman)
-            install_packages base-devel git python python-pip xz ca-certificates
-            ;;
-        apk)
-            install_packages build-base git python3 xz ca-certificates
-            ;;
-        *)
-            print_warning "Skipping package-manager based toolchain install."
-            ;;
-    esac
-}
+download_and_extract() {
+    local version_num="${PIXEL_VERSION#v}"
+    local archive_name="sub2api_${version_num}_${OS}_${ARCH}.tar.gz"
+    local base_url="https://github.com/${RELEASE_REPO}/releases/download/${RELEASE_TAG}"
+    local download_url="${base_url}/${archive_name}"
+    local checksum_url="${base_url}/checksums.txt"
 
-current_go_version() {
-    if ! command_exists go; then
-        return 1
-    fi
-    go version | awk '{print $3}' | sed 's/^go//'
-}
-
-ensure_go() {
-    local current=""
-    current="$(current_go_version || true)"
-
-    if [ -n "$current" ] && version_ge "$current" "$GO_MIN_VERSION"; then
-        print_info "Using existing Go ${current}"
-    else
-        print_info "Installing Go ${GO_INSTALL_VERSION}..."
-        local archive="go${GO_INSTALL_VERSION}.linux-${ARCH}.tar.gz"
-        local url="https://go.dev/dl/${archive}"
-
-        TMP_DIR="$(mktemp -d)"
-        curl -fsSL "$url" -o "$TMP_DIR/$archive"
-        rm -rf /usr/local/go
-        tar -C /usr/local -xzf "$TMP_DIR/$archive"
-        ln -sf /usr/local/go/bin/go /usr/local/bin/go
-        ln -sf /usr/local/go/bin/gofmt /usr/local/bin/gofmt
-        print_success "Installed Go ${GO_INSTALL_VERSION}"
-    fi
-
-    export PATH="/usr/local/go/bin:${PATH}"
-}
-
-current_node_major() {
-    if ! command_exists node; then
-        return 1
-    fi
-    node -p "process.versions.node.split('.')[0]"
-}
-
-ensure_node_and_pnpm() {
-    local node_major=""
-    node_major="$(current_node_major || true)"
-
-    if [ -n "$node_major" ] && [ "$node_major" -ge 20 ]; then
-        print_info "Using existing Node.js $(node -v)"
-    else
-        print_info "Installing Node.js v${NODE_INSTALL_VERSION}..."
-        local archive="node-v${NODE_INSTALL_VERSION}-linux-${NODE_ARCH}.tar.xz"
-        local url="https://nodejs.org/dist/v${NODE_INSTALL_VERSION}/${archive}"
-
-        TMP_DIR="$(mktemp -d)"
-        curl -fsSL "$url" -o "$TMP_DIR/$archive"
-        rm -rf /usr/local/lib/nodejs
-        mkdir -p /usr/local/lib/nodejs
-        tar -C /usr/local/lib/nodejs -xf "$TMP_DIR/$archive"
-
-        local node_root="/usr/local/lib/nodejs/node-v${NODE_INSTALL_VERSION}-linux-${NODE_ARCH}"
-        ln -sf "${node_root}/bin/node" /usr/local/bin/node
-        ln -sf "${node_root}/bin/npm" /usr/local/bin/npm
-        ln -sf "${node_root}/bin/npx" /usr/local/bin/npx
-        ln -sf "${node_root}/bin/corepack" /usr/local/bin/corepack
-        print_success "Installed Node.js v${NODE_INSTALL_VERSION}"
-    fi
-
-    corepack enable
-    corepack prepare "pnpm@${PNPM_INSTALL_VERSION}" --activate
-    print_info "Using pnpm $(pnpm --version)"
-}
-
-download_source() {
     TMP_DIR="$(mktemp -d)"
-    local tarball="${TMP_DIR}/pixel.tar.gz"
-    local src_dir="${TMP_DIR}/src"
 
-    print_info "Downloading Pixel source: ${PIXEL_TARBALL_URL}"
-    curl -fsSL "${PIXEL_TARBALL_URL}" -o "$tarball" >&2
-
-    mkdir -p "$src_dir"
-    tar -xzf "$tarball" -C "$src_dir" --strip-components=1
-    echo "$src_dir"
-}
-
-build_pixel() {
-    local src_dir="$1"
-    local build_dir="${src_dir}/build"
-    local frontend_dir="${src_dir}/frontend"
-    local backend_dir="${src_dir}/backend"
-
-    mkdir -p "$build_dir"
-
-    print_info "Installing frontend dependencies..."
-    pnpm --dir "$frontend_dir" install --frozen-lockfile >&2
-
-    print_info "Building embedded frontend..."
-    pnpm --dir "$frontend_dir" run build >&2
-
-    if [ ! -f "${backend_dir}/internal/web/dist/index.html" ]; then
-        print_error "Frontend build completed but embedded dist/index.html was not generated."
+    print_info "Downloading ${archive_name}..."
+    if ! curl -fL "$download_url" -o "${TMP_DIR}/${archive_name}"; then
+        print_error "Download failed: ${download_url}"
+        print_error "The release asset may not be built yet. Check https://github.com/${RELEASE_REPO}/releases/tag/${RELEASE_TAG}"
         exit 1
     fi
 
-    print_info "Building backend binary..."
-    (
-        cd "$backend_dir"
-        CGO_ENABLED=0 go build \
-            -tags=embed \
-            -trimpath \
-            -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=source" \
-            -o "${build_dir}/${APP_NAME}" \
-            ./cmd/server >&2
-    )
+    if command_exists sha256sum; then
+        print_info "Verifying checksum..."
+        if curl -fsL "$checksum_url" -o "${TMP_DIR}/checksums.txt"; then
+            local expected
+            local actual
+            expected="$(grep " ${archive_name}$" "${TMP_DIR}/checksums.txt" | awk '{print $1}')"
+            actual="$(sha256sum "${TMP_DIR}/${archive_name}" | awk '{print $1}')"
 
-    if [ ! -f "${build_dir}/${APP_NAME}" ]; then
-        print_error "Backend build failed: binary not found."
-        exit 1
+            if [ -z "$expected" ]; then
+                print_warning "No checksum entry found for ${archive_name}; skipping checksum verification."
+            elif [ "$expected" != "$actual" ]; then
+                print_error "Checksum verification failed."
+                print_error "Expected: $expected"
+                print_error "Actual:   $actual"
+                exit 1
+            else
+                print_success "Checksum verified"
+            fi
+        else
+            print_warning "checksums.txt not found; skipping checksum verification."
+        fi
     fi
 
-    echo "${build_dir}/${APP_NAME}"
+    print_info "Extracting..."
+    tar -xzf "${TMP_DIR}/${archive_name}" -C "$TMP_DIR"
 }
 
 create_user_if_needed() {
@@ -361,35 +186,31 @@ create_user_if_needed() {
 }
 
 install_files() {
-    local src_dir="$1"
-    local binary_path="$2"
-
-    mkdir -p "$INSTALL_DIR" "$INSTALL_DIR/data" "$CONFIG_DIR"
+    mkdir -p "$INSTALL_DIR" "${INSTALL_DIR}/data" "$CONFIG_DIR"
 
     if [ -f "${INSTALL_DIR}/${APP_NAME}" ]; then
         cp "${INSTALL_DIR}/${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}.backup.$(date +%Y%m%d%H%M%S)"
     fi
 
-    install -m 0755 "$binary_path" "${INSTALL_DIR}/${APP_NAME}"
+    install -m 0755 "${TMP_DIR}/${APP_NAME}" "${INSTALL_DIR}/${APP_NAME}"
 
-    if [ -f "${src_dir}/deploy/config.example.yaml" ]; then
-        install -m 0644 "${src_dir}/deploy/config.example.yaml" "${CONFIG_DIR}/config.example.yaml"
-    fi
-
-    if [ -d "${src_dir}/deploy" ]; then
+    if [ -d "${TMP_DIR}/deploy" ]; then
         mkdir -p "${INSTALL_DIR}/deploy"
-        cp -R "${src_dir}/deploy/." "${INSTALL_DIR}/deploy/"
+        cp -R "${TMP_DIR}/deploy/." "${INSTALL_DIR}/deploy/"
+        if [ -f "${TMP_DIR}/deploy/config.example.yaml" ]; then
+            install -m 0644 "${TMP_DIR}/deploy/config.example.yaml" "${CONFIG_DIR}/config.example.yaml"
+        fi
     fi
 
     chown -R "${SERVICE_USER}:${SERVICE_USER}" "$INSTALL_DIR" "$CONFIG_DIR"
-    print_success "Installed files to ${INSTALL_DIR}"
+    print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
 install_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
 Description=Sub2API (Pixel ${PIXEL_VERSION})
-Documentation=https://github.com/${PIXEL_REPO}
+Documentation=https://github.com/Pixel-API/Pixel
 After=network.target postgresql.service redis.service
 Wants=postgresql.service redis.service
 
@@ -420,7 +241,7 @@ EOF
 
     systemctl daemon-reload
     systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
-    print_success "Installed systemd service ${SERVICE_FILE}"
+    print_success "systemd service installed"
 }
 
 get_public_ip() {
@@ -466,28 +287,16 @@ Useful commands:
   systemctl status ${SERVICE_NAME}
   journalctl -u ${SERVICE_NAME} -f
   systemctl restart ${SERVICE_NAME}
-
-If this is the first install, complete the web setup wizard to write config.yaml.
 EOF
 }
 
 do_install() {
     check_root
     detect_platform
-    detect_package_manager || true
-    ensure_base_dependencies
-    ensure_build_toolchain_packages
-    ensure_go
-    ensure_node_and_pnpm
-
-    local src_dir
-    local binary_path
-
-    src_dir="$(download_source)"
-    binary_path="$(build_pixel "$src_dir")"
-
+    check_dependencies
+    download_and_extract
     create_user_if_needed
-    install_files "$src_dir" "$binary_path"
+    install_files
     install_service
     start_service
     print_completion
@@ -511,7 +320,6 @@ do_uninstall() {
     systemctl disable "$SERVICE_NAME" 2>/dev/null || true
     rm -f "$SERVICE_FILE"
     systemctl daemon-reload
-
     rm -rf "$INSTALL_DIR"
 
     if id "$SERVICE_USER" >/dev/null 2>&1; then
@@ -550,13 +358,13 @@ main() {
                     exit 1
                 fi
                 PIXEL_VERSION="${2#v}"
-                PIXEL_TARBALL_URL="https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_VERSION}.tar.gz"
+                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
                 shift 2
                 ;;
             --version=*)
                 PIXEL_VERSION="${1#*=}"
                 PIXEL_VERSION="${PIXEL_VERSION#v}"
-                PIXEL_TARBALL_URL="https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_VERSION}.tar.gz"
+                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
                 shift
                 ;;
             -h|--help)
@@ -572,7 +380,6 @@ main() {
     done
 
     PIXEL_VERSION="${PIXEL_VERSION#v}"
-    PIXEL_TARBALL_URL="${PIXEL_TARBALL_URL:-https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_VERSION}.tar.gz}"
 
     case "$command" in
         install|upgrade)
