@@ -50,15 +50,15 @@ cleanup() {
 trap cleanup EXIT
 
 print_info() {
-    echo -e "${BLUE}[INFO]${NC} $*"
+    echo -e "${BLUE}[INFO]${NC} $*" >&2
 }
 
 print_success() {
-    echo -e "${GREEN}[OK]${NC} $*"
+    echo -e "${GREEN}[OK]${NC} $*" >&2
 }
 
 print_warning() {
-    echo -e "${YELLOW}[WARN]${NC} $*"
+    echo -e "${YELLOW}[WARN]${NC} $*" >&2
 }
 
 print_error() {
@@ -305,7 +305,7 @@ download_source() {
     local src_dir="${TMP_DIR}/src"
 
     print_info "Downloading Pixel source: ${PIXEL_TARBALL_URL}"
-    curl -fsSL "${PIXEL_TARBALL_URL}" -o "$tarball"
+    curl -fsSL "${PIXEL_TARBALL_URL}" -o "$tarball" >&2
 
     mkdir -p "$src_dir"
     tar -xzf "$tarball" -C "$src_dir" --strip-components=1
@@ -321,10 +321,10 @@ build_pixel() {
     mkdir -p "$build_dir"
 
     print_info "Installing frontend dependencies..."
-    pnpm --dir "$frontend_dir" install --frozen-lockfile
+    pnpm --dir "$frontend_dir" install --frozen-lockfile >&2
 
     print_info "Building embedded frontend..."
-    pnpm --dir "$frontend_dir" run build
+    pnpm --dir "$frontend_dir" run build >&2
 
     if [ ! -f "${backend_dir}/internal/web/dist/index.html" ]; then
         print_error "Frontend build completed but embedded dist/index.html was not generated."
@@ -339,7 +339,7 @@ build_pixel() {
             -trimpath \
             -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=source" \
             -o "${build_dir}/${APP_NAME}" \
-            ./cmd/server
+            ./cmd/server >&2
     )
 
     if [ ! -f "${build_dir}/${APP_NAME}" ]; then
