@@ -15,7 +15,7 @@ NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
 PIXEL_VERSION="${PIXEL_VERSION:-1.0.12}"
-RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
+RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api-subsite-agent"
 SERVICE_NAME="sub2api-subsite-agent"
@@ -338,13 +338,13 @@ main() {
                     exit 1
                 fi
                 PIXEL_VERSION="${2#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
                 shift 2
                 ;;
             --version=*)
                 PIXEL_VERSION="${1#*=}"
                 PIXEL_VERSION="${PIXEL_VERSION#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
                 shift
                 ;;
             -h|--help)

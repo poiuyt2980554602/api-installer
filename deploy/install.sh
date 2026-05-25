@@ -15,7 +15,7 @@ NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
 PIXEL_VERSION="${PIXEL_VERSION:-1.0.12}"
-RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
+RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api"
 SERVICE_NAME="sub2api"
@@ -142,6 +142,23 @@ command_exists() {
     command -v "$1" >/dev/null 2>&1
 }
 
+binary_contains() {
+    local file="$1"
+    local pattern="$2"
+
+    if command_exists grep; then
+        grep -a -q "$pattern" "$file" 2>/dev/null
+        return $?
+    fi
+
+    if command_exists strings; then
+        strings "$file" | grep -q "$pattern" 2>/dev/null
+        return $?
+    fi
+
+    return 2
+}
+
 detect_platform() {
     OS="$(uname -s | tr '[:upper:]' '[:lower:]')"
     case "$OS" in
@@ -258,6 +275,19 @@ install_files() {
     print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
+verify_forwarder_binary() {
+    local binary_path="${INSTALL_DIR}/${APP_NAME}"
+
+    if binary_contains "$binary_path" "SUBSITE_FORWARD"; then
+        print_success "Forwarder patch marker found in installed binary"
+        return 0
+    fi
+
+    print_warning "Forwarder patch marker was not found in ${binary_path}."
+    print_warning "This binary may still be the original Pixel ${PIXEL_VERSION} build without the subsite forwarder and lease-delete SQL fix."
+    print_warning "Expected release: https://github.com/${RELEASE_REPO}/releases/tag/${RELEASE_TAG}"
+}
+
 install_service() {
     cat > "$SERVICE_FILE" <<EOF
 [Unit]
@@ -350,6 +380,7 @@ do_install() {
     download_and_extract
     create_user_if_needed
     install_files
+    verify_forwarder_binary
     install_service
     start_service
     print_completion
@@ -411,7 +442,7 @@ main() {
                     exit 1
                 fi
                 PIXEL_VERSION="${2#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
                 shift 2
                 ;;
             --host)
@@ -453,7 +484,7 @@ main() {
             --version=*)
                 PIXEL_VERSION="${1#*=}"
                 PIXEL_VERSION="${PIXEL_VERSION#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
                 shift
                 ;;
             -h|--help)

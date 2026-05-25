@@ -111,10 +111,10 @@ jobs:
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ env.PIXEL_VERSION }}-pixel
-          name: Pixel ${{ env.PIXEL_VERSION }} Sub2API binaries
+          tag_name: v${{ env.PIXEL_VERSION }}-forwarder-pixel
+          name: Pixel ${{ env.PIXEL_VERSION }} Sub2API forwarder binaries
           body: |
-            Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel tag `${{ env.PIXEL_VERSION }}`.
+            Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel tag `${{ env.PIXEL_VERSION }}` with the subsite forwarder patch.
 
             Install:
             ```bash

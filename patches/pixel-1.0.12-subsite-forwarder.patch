@@ -46,6 +46,7 @@ index 0000000..9148ce4
 +	"encoding/json"
 +	"errors"
 +	"fmt"
++	"bytes"
 +	"io"
 +	"math/rand"
 +	"net"
@@ -114,7 +115,7 @@ index 0000000..9148ce4
 +		writeSubsiteForwardError(c, http.StatusBadRequest, "SUBSITE_FORWARD_BODY", err.Error())
 +		return true
 +	}
-+	c.Request.Body = io.NopCloser(strings.NewReader(string(body)))
++	c.Request.Body = io.NopCloser(bytes.NewReader(body))
 +
 +	key := f.affinityKey(c, body)
 +	candidate, reason, err := f.selectSubsite(c.Request.Context(), key)
@@ -186,7 +187,7 @@ index 0000000..9148ce4
 +	if err != nil {
 +		return err
 +	}
-+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, strings.NewReader(string(body)))
++	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, bytes.NewReader(body))
 +	if err != nil {
 +		return err
 +	}
