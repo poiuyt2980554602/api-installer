@@ -10,6 +10,7 @@ on:
   push:
     tags:
       - "v*-pixel"
+      - "v*-forwarder-pixel"
 
 permissions:
   contents: write
@@ -28,6 +29,7 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
+          version="${version%-forwarder-pixel}"
           version="${version%-pixel}"
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
 
