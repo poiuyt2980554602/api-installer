@@ -37,6 +37,13 @@ jobs:
           mkdir pixel-src
           tar -xzf pixel.tar.gz -C pixel-src --strip-components=1
 
+      - name: Apply Pixel compatibility patches
+        run: |
+          set -euo pipefail
+          if [ "${PIXEL_VERSION}" = "1.0.12" ]; then
+            git apply --directory=pixel-src patches/pixel-1.0.12-subsite-forwarder.patch
+          fi
+
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
         with:

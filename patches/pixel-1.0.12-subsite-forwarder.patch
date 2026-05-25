@@ -1,0 +1,674 @@
+diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
+index 55c03b8..44c98e1 100644
+--- a/backend/cmd/server/wire_gen.go
++++ b/backend/cmd/server/wire_gen.go
+@@ -267,6 +267,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
+ 	gatewayHandler := handler.NewGatewayHandler(gatewayService, geminiMessagesCompatService, antigravityGatewayService, userService, concurrencyService, billingCacheService, usageService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, userMessageQueueService, configConfig, settingService)
+ 	openAIGatewayHandler := handler.NewOpenAIGatewayHandler(openAIGatewayService, concurrencyService, billingCacheService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, configConfig)
++	subsiteForwarder := handler.NewSubsiteForwarder(subsiteService)
+ 	handlerSettingHandler := handler.ProvideSettingHandler(settingService, buildInfo)
+ 	totpHandler := handler.NewTotpHandler(totpService)
+ 	handlerPaymentHandler := handler.NewPaymentHandler(paymentService, paymentConfigService, channelService)
+@@ -283,7 +284,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	shopHandler := handler.NewShopHandler(shopService)
+ 	idempotencyCoordinator := service.ProvideIdempotencyCoordinator(idempotencyRepository, configConfig)
+ 	idempotencyCleanupService := service.ProvideIdempotencyCleanupService(idempotencyRepository, configConfig)
+-	handlers := handler.ProvideHandlers(authHandler, userHandler, apiKeyHandler, userAccountHandler, usageHandler, redeemHandler, subscriptionHandler, announcementHandler, channelMonitorUserHandler, adminHandlers, gatewayHandler, openAIGatewayHandler, handlerSettingHandler, totpHandler, handlerPaymentHandler, paymentWebhookHandler, availableChannelHandler, subsiteInternalHandler, receiptCodeHandler, handlerWithdrawalHandler, shopHandler, idempotencyCoordinator, idempotencyCleanupService)
++	handlers := handler.ProvideHandlers(authHandler, userHandler, apiKeyHandler, userAccountHandler, usageHandler, redeemHandler, subscriptionHandler, announcementHandler, channelMonitorUserHandler, adminHandlers, gatewayHandler, openAIGatewayHandler, subsiteForwarder, handlerSettingHandler, totpHandler, handlerPaymentHandler, paymentWebhookHandler, availableChannelHandler, subsiteInternalHandler, receiptCodeHandler, handlerWithdrawalHandler, shopHandler, idempotencyCoordinator, idempotencyCleanupService)
+ 	jwtAuthMiddleware := middleware.NewJWTAuthMiddleware(authService, userService)
+ 	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
+ 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
+diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
+index b723365..0c77fd2 100644
+--- a/backend/internal/handler/handler.go
++++ b/backend/internal/handler/handler.go
+@@ -57,6 +57,7 @@ type Handlers struct {
+ 	Admin            *AdminHandlers
+ 	Gateway          *GatewayHandler
+ 	OpenAIGateway    *OpenAIGatewayHandler
++	SubsiteForwarder *SubsiteForwarder
+ 	Setting          *SettingHandler
+ 	Totp             *TotpHandler
+ 	Payment          *PaymentHandler
+diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
+new file mode 100644
+index 0000000..9148ce4
+--- /dev/null
++++ b/backend/internal/handler/subsite_forwarder.go
+@@ -0,0 +1,361 @@
++package handler
++
++import (
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"math/rand"
++	"net"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++)
++
++const (
++	subsiteForwardAffinityTTL     = 12 * time.Hour
++	subsiteForwardMaxBodyBytes    = 64 << 20
++	subsiteForwardHeader          = "X-Sub2API-Master-Forwarded"
++	subsiteForwardTargetHeader    = "X-Sub2API-Forward-Target"
++	subsiteForwardAffinityHeader  = "X-Sub2API-Forward-Affinity"
++	subsiteForwardReasonHeader    = "X-Sub2API-Forward-Reason"
++	subsiteForwardNoCandidateCode = "SUBSITE_FORWARD_NO_CANDIDATE"
++)
++
++var errSubsiteForwardNoCandidate = errors.New("no healthy subsite is available for forwarding")
++
++type SubsiteForwarder struct {
++	subsiteService *service.SubsiteService
++	client         *http.Client
++	affinity       *subsiteAffinityStore
++}
++
++func NewSubsiteForwarder(subsiteService *service.SubsiteService) *SubsiteForwarder {
++	return &SubsiteForwarder{
++		subsiteService: subsiteService,
++		client: &http.Client{
++			Timeout: 0,
++			Transport: &http.Transport{
++				Proxy:                 http.ProxyFromEnvironment,
++				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
++				ForceAttemptHTTP2:     true,
++				MaxIdleConns:          100,
++				MaxIdleConnsPerHost:   32,
++				IdleConnTimeout:       90 * time.Second,
++				TLSHandshakeTimeout:   10 * time.Second,
++				ExpectContinueTimeout: 1 * time.Second,
++			},
++		},
++		affinity: newSubsiteAffinityStore(subsiteForwardAffinityTTL),
++	}
++}
++
++func (f *SubsiteForwarder) ForwardGatewayRequest(c *gin.Context) bool {
++	if f == nil || f.subsiteService == nil {
++		return false
++	}
++	if strings.EqualFold(c.GetHeader(subsiteForwardHeader), "1") {
++		writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_LOOP", "subsite forward loop detected")
++		return true
++	}
++
++	body, err := readForwardBody(c)
++	if err != nil {
++		writeSubsiteForwardError(c, http.StatusBadRequest, "SUBSITE_FORWARD_BODY", err.Error())
++		return true
++	}
++	c.Request.Body = io.NopCloser(strings.NewReader(string(body)))
++
++	key := f.affinityKey(c, body)
++	candidate, reason, err := f.selectSubsite(c.Request.Context(), key)
++	if err != nil {
++		writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, err.Error())
++		return true
++	}
++	if candidate == nil {
++		writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, errSubsiteForwardNoCandidate.Error())
++		return true
++	}
++
++	if err := f.proxy(c, candidate, body, reason); err != nil {
++		writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_FAILED", err.Error())
++		return true
++	}
++	f.affinity.Set(key, candidate.SubsiteID)
++	return true
++}
++
++func (f *SubsiteForwarder) selectSubsite(ctx context.Context, key string) (*service.Subsite, string, error) {
++	items, _, err := f.subsiteService.List(ctx, pagination.PaginationParams{Page: 1, PageSize: 1000}, service.ListSubsitesFilter{})
++	if err != nil {
++		return nil, "", err
++	}
++	now := time.Now()
++	active := make([]service.Subsite, 0, len(items))
++	for _, item := range items {
++		if !isForwardableSubsite(item, now) {
++			continue
++		}
++		active = append(active, item)
++	}
++	if len(active) == 0 {
++		return nil, "", errSubsiteForwardNoCandidate
++	}
++	if id, ok := f.affinity.Get(key); ok {
++		for i := range active {
++			if active[i].SubsiteID == id {
++				return &active[i], "affinity", nil
++			}
++		}
++	}
++	sort.SliceStable(active, func(i, j int) bool {
++		if active[i].HealthScore != active[j].HealthScore {
++			return active[i].HealthScore > active[j].HealthScore
++		}
++		if active[i].LastHeartbeatAt == nil {
++			return false
++		}
++		if active[j].LastHeartbeatAt == nil {
++			return true
++		}
++		return active[i].LastHeartbeatAt.After(*active[j].LastHeartbeatAt)
++	})
++	bestScore := active[0].HealthScore
++	top := active[:0]
++	for _, item := range active {
++		if item.HealthScore == bestScore {
++			top = append(top, item)
++		}
++	}
++	selected := top[rand.Intn(len(top))]
++	return &selected, "health", nil
++}
++
++func (f *SubsiteForwarder) proxy(c *gin.Context, subsite *service.Subsite, body []byte, reason string) error {
++	targetURL, err := buildSubsiteForwardURL(subsite.PublicURL, c.Request.URL)
++	if err != nil {
++		return err
++	}
++	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, strings.NewReader(string(body)))
++	if err != nil {
++		return err
++	}
++	copyForwardHeaders(req.Header, c.Request.Header)
++	req.Header.Set(subsiteForwardHeader, "1")
++	req.Header.Set("X-Forwarded-Host", c.Request.Host)
++	req.Header.Set("X-Forwarded-Proto", forwardedProto(c))
++	req.Header.Set("X-Forwarded-For", c.ClientIP())
++
++	resp, err := f.client.Do(req)
++	if err != nil {
++		return err
++	}
++	defer resp.Body.Close()
++
++	copyResponseHeaders(c.Writer.Header(), resp.Header)
++	c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
++	c.Header(subsiteForwardReasonHeader, reason)
++	if reason == "affinity" {
++		c.Header(subsiteForwardAffinityHeader, "hit")
++	} else {
++		c.Header(subsiteForwardAffinityHeader, "miss")
++	}
++	c.Status(resp.StatusCode)
++	_, err = io.Copy(c.Writer, resp.Body)
++	return err
++}
++
++func (f *SubsiteForwarder) affinityKey(c *gin.Context, body []byte) string {
++	apiKeyID := int64(0)
++	userID := int64(0)
++	groupID := int64(0)
++	if apiKey, ok := middleware.GetAPIKeyFromContext(c); ok && apiKey != nil {
++		apiKeyID = apiKey.ID
++		userID = apiKey.UserID
++		if apiKey.GroupID != nil {
++			groupID = *apiKey.GroupID
++		}
++	}
++	model := extractForwardModel(body)
++	session := extractForwardSession(body, c.Request.Header)
++	if session == "" {
++		session = requestShapeHash(c.Request.Method, c.Request.URL.Path, model, apiKeyID, userID, groupID)
++	}
++	return fmt.Sprintf("api:%d:user:%d:group:%d:model:%s:session:%s", apiKeyID, userID, groupID, model, session)
++}
++
++func isForwardableSubsite(subsite service.Subsite, now time.Time) bool {
++	if subsite.Status != service.SubsiteStatusActive {
++		return false
++	}
++	if strings.TrimSpace(subsite.PublicURL) == "" {
++		return false
++	}
++	if subsite.LastHeartbeatAt == nil {
++		return false
++	}
++	return now.Sub(*subsite.LastHeartbeatAt) <= 90*time.Second
++}
++
++func readForwardBody(c *gin.Context) ([]byte, error) {
++	if c.Request.Body == nil {
++		return nil, nil
++	}
++	reader := http.MaxBytesReader(c.Writer, c.Request.Body, subsiteForwardMaxBodyBytes)
++	body, err := io.ReadAll(reader)
++	if err != nil {
++		return nil, err
++	}
++	return body, nil
++}
++
++func buildSubsiteForwardURL(base string, original *url.URL) (string, error) {
++	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(base), "/"))
++	if err != nil {
++		return "", err
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return "", fmt.Errorf("invalid subsite public url: %s", base)
++	}
++	parsed.Path = strings.TrimRight(parsed.Path, "/") + original.EscapedPath()
++	parsed.RawQuery = original.RawQuery
++	return parsed.String(), nil
++}
++
++func copyForwardHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipForwardHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copyResponseHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipResponseHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func shouldSkipForwardHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length":
++		return true
++	default:
++		return false
++	}
++}
++
++func shouldSkipResponseHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length":
++		return true
++	default:
++		return false
++	}
++}
++
++func forwardedProto(c *gin.Context) string {
++	if value := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); value != "" {
++		return value
++	}
++	if c.Request.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++func extractForwardModel(body []byte) string {
++	var payload map[string]any
++	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
++		return ""
++	}
++	if model, ok := payload["model"].(string); ok {
++		return strings.TrimSpace(model)
++	}
++	return ""
++}
++
++func extractForwardSession(body []byte, header http.Header) string {
++	keys := []string{"previous_response_id", "conversation_id", "session_id", "thread_id"}
++	var payload map[string]any
++	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
++		for _, key := range keys {
++			if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
++				return key + ":" + strings.TrimSpace(value)
++			}
++		}
++	}
++	for _, key := range []string{"session_id", "conversation_id", "x-session-id", "x-conversation-id"} {
++		if value := strings.TrimSpace(header.Get(key)); value != "" {
++			return key + ":" + value
++		}
++	}
++	return ""
++}
++
++func requestShapeHash(method, path, model string, apiKeyID, userID, groupID int64) string {
++	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d", method, path, model, apiKeyID, userID, groupID)))
++	return hex.EncodeToString(sum[:12])
++}
++
++func writeSubsiteForwardError(c *gin.Context, status int, code, message string) {
++	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
++}
++
++type subsiteAffinityStore struct {
++	mu      sync.RWMutex
++	ttl     time.Duration
++	entries map[string]subsiteAffinityEntry
++}
++
++type subsiteAffinityEntry struct {
++	subsiteID string
++	expiresAt time.Time
++}
++
++func newSubsiteAffinityStore(ttl time.Duration) *subsiteAffinityStore {
++	return &subsiteAffinityStore{ttl: ttl, entries: make(map[string]subsiteAffinityEntry)}
++}
++
++func (s *subsiteAffinityStore) Get(key string) (string, bool) {
++	s.mu.RLock()
++	entry, ok := s.entries[key]
++	s.mu.RUnlock()
++	if !ok || time.Now().After(entry.expiresAt) {
++		if ok {
++			s.mu.Lock()
++			delete(s.entries, key)
++			s.mu.Unlock()
++		}
++		return "", false
++	}
++	return entry.subsiteID, true
++}
++
++func (s *subsiteAffinityStore) Set(key, subsiteID string) {
++	if key == "" || subsiteID == "" {
++		return
++	}
++	s.mu.Lock()
++	s.entries[key] = subsiteAffinityEntry{subsiteID: subsiteID, expiresAt: time.Now().Add(s.ttl)}
++	s.mu.Unlock()
++}
+diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
+index 1738de6..0a19754 100644
+--- a/backend/internal/handler/wire.go
++++ b/backend/internal/handler/wire.go
+@@ -108,6 +108,7 @@ func ProvideHandlers(
+ 	adminHandlers *AdminHandlers,
+ 	gatewayHandler *GatewayHandler,
+ 	openaiGatewayHandler *OpenAIGatewayHandler,
++	subsiteForwarder *SubsiteForwarder,
+ 	settingHandler *SettingHandler,
+ 	totpHandler *TotpHandler,
+ 	paymentHandler *PaymentHandler,
+@@ -133,6 +134,7 @@ func ProvideHandlers(
+ 		Admin:            adminHandlers,
+ 		Gateway:          gatewayHandler,
+ 		OpenAIGateway:    openaiGatewayHandler,
++		SubsiteForwarder: subsiteForwarder,
+ 		Setting:          settingHandler,
+ 		Totp:             totpHandler,
+ 		Payment:          paymentHandler,
+@@ -159,6 +161,7 @@ var ProviderSet = wire.NewSet(
+ 	NewChannelMonitorUserHandler,
+ 	NewGatewayHandler,
+ 	NewOpenAIGatewayHandler,
++	NewSubsiteForwarder,
+ 	NewTotpHandler,
+ 	ProvideSettingHandler,
+ 	NewPaymentHandler,
+diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
+index 782fff0..f6293e3 100644
+--- a/backend/internal/repository/subsite_repo.go
++++ b/backend/internal/repository/subsite_repo.go
+@@ -546,14 +546,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+ 
+ 	lease, err := scanAccountLease(tx.QueryRowContext(ctx, `
+ 		SELECT al.id, al.lease_id, al.subsite_id, al.account_id, al.group_id,
+-			COALESCE(NULLIF(a.name, ''), '') AS account_name,
+-			COALESCE(NULLIF(g.name, ''), '') AS group_name,
++			'' AS account_name,
++			'' AS group_name,
+ 			al.platform, al.status, al.max_concurrency, al.max_requests, al.max_tokens,
+ 			al.used_requests, al.used_tokens, al.assigned_at, al.expires_at,
+ 			al.renewed_at, al.released_at, al.created_at, al.updated_at
+ 		FROM account_leases al
+-		JOIN accounts a ON a.id = al.account_id AND a.deleted_at IS NULL
+-		LEFT JOIN groups g ON g.id = al.group_id AND g.deleted_at IS NULL
+ 		WHERE al.lease_id = $1
+ 		  AND al.subsite_id = $2
+ 		  AND al.deleted_at IS NULL
+diff --git a/backend/internal/server/middleware/master_data_plane_guard.go b/backend/internal/server/middleware/master_data_plane_guard.go
+index 8725039..a832e61 100644
+--- a/backend/internal/server/middleware/master_data_plane_guard.go
++++ b/backend/internal/server/middleware/master_data_plane_guard.go
+@@ -2,6 +2,7 @@ package middleware
+ 
+ import (
+ 	"net/http"
++	"strings"
+ 
+ 	"github.com/Wei-Shaw/sub2api/internal/service"
+ 	"github.com/gin-gonic/gin"
+@@ -11,6 +12,10 @@ import (
+ // traffic must enter through subsite agents.
+ func MasterDataPlaneGuard(settingService *service.SettingService) gin.HandlerFunc {
+ 	return func(c *gin.Context) {
++		if isLocalModelListEndpoint(c.Request.Method, c.Request.URL.Path) {
++			c.Next()
++			return
++		}
+ 		if settingService == nil || settingService.IsMasterDataPlaneEnabled(c.Request.Context()) {
+ 			c.Next()
+ 			return
+@@ -24,3 +29,10 @@ func MasterDataPlaneGuard(settingService *service.SettingService) gin.HandlerFun
+ 		})
+ 	}
+ }
++
++func isLocalModelListEndpoint(method, path string) bool {
++	if !strings.EqualFold(method, http.MethodGet) {
++		return false
++	}
++	return strings.TrimRight(strings.TrimSpace(path), "/") == "/v1/models"
++}
+diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
+index 2302ae5..50cabed 100644
+--- a/backend/internal/server/routes/gateway.go
++++ b/backend/internal/server/routes/gateway.go
+@@ -27,6 +27,17 @@ func RegisterGatewayRoutes(
+ 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
+ 	endpointNorm := handler.InboundEndpointMiddleware()
+ 	masterDataPlaneGuard := middleware.MasterDataPlaneGuard(settingService)
++	masterDataPlaneOrSubsiteForward := func(c *gin.Context) {
++		if settingService == nil || settingService.IsMasterDataPlaneEnabled(c.Request.Context()) {
++			c.Next()
++			return
++		}
++		if h != nil && h.SubsiteForwarder != nil && h.SubsiteForwarder.ForwardGatewayRequest(c) {
++			c.Abort()
++			return
++		}
++		masterDataPlaneGuard(c)
++	}
+ 
+ 	// 未分组 Key 拦截中间件（按协议格式区分错误响应）
+ 	requireGroupAnthropic := middleware.RequireGroupAssignment(settingService, middleware.AnthropicErrorWriter)
+@@ -34,7 +45,6 @@ func RegisterGatewayRoutes(
+ 
+ 	// API网关（Claude API兼容）
+ 	gateway := r.Group("/v1")
+-	gateway.Use(masterDataPlaneGuard)
+ 	gateway.Use(bodyLimit)
+ 	gateway.Use(clientRequestID)
+ 	gateway.Use(opsErrorLogger)
+@@ -44,6 +54,10 @@ func RegisterGatewayRoutes(
+ 	{
+ 		// /v1/messages: auto-route based on group platform
+ 		gateway.POST("/messages", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Messages(c)
+ 				return
+@@ -52,6 +66,10 @@ func RegisterGatewayRoutes(
+ 		})
+ 		// /v1/messages/count_tokens: OpenAI groups get 404
+ 		gateway.POST("/messages/count_tokens", func(c *gin.Context) {
++			masterDataPlaneGuard(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"type": "error",
+@@ -68,6 +86,10 @@ func RegisterGatewayRoutes(
+ 		gateway.GET("/usage", h.Gateway.Usage)
+ 		// OpenAI Responses API: auto-route based on group platform
+ 		gateway.POST("/responses", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+@@ -75,15 +97,23 @@ func RegisterGatewayRoutes(
+ 			h.Gateway.Responses(c)
+ 		})
+ 		gateway.POST("/responses/*subpath", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+ 			}
+ 			h.Gateway.Responses(c)
+ 		})
+-		gateway.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
++		gateway.GET("/responses", masterDataPlaneGuard, h.OpenAIGateway.ResponsesWebSocket)
+ 		// OpenAI Chat Completions API: auto-route based on group platform
+ 		gateway.POST("/chat/completions", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.ChatCompletions(c)
+ 				return
+@@ -91,6 +121,10 @@ func RegisterGatewayRoutes(
+ 			h.Gateway.ChatCompletions(c)
+ 		})
+ 		gateway.POST("/images/generations", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) != service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"error": gin.H{
+@@ -103,6 +137,10 @@ func RegisterGatewayRoutes(
+ 			h.OpenAIGateway.Images(c)
+ 		})
+ 		gateway.POST("/images/edits", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) != service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"error": gin.H{
+@@ -118,7 +156,6 @@ func RegisterGatewayRoutes(
+ 
+ 	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
+ 	gemini := r.Group("/v1beta")
+-	gemini.Use(masterDataPlaneGuard)
+ 	gemini.Use(bodyLimit)
+ 	gemini.Use(clientRequestID)
+ 	gemini.Use(opsErrorLogger)
+@@ -126,39 +163,51 @@ func RegisterGatewayRoutes(
+ 	gemini.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
+ 	gemini.Use(requireGroupGoogle)
+ 	{
+-		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
+-		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
++		gemini.GET("/models", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaListModels)
++		gemini.GET("/models/:model", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaGetModel)
+ 		// Gin treats ":" as a param marker, but Gemini uses "{model}:{action}" in the same segment.
+-		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
++		gemini.POST("/models/*modelAction", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaModels)
+ 	}
+ 
+ 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
+ 	responsesHandler := func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) == service.PlatformOpenAI {
+ 			h.OpenAIGateway.Responses(c)
+ 			return
+ 		}
+ 		h.Gateway.Responses(c)
+ 	}
+-	r.POST("/responses", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+-	r.POST("/responses/*subpath", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
++	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
++	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+ 	r.GET("/responses", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.ResponsesWebSocket)
+ 	codexDirect := r.Group("/backend-api/codex")
+-	codexDirect.Use(masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic)
++	codexDirect.Use(bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic)
+ 	{
+ 		codexDirect.POST("/responses", responsesHandler)
+ 		codexDirect.POST("/responses/*subpath", responsesHandler)
+ 		codexDirect.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
+ 	}
+ 	// OpenAI Chat Completions API（不带v1前缀的别名）— auto-route based on group platform
+-	r.POST("/chat/completions", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/chat/completions", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) == service.PlatformOpenAI {
+ 			h.OpenAIGateway.ChatCompletions(c)
+ 			return
+ 		}
+ 		h.Gateway.ChatCompletions(c)
+ 	})
+-	r.POST("/images/generations", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/images/generations", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) != service.PlatformOpenAI {
+ 			c.JSON(http.StatusNotFound, gin.H{
+ 				"error": gin.H{
+@@ -170,7 +219,11 @@ func RegisterGatewayRoutes(
+ 		}
+ 		h.OpenAIGateway.Images(c)
+ 	})
+-	r.POST("/images/edits", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/images/edits", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) != service.PlatformOpenAI {
+ 			c.JSON(http.StatusNotFound, gin.H{
+ 				"error": gin.H{
