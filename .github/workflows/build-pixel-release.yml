@@ -26,8 +26,10 @@ jobs:
       PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.13' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.12' }}
     steps:
-      - name: Checkout installer repo
-        uses: actions/checkout@v4
+      - name: Download installer repo
+        run: |
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/${GITHUB_SHA}.tar.gz" -o installer.tar.gz
+          tar -xzf installer.tar.gz --strip-components=1
 
       - name: Resolve version from tag
         if: startsWith(github.ref, 'refs/tags/')
