@@ -85,6 +85,9 @@ jobs:
           /usr/local/go/bin/go version
 
       - name: Build Linux binaries
+        env:
+          GOMAXPROCS: "2"
+          GOGC: "50"
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -96,11 +99,13 @@ jobs:
               cd pixel-src/backend
               GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
                 -tags=embed \
+                -p=1 \
                 -trimpath \
                 -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=release" \
                 -o "../../${out}/sub2api" \
                 ./cmd/server
               GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
+                -p=1 \
                 -trimpath \
                 -ldflags="-s -w" \
                 -o "../../${agent_out}/sub2api-subsite-agent" \
