@@ -123,18 +123,23 @@ jobs:
           )
 
       - name: Publish release
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: v${{ env.PIXEL_VERSION }}-forwarder-pixel
-          name: Pixel ${{ env.PIXEL_VERSION }} Sub2API forwarder binaries
-          body: |
-            Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel tag `${{ env.PIXEL_SOURCE_VERSION }}` with the subsite forwarder patch. Published as `${{ env.PIXEL_VERSION }}` for this custom forwarder release.
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${PIXEL_VERSION}-forwarder-pixel"
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel tag \`${PIXEL_SOURCE_VERSION}\` with the subsite forwarder patch. Published as \`${PIXEL_VERSION}\` for this custom forwarder release.
 
-            Install:
-            ```bash
-            curl -sSL https://raw.githubusercontent.com/${{ github.repository }}/main/deploy/install.sh | sudo bash
-            ```
-          files: |
-            dist/*.tar.gz
-            dist/checksums.txt
-          overwrite_files: true
+          Install:
+          \`\`\`bash
+          curl -sSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/deploy/install.sh | sudo bash
+          \`\`\`
+          EOF
+          gh release delete "$tag" --yes --cleanup-tag || true
+          git tag -f "$tag"
+          git push -f origin "$tag"
+          gh release create "$tag" dist/*.tar.gz dist/checksums.txt \
+            --title "Pixel ${PIXEL_VERSION} Sub2API forwarder binaries" \
+            --notes-file "$body_file"
