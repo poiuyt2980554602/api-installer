@@ -55,11 +55,12 @@ jobs:
           fi
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
-        with:
-          node-version: "20"
-          cache: pnpm
-          cache-dependency-path: pixel-src/frontend/pnpm-lock.yaml
+        run: |
+          set -euo pipefail
+          curl -fsSL https://nodejs.org/dist/v20.19.4/node-v20.19.4-linux-x64.tar.xz -o node.tar.xz
+          sudo tar -xJf node.tar.xz -C /usr/local --strip-components=1
+          node --version
+          npm --version
 
       - name: Setup pnpm
         run: |
@@ -73,10 +74,14 @@ jobs:
           pnpm --dir pixel-src/frontend run build
 
       - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: pixel-src/backend/go.mod
-          cache-dependency-path: pixel-src/backend/go.sum
+        run: |
+          set -euo pipefail
+          GO_VERSION="$(sed -n 's/^go //p' pixel-src/backend/go.mod | head -n1)"
+          curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o go.tar.gz
+          sudo rm -rf /usr/local/go
+          sudo tar -C /usr/local -xzf go.tar.gz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          /usr/local/go/bin/go version
 
       - name: Build Linux binaries
         run: |
