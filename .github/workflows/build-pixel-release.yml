@@ -190,31 +190,23 @@ jobs:
                   raise
 
           release = get_release()
-          if release is None:
-              release = request(
-                  "POST",
-                  f"{api}/releases",
-                  {
-                      "tag_name": tag,
-                      "name": title,
-                      "body": pathlib.Path(body_path).read_text(),
-                      "draft": False,
-                      "prerelease": False,
-                  },
-              )
-          else:
-              release = request(
-                  "PATCH",
-                  f"{api}/releases/{release['id']}",
-                  {
-                      "name": title,
-                      "body": pathlib.Path(body_path).read_text(),
-                      "draft": False,
-                      "prerelease": False,
-                  },
-              )
-              for asset in release.get("assets", []):
-                  request("DELETE", f"{api}/releases/assets/{asset['id']}")
+          if release is not None:
+              # Recreate the release so a force-updated tag cannot leave the
+              # release page pinned to the previous commit without binaries.
+              request("DELETE", f"{api}/releases/{release['id']}")
+
+          release = request(
+              "POST",
+              f"{api}/releases",
+              {
+                  "tag_name": tag,
+                  "target_commitish": os.environ["GITHUB_SHA"],
+                  "name": title,
+                  "body": pathlib.Path(body_path).read_text(),
+                  "draft": False,
+                  "prerelease": False,
+              },
+          )
 
           upload_url = release["upload_url"].split("{", 1)[0]
           for asset_path in assets:
@@ -228,4 +220,10 @@ jobs:
                   headers={"Content-Type": content_type},
               )
               print(f"uploaded {path.name}")
+
+          refreshed = request("GET", f"{api}/releases/{release['id']}")
+          uploaded = {asset["name"] for asset in refreshed.get("assets", [])}
+          missing = [pathlib.Path(asset).name for asset in assets if pathlib.Path(asset).name not in uploaded]
+          if missing:
+              raise RuntimeError(f"release asset upload did not persist: {missing}")
           PY
