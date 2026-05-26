@@ -145,7 +145,7 @@ download_and_extract() {
         if curl -fsL "$checksum_url" -o "${TMP_DIR}/checksums.txt"; then
             local expected
             local actual
-            expected="$(grep " ${archive_name}$" "${TMP_DIR}/checksums.txt" | awk '{print $1}')"
+            expected="$(awk -v name="$archive_name" '$2 == name { print $1; found = 1; exit } END { if (!found) exit 0 }' "${TMP_DIR}/checksums.txt")"
             actual="$(sha256sum "${TMP_DIR}/${archive_name}" | awk '{print $1}')"
 
             if [ -z "$expected" ]; then
