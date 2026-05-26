@@ -1,12 +1,20 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index 55c03b8..44c98e1 100644
+index 55c03b8..df85fb2 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
-@@ -267,6 +267,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+@@ -260,13 +260,14 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	subsiteService := service.NewSubsiteService(subsiteRepository, secretEncryptor)
+ 	accountLeaseRepository := repository.NewAccountLeaseRepository(db)
+ 	accountLeaseService := service.NewAccountLeaseService(accountLeaseRepository, subsiteRepository, accountRepository, groupRepository)
+-	subsiteHandler := admin.NewSubsiteHandler(subsiteService, accountLeaseService)
++	subsiteHandler := admin.NewSubsiteHandler(subsiteService, accountLeaseService, settingService)
+ 	adminHandlers := handler.ProvideAdminHandlers(dashboardHandler, adminUserHandler, groupHandler, accountHandler, accountSharePolicyHandler, adminAnnouncementHandler, dataManagementHandler, backupHandler, oAuthHandler, openAIOAuthHandler, geminiOAuthHandler, antigravityOAuthHandler, proxyHandler, adminRedeemHandler, promoHandler, settingHandler, opsHandler, systemHandler, adminSubscriptionHandler, adminUsageHandler, userAttributeHandler, errorPassthroughHandler, tlsFingerprintProfileHandler, adminAPIKeyHandler, scheduledTestHandler, channelHandler, channelMonitorHandler, channelMonitorRequestTemplateHandler, contentModerationHandler, paymentHandler, revenueHandler, withdrawalHandler, adminShopHandler, affiliateHandler, subsiteHandler)
+ 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
+ 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
  	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
  	gatewayHandler := handler.NewGatewayHandler(gatewayService, geminiMessagesCompatService, antigravityGatewayService, userService, concurrencyService, billingCacheService, usageService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, userMessageQueueService, configConfig, settingService)
  	openAIGatewayHandler := handler.NewOpenAIGatewayHandler(openAIGatewayService, concurrencyService, billingCacheService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, configConfig)
-+	subsiteForwarder := handler.NewSubsiteForwarder(subsiteService)
++	subsiteForwarder := handler.NewSubsiteForwarder(subsiteService, settingService)
  	handlerSettingHandler := handler.ProvideSettingHandler(settingService, buildInfo)
  	totpHandler := handler.NewTotpHandler(totpService)
  	handlerPaymentHandler := handler.NewPaymentHandler(paymentService, paymentConfigService, channelService)
@@ -20,19 +28,34 @@ index 55c03b8..44c98e1 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
-index f83507c..1c8fcd1 100644
+index f83507c..d733e4d 100644
 --- a/backend/internal/handler/admin/subsite_handler.go
 +++ b/backend/internal/handler/admin/subsite_handler.go
-@@ -1,6 +1,8 @@
+@@ -1,6 +1,9 @@
  package admin
  
  import (
++	"context"
 +	"os"
 +	"strconv"
  	"strings"
  	"time"
  
-@@ -39,6 +41,140 @@ func (h *SubsiteHandler) List(c *gin.Context) {
+@@ -13,10 +16,11 @@ import (
+ type SubsiteHandler struct {
+ 	subsiteService *service.SubsiteService
+ 	leaseService   *service.AccountLeaseService
++	settingService *service.SettingService
+ }
+ 
+-func NewSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService) *SubsiteHandler {
+-	return &SubsiteHandler{subsiteService: subsiteService, leaseService: leaseService}
++func NewSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService, settingService *service.SettingService) *SubsiteHandler {
++	return &SubsiteHandler{subsiteService: subsiteService, leaseService: leaseService, settingService: settingService}
+ }
+ 
+ func (h *SubsiteHandler) List(c *gin.Context) {
+@@ -39,6 +43,150 @@ func (h *SubsiteHandler) List(c *gin.Context) {
  	})
  }
  
@@ -41,21 +64,31 @@ index f83507c..1c8fcd1 100644
 +	if response.ErrorFrom(c, err) {
 +		return
 +	}
-+	stats.Mode = normalizeForwardMode(os.Getenv("SUBSITE_FORWARD_MODE"))
++	stats.Mode = h.forwardMode(c.Request.Context())
 +	response.Success(c, stats)
 +}
 +
-+func normalizeForwardMode(mode string) string {
-+	switch strings.ToLower(strings.TrimSpace(mode)) {
-+	case "local", "master", "master_local":
-+		return "local"
-+	case "direct", "subsite", "subsite_direct":
-+		return "direct"
-+	case "forward", "subsite_forward", "":
-+		return "forward"
-+	default:
-+		return "forward"
++func (h *SubsiteHandler) forwardMode(ctx context.Context) string {
++	fallback := os.Getenv("SUBSITE_FORWARD_MODE")
++	if h == nil || h.settingService == nil {
++		return service.NormalizeSubsiteForwardMode(fallback)
 +	}
++	return h.settingService.GetSubsiteForwardMode(ctx, fallback)
++}
++
++func (h *SubsiteHandler) UpdateForwardMode(c *gin.Context) {
++	var input struct {
++		Mode string `json:"mode" binding:"required"`
++	}
++	if err := c.ShouldBindJSON(&input); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	mode, err := h.settingService.SetSubsiteForwardMode(c.Request.Context(), input.Mode)
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.Success(c, gin.H{"mode": mode})
 +}
 +
 +func (h *SubsiteHandler) ListForwardAffinities(c *gin.Context) {
@@ -185,531 +218,8 @@ index b723365..0c77fd2 100644
  	Setting          *SettingHandler
  	Totp             *TotpHandler
  	Payment          *PaymentHandler
-diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
-new file mode 100644
-index 0000000..7fa7b3d
---- /dev/null
-+++ b/backend/internal/handler/subsite_forwarder.go
-@@ -0,0 +1,517 @@
-+package handler
-+
-+import (
-+	"bytes"
-+	"context"
-+	"crypto/sha256"
-+	"encoding/hex"
-+	"encoding/json"
-+	"errors"
-+	"fmt"
-+	"io"
-+	"math/rand"
-+	"net"
-+	"net/http"
-+	"net/url"
-+	"sort"
-+	"strings"
-+	"sync"
-+	"time"
-+
-+	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
-+	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
-+	"github.com/Wei-Shaw/sub2api/internal/service"
-+	"github.com/gin-gonic/gin"
-+)
-+
-+const (
-+	subsiteForwardAffinityTTL     = 12 * time.Hour
-+	subsiteForwardMaxBodyBytes    = 64 << 20
-+	subsiteForwardHeader          = "X-Sub2API-Master-Forwarded"
-+	subsiteForwardTargetHeader    = "X-Sub2API-Forward-Target"
-+	subsiteForwardAffinityHeader  = "X-Sub2API-Forward-Affinity"
-+	subsiteForwardReasonHeader    = "X-Sub2API-Forward-Reason"
-+	subsiteForwardLeaseHeader     = "X-Sub2API-Lease-ID"
-+	subsiteForwardAccountHeader   = "X-Sub2API-Account-ID"
-+	subsiteForwardNoCandidateCode = "SUBSITE_FORWARD_NO_CANDIDATE"
-+)
-+
-+var errSubsiteForwardNoCandidate = errors.New("no healthy subsite is available for forwarding")
-+
-+type SubsiteForwarder struct {
-+	subsiteService *service.SubsiteService
-+	client         *http.Client
-+	affinity       *subsiteAffinityStore
-+}
-+
-+type subsiteForwardContext struct {
-+	Key       string
-+	Model     string
-+	Session   string
-+	APIKeyID  int64
-+	UserID    int64
-+	GroupID   int64
-+	AccountID int64
-+	LeaseID   string
-+}
-+
-+func NewSubsiteForwarder(subsiteService *service.SubsiteService) *SubsiteForwarder {
-+	return &SubsiteForwarder{
-+		subsiteService: subsiteService,
-+		client: &http.Client{
-+			Timeout: 0,
-+			Transport: &http.Transport{
-+				Proxy:                 http.ProxyFromEnvironment,
-+				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-+				ForceAttemptHTTP2:     true,
-+				MaxIdleConns:          100,
-+				MaxIdleConnsPerHost:   32,
-+				IdleConnTimeout:       90 * time.Second,
-+				TLSHandshakeTimeout:   10 * time.Second,
-+				ExpectContinueTimeout: 1 * time.Second,
-+			},
-+		},
-+		affinity: newSubsiteAffinityStore(subsiteForwardAffinityTTL),
-+	}
-+}
-+
-+func (f *SubsiteForwarder) ForwardGatewayRequest(c *gin.Context) bool {
-+	if f == nil || f.subsiteService == nil {
-+		return false
-+	}
-+	if strings.EqualFold(c.GetHeader(subsiteForwardHeader), "1") {
-+		writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_LOOP", "subsite forward loop detected")
-+		return true
-+	}
-+
-+	body, err := readForwardBody(c)
-+	if err != nil {
-+		writeSubsiteForwardError(c, http.StatusBadRequest, "SUBSITE_FORWARD_BODY", err.Error())
-+		return true
-+	}
-+	c.Request.Body = io.NopCloser(bytes.NewReader(body))
-+
-+	forwardCtx := f.forwardContext(c, body)
-+	excluded := make(map[string]struct{})
-+	fallbackFrom := ""
-+	var lastErr error
-+	for attempt := 0; attempt < 3; attempt++ {
-+		candidate, reason, err := f.selectSubsite(c.Request.Context(), forwardCtx, excluded)
-+		if err != nil {
-+			f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, err)
-+			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, err.Error())
-+			return true
-+		}
-+		if candidate == nil {
-+			f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, errSubsiteForwardNoCandidate)
-+			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, errSubsiteForwardNoCandidate.Error())
-+			return true
-+		}
-+
-+		proxyResult, err := f.proxy(c, candidate, body, reason, forwardCtx)
-+		if err == nil {
-+			f.storeAffinity(c.Request.Context(), forwardCtx, candidate, reason, "")
-+			outcome := "success"
-+			if fallbackFrom != "" {
-+				outcome = "fallback"
-+			}
-+			f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, outcome, proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, nil)
-+			return true
-+		}
-+		lastErr = err
-+		f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, "failed", 0, 0, len(body), 0, err)
-+		if c.Writer.Written() {
-+			return true
-+		}
-+		forwardCtx.LeaseID = ""
-+		forwardCtx.AccountID = 0
-+		excluded[candidate.SubsiteID] = struct{}{}
-+		fallbackFrom = candidate.SubsiteID
-+	}
-+	if lastErr == nil {
-+		lastErr = errSubsiteForwardNoCandidate
-+	}
-+	writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_FAILED", lastErr.Error())
-+	return true
-+}
-+
-+func (f *SubsiteForwarder) selectSubsite(ctx context.Context, forwardCtx *subsiteForwardContext, excluded map[string]struct{}) (*service.Subsite, string, error) {
-+	items, _, err := f.subsiteService.List(ctx, pagination.PaginationParams{Page: 1, PageSize: 1000}, service.ListSubsitesFilter{})
-+	if err != nil {
-+		return nil, "", err
-+	}
-+	now := time.Now()
-+	active := make([]service.Subsite, 0, len(items))
-+	for _, item := range items {
-+		if !isForwardableSubsite(item, now) {
-+			continue
-+		}
-+		if _, skip := excluded[item.SubsiteID]; skip {
-+			continue
-+		}
-+		active = append(active, item)
-+	}
-+	if len(active) == 0 {
-+		return nil, "", errSubsiteForwardNoCandidate
-+	}
-+	if persisted, err := f.subsiteService.GetForwardAffinity(ctx, forwardCtx.Key); err == nil && persisted != nil {
-+		for i := range active {
-+			if active[i].SubsiteID == persisted.SubsiteID {
-+				forwardCtx.AccountID = persisted.AccountID
-+				forwardCtx.LeaseID = persisted.LeaseID
-+				return &active[i], "db_affinity", nil
-+			}
-+		}
-+	}
-+	if id, ok := f.affinity.Get(forwardCtx.Key); ok {
-+		for i := range active {
-+			if active[i].SubsiteID == id {
-+				return &active[i], "affinity", nil
-+			}
-+		}
-+	}
-+	sort.SliceStable(active, func(i, j int) bool {
-+		if active[i].HealthScore != active[j].HealthScore {
-+			return active[i].HealthScore > active[j].HealthScore
-+		}
-+		if active[i].LastHeartbeatAt == nil {
-+			return false
-+		}
-+		if active[j].LastHeartbeatAt == nil {
-+			return true
-+		}
-+		return active[i].LastHeartbeatAt.After(*active[j].LastHeartbeatAt)
-+	})
-+	bestScore := active[0].HealthScore
-+	top := active[:0]
-+	for _, item := range active {
-+		if item.HealthScore == bestScore {
-+			top = append(top, item)
-+		}
-+	}
-+	selected := top[rand.Intn(len(top))]
-+	return &selected, "health", nil
-+}
-+
-+type subsiteProxyResult struct {
-+	StatusCode    int
-+	LatencyMS     int64
-+	ResponseBytes int64
-+}
-+
-+func (f *SubsiteForwarder) proxy(c *gin.Context, subsite *service.Subsite, body []byte, reason string, forwardCtx *subsiteForwardContext) (subsiteProxyResult, error) {
-+	targetURL, err := buildSubsiteForwardURL(subsite.PublicURL, c.Request.URL)
-+	if err != nil {
-+		return subsiteProxyResult{}, err
-+	}
-+	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, bytes.NewReader(body))
-+	if err != nil {
-+		return subsiteProxyResult{}, err
-+	}
-+	copyForwardHeaders(req.Header, c.Request.Header)
-+	req.Header.Set(subsiteForwardHeader, "1")
-+	req.Header.Set("X-Forwarded-Host", c.Request.Host)
-+	req.Header.Set("X-Forwarded-Proto", forwardedProto(c))
-+	req.Header.Set("X-Forwarded-For", c.ClientIP())
-+	if forwardCtx.AccountID > 0 {
-+		req.Header.Set("X-Sub2API-Preferred-Account-ID", fmt.Sprint(forwardCtx.AccountID))
-+	}
-+	if forwardCtx.LeaseID != "" {
-+		req.Header.Set("X-Sub2API-Preferred-Lease-ID", forwardCtx.LeaseID)
-+	}
-+
-+	started := time.Now()
-+	resp, err := f.client.Do(req)
-+	if err != nil {
-+		return subsiteProxyResult{}, err
-+	}
-+	defer resp.Body.Close()
-+
-+	if leaseID := strings.TrimSpace(resp.Header.Get(subsiteForwardLeaseHeader)); leaseID != "" {
-+		forwardCtx.LeaseID = leaseID
-+	}
-+	if accountID := parseForwardAccountID(resp.Header.Get(subsiteForwardAccountHeader)); accountID > 0 {
-+		forwardCtx.AccountID = accountID
-+	}
-+	copyResponseHeaders(c.Writer.Header(), resp.Header)
-+	c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
-+	c.Header(subsiteForwardReasonHeader, reason)
-+	if reason == "affinity" {
-+		c.Header(subsiteForwardAffinityHeader, "hit")
-+	} else {
-+		c.Header(subsiteForwardAffinityHeader, "miss")
-+	}
-+	latencyMS := time.Since(started).Milliseconds()
-+	c.Header("X-Sub2API-Forward-Latency-MS", fmt.Sprint(latencyMS))
-+	c.Status(resp.StatusCode)
-+	n, err := io.Copy(c.Writer, resp.Body)
-+	return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n}, err
-+}
-+
-+func (f *SubsiteForwarder) forwardContext(c *gin.Context, body []byte) *subsiteForwardContext {
-+	apiKeyID := int64(0)
-+	userID := int64(0)
-+	groupID := int64(0)
-+	if apiKey, ok := middleware.GetAPIKeyFromContext(c); ok && apiKey != nil {
-+		apiKeyID = apiKey.ID
-+		userID = apiKey.UserID
-+		if apiKey.GroupID != nil {
-+			groupID = *apiKey.GroupID
-+		}
-+	}
-+	model := extractForwardModel(body)
-+	session := extractForwardSession(body, c.Request.Header)
-+	if session == "" {
-+		session = requestShapeHash(c.Request.Method, c.Request.URL.Path, model, apiKeyID, userID, groupID)
-+	}
-+	return &subsiteForwardContext{
-+		Key:      fmt.Sprintf("api:%d:user:%d:group:%d:model:%s:session:%s", apiKeyID, userID, groupID, model, session),
-+		Model:    model,
-+		Session:  session,
-+		APIKeyID: apiKeyID,
-+		UserID:   userID,
-+		GroupID:  groupID,
-+	}
-+}
-+
-+func (f *SubsiteForwarder) storeAffinity(ctx context.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, reason, lastError string) {
-+	if f == nil || f.subsiteService == nil || subsite == nil || forwardCtx.Key == "" {
-+		return
-+	}
-+	f.affinity.Set(forwardCtx.Key, subsite.SubsiteID)
-+	_, _ = f.subsiteService.UpsertForwardAffinity(ctx, service.UpsertSubsiteForwardAffinityInput{
-+		Key:        forwardCtx.Key,
-+		Type:       "session",
-+		SubsiteID:  subsite.SubsiteID,
-+		LeaseID:    forwardCtx.LeaseID,
-+		AccountID:  forwardCtx.AccountID,
-+		APIKeyID:   forwardCtx.APIKeyID,
-+		UserID:     forwardCtx.UserID,
-+		GroupID:    forwardCtx.GroupID,
-+		Model:      forwardCtx.Model,
-+		SessionID:  forwardCtx.Session,
-+		Source:     "auto",
-+		LastReason: reason,
-+		LastError:  lastError,
-+		ExpiresAt:  time.Now().Add(subsiteForwardAffinityTTL),
-+	})
-+}
-+
-+func (f *SubsiteForwarder) recordForwardEvent(c *gin.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, fallbackFrom, reason, outcome string, statusCode int, latencyMS int64, requestBytes int, responseBytes int64, eventErr error) {
-+	if f == nil || f.subsiteService == nil || c == nil {
-+		return
-+	}
-+	subsiteID := ""
-+	if subsite != nil {
-+		subsiteID = subsite.SubsiteID
-+	}
-+	errText := ""
-+	if eventErr != nil {
-+		errText = eventErr.Error()
-+	}
-+	_ = f.subsiteService.RecordForwardEvent(c.Request.Context(), &service.SubsiteForwardEvent{
-+		RequestID:          c.GetHeader("X-Request-Id"),
-+		AffinityKey:        forwardCtx.Key,
-+		SubsiteID:          subsiteID,
-+		AttemptedSubsiteID: subsiteID,
-+		FallbackFrom:       fallbackFrom,
-+		LeaseID:            forwardCtx.LeaseID,
-+		AccountID:          forwardCtx.AccountID,
-+		APIKeyID:           forwardCtx.APIKeyID,
-+		UserID:             forwardCtx.UserID,
-+		GroupID:            forwardCtx.GroupID,
-+		Model:              forwardCtx.Model,
-+		SessionID:          forwardCtx.Session,
-+		Method:             c.Request.Method,
-+		Path:               c.Request.URL.Path,
-+		StatusCode:         statusCode,
-+		LatencyMS:          latencyMS,
-+		RequestBytes:       int64(requestBytes),
-+		ResponseBytes:      responseBytes,
-+		Reason:             reason,
-+		Outcome:            outcome,
-+		Error:              errText,
-+		Metadata: map[string]any{
-+			"query": c.Request.URL.RawQuery,
-+		},
-+	})
-+}
-+
-+func isForwardableSubsite(subsite service.Subsite, now time.Time) bool {
-+	if subsite.Status != service.SubsiteStatusActive {
-+		return false
-+	}
-+	if strings.TrimSpace(subsite.PublicURL) == "" {
-+		return false
-+	}
-+	if subsite.LastHeartbeatAt == nil {
-+		return false
-+	}
-+	return now.Sub(*subsite.LastHeartbeatAt) <= 90*time.Second
-+}
-+
-+func readForwardBody(c *gin.Context) ([]byte, error) {
-+	if c.Request.Body == nil {
-+		return nil, nil
-+	}
-+	reader := http.MaxBytesReader(c.Writer, c.Request.Body, subsiteForwardMaxBodyBytes)
-+	body, err := io.ReadAll(reader)
-+	if err != nil {
-+		return nil, err
-+	}
-+	return body, nil
-+}
-+
-+func buildSubsiteForwardURL(base string, original *url.URL) (string, error) {
-+	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(base), "/"))
-+	if err != nil {
-+		return "", err
-+	}
-+	if parsed.Scheme == "" || parsed.Host == "" {
-+		return "", fmt.Errorf("invalid subsite public url: %s", base)
-+	}
-+	parsed.Path = strings.TrimRight(parsed.Path, "/") + original.EscapedPath()
-+	parsed.RawQuery = original.RawQuery
-+	return parsed.String(), nil
-+}
-+
-+func copyForwardHeaders(dst, src http.Header) {
-+	for key, values := range src {
-+		if shouldSkipForwardHeader(key) {
-+			continue
-+		}
-+		for _, value := range values {
-+			dst.Add(key, value)
-+		}
-+	}
-+}
-+
-+func copyResponseHeaders(dst, src http.Header) {
-+	for key, values := range src {
-+		if shouldSkipResponseHeader(key) {
-+			continue
-+		}
-+		for _, value := range values {
-+			dst.Add(key, value)
-+		}
-+	}
-+}
-+
-+func shouldSkipForwardHeader(key string) bool {
-+	switch strings.ToLower(key) {
-+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
-+		"x-sub2api-preferred-account-id", "x-sub2api-preferred-lease-id", "x-sub2api-route-signature", "x-sub2api-route-timestamp", "x-sub2api-route-nonce":
-+		return true
-+	default:
-+		return false
-+	}
-+}
-+
-+func shouldSkipResponseHeader(key string) bool {
-+	switch strings.ToLower(key) {
-+	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length",
-+		"x-sub2api-account-id", "x-sub2api-lease-id":
-+		return true
-+	default:
-+		return false
-+	}
-+}
-+
-+func parseForwardAccountID(value string) int64 {
-+	value = strings.TrimSpace(value)
-+	if value == "" {
-+		return 0
-+	}
-+	var id int64
-+	if _, err := fmt.Sscan(value, &id); err != nil || id <= 0 {
-+		return 0
-+	}
-+	return id
-+}
-+
-+func forwardedProto(c *gin.Context) string {
-+	if value := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); value != "" {
-+		return value
-+	}
-+	if c.Request.TLS != nil {
-+		return "https"
-+	}
-+	return "http"
-+}
-+
-+func extractForwardModel(body []byte) string {
-+	var payload map[string]any
-+	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
-+		return ""
-+	}
-+	if model, ok := payload["model"].(string); ok {
-+		return strings.TrimSpace(model)
-+	}
-+	return ""
-+}
-+
-+func extractForwardSession(body []byte, header http.Header) string {
-+	keys := []string{"previous_response_id", "conversation_id", "session_id", "thread_id"}
-+	var payload map[string]any
-+	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
-+		for _, key := range keys {
-+			if value, ok := payload[key].(string); ok && strings.TrimSpace(value) != "" {
-+				return key + ":" + strings.TrimSpace(value)
-+			}
-+		}
-+	}
-+	for _, key := range []string{"session_id", "conversation_id", "x-session-id", "x-conversation-id"} {
-+		if value := strings.TrimSpace(header.Get(key)); value != "" {
-+			return key + ":" + value
-+		}
-+	}
-+	return ""
-+}
-+
-+func requestShapeHash(method, path, model string, apiKeyID, userID, groupID int64) string {
-+	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d", method, path, model, apiKeyID, userID, groupID)))
-+	return hex.EncodeToString(sum[:12])
-+}
-+
-+func writeSubsiteForwardError(c *gin.Context, status int, code, message string) {
-+	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
-+}
-+
-+type subsiteAffinityStore struct {
-+	mu      sync.RWMutex
-+	ttl     time.Duration
-+	entries map[string]subsiteAffinityEntry
-+}
-+
-+type subsiteAffinityEntry struct {
-+	subsiteID string
-+	expiresAt time.Time
-+}
-+
-+func newSubsiteAffinityStore(ttl time.Duration) *subsiteAffinityStore {
-+	return &subsiteAffinityStore{ttl: ttl, entries: make(map[string]subsiteAffinityEntry)}
-+}
-+
-+func (s *subsiteAffinityStore) Get(key string) (string, bool) {
-+	s.mu.RLock()
-+	entry, ok := s.entries[key]
-+	s.mu.RUnlock()
-+	if !ok || time.Now().After(entry.expiresAt) {
-+		if ok {
-+			s.mu.Lock()
-+			delete(s.entries, key)
-+			s.mu.Unlock()
-+		}
-+		return "", false
-+	}
-+	return entry.subsiteID, true
-+}
-+
-+func (s *subsiteAffinityStore) Set(key, subsiteID string) {
-+	if key == "" || subsiteID == "" {
-+		return
-+	}
-+	s.mu.Lock()
-+	s.entries[key] = subsiteAffinityEntry{subsiteID: subsiteID, expiresAt: time.Now().Add(s.ttl)}
-+	s.mu.Unlock()
-+}
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 1738de6..0a19754 100644
+index 1738de6..068d85f 100644
 --- a/backend/internal/handler/wire.go
 +++ b/backend/internal/handler/wire.go
 @@ -108,6 +108,7 @@ func ProvideHandlers(
@@ -736,11 +246,46 @@ index 1738de6..0a19754 100644
  	NewTotpHandler,
  	ProvideSettingHandler,
  	NewPaymentHandler,
+@@ -204,9 +207,13 @@ var ProviderSet = wire.NewSet(
+ 	admin.NewWithdrawalHandler,
+ 	admin.NewShopHandler,
+ 	admin.NewAffiliateHandler,
+-	admin.NewSubsiteHandler,
++	ProvideSubsiteHandler,
+ 
+ 	// AdminHandlers and Handlers constructors
+ 	ProvideAdminHandlers,
+ 	ProvideHandlers,
+ )
++
++func ProvideSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService, settingService *service.SettingService) *admin.SubsiteHandler {
++	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
++}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..af13cf0 100644
+index 782fff0..55a031d 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
-@@ -300,6 +300,312 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
+@@ -281,6 +281,19 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
+ 	if affected, _ := res.RowsAffected(); affected == 0 {
+ 		return service.ErrSubsiteNotFound
+ 	}
++	if _, err := tx.ExecContext(ctx, `
++		INSERT INTO subsite_health_samples (
++			subsite_id, status, health_score, active_requests, queued_usage, qps,
++			cpu_percent, memory_bytes, version, metadata, created_at
++		)
++		VALUES ($1, $2,
++			CASE WHEN $2 = 'unhealthy' THEN 0 ELSE 100 END,
++			$3, $4, $5, $6, $7, $8, $9, $10
++		)
++	`, heartbeat.SubsiteID, heartbeat.Status, heartbeat.ActiveRequests, heartbeat.QueuedUsage,
++		heartbeat.QPS, heartbeat.CPUPercent, heartbeat.MemoryBytes, heartbeat.Version, metadataJSON, heartbeat.ReportedAt); err != nil {
++		return fmt.Errorf("insert subsite health sample: %w", err)
++	}
+ 	return tx.Commit()
+ }
+ 
+@@ -300,6 +313,456 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
  	return res.RowsAffected()
  }
  
@@ -915,6 +460,17 @@ index 782fff0..af13cf0 100644
 +	if err != nil {
 +		return fmt.Errorf("insert subsite forward event: %w", err)
 +	}
++	if event.Outcome == "failed" || (event.Outcome == "no_candidate" && strings.TrimSpace(event.SubsiteID) != "") {
++		_ = r.upsertCircuitBreaker(ctx, event)
++	} else if event.Outcome == "success" || event.Outcome == "fallback" {
++		_ = r.clearCircuitBreaker(ctx, "subsite", event.SubsiteID)
++		if event.AccountID > 0 {
++			_ = r.clearCircuitBreaker(ctx, "account", fmt.Sprint(event.AccountID))
++		}
++		if strings.TrimSpace(event.LeaseID) != "" {
++			_ = r.clearCircuitBreaker(ctx, "lease", event.LeaseID)
++		}
++	}
 +	return nil
 +}
 +
@@ -959,7 +515,10 @@ index 782fff0..af13cf0 100644
 +}
 +
 +func (r *subsiteRepository) ForwardStats(ctx context.Context) (*service.SubsiteForwardStats, error) {
-+	stats := &service.SubsiteForwardStats{BySubsite: []service.SubsiteForwardSiteStat{}}
++	stats := &service.SubsiteForwardStats{
++		BySubsite:       []service.SubsiteForwardSiteStat{},
++		CircuitBreakers: []service.SubsiteCircuitBreaker{},
++	}
 +	if err := r.db.QueryRowContext(ctx, `
 +		SELECT
 +			(SELECT COUNT(*) FROM subsite_forward_affinities WHERE deleted_at IS NULL),
@@ -969,6 +528,7 @@ index 782fff0..af13cf0 100644
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours'),
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome <> 'success'),
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome = 'fallback'),
++			(SELECT COUNT(*) FROM subsite_circuit_breakers WHERE deleted_at IS NULL AND cooldown_until > NOW()),
 +			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '90 seconds'),
 +			COALESCE((SELECT AVG(latency_ms)::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0)
 +	`).Scan(
@@ -979,6 +539,7 @@ index 782fff0..af13cf0 100644
 +		&stats.Events24h,
 +		&stats.Failures24h,
 +		&stats.Failovers24h,
++		&stats.CircuitOpen,
 +		&stats.OnlineSubsites,
 +		&stats.AvgLatencyMS24h,
 +	); err != nil {
@@ -995,7 +556,7 @@ index 782fff0..af13cf0 100644
 +			SELECT subsite_id,
 +				COUNT(*) AS events_24h,
 +				COUNT(*) FILTER (WHERE outcome <> 'success') AS failures_24h,
-+				COALESCE(AVG(latency_ms)::float8 FILTER (WHERE latency_ms > 0), 0) AS avg_latency_ms
++				COALESCE(AVG(latency_ms) FILTER (WHERE latency_ms > 0), 0)::float8 AS avg_latency_ms
 +			FROM subsite_forward_events
 +			WHERE created_at >= NOW() - INTERVAL '24 hours'
 +			GROUP BY subsite_id
@@ -1007,16 +568,27 @@ index 782fff0..af13cf0 100644
 +			FROM subsite_forward_affinities
 +			WHERE deleted_at IS NULL
 +			GROUP BY subsite_id
++		),
++		circuit_stats AS (
++			SELECT DISTINCT ON (subsite_id)
++				subsite_id, reason, cooldown_until
++			FROM subsite_circuit_breakers
++			WHERE deleted_at IS NULL
++			  AND cooldown_until > NOW()
++			  AND scope = 'subsite'
++			ORDER BY subsite_id, updated_at DESC
 +		)
 +		SELECT s.subsite_id, s.name, s.status, s.health_score, s.last_heartbeat_at,
 +			COALESCE(h.active_requests, 0), COALESCE(h.queued_usage, 0),
 +			COALESCE(h.qps, 0), COALESCE(h.cpu_percent, 0), COALESCE(h.memory_bytes, 0),
 +			COALESCE(es.events_24h, 0), COALESCE(es.failures_24h, 0), COALESCE(es.avg_latency_ms, 0),
-+			COALESCE(afs.affinities, 0), COALESCE(afs.locked_affinities, 0)
++			COALESCE(afs.affinities, 0), COALESCE(afs.locked_affinities, 0),
++			cs.subsite_id IS NOT NULL, COALESCE(cs.reason, ''), cs.cooldown_until
 +		FROM subsites s
 +		LEFT JOIN latest_hb h ON h.subsite_id = s.subsite_id
 +		LEFT JOIN event_stats es ON es.subsite_id = s.subsite_id
 +		LEFT JOIN affinity_stats afs ON afs.subsite_id = s.subsite_id
++		LEFT JOIN circuit_stats cs ON cs.subsite_id = s.subsite_id
 +		WHERE s.deleted_at IS NULL
 +		ORDER BY s.status = 'active' DESC, s.health_score DESC, s.name ASC
 +	`)
@@ -1042,18 +614,135 @@ index 782fff0..af13cf0 100644
 +			&item.AvgLatencyMS24h,
 +			&item.Affinities,
 +			&item.LockedAffinity,
++			&item.CircuitOpen,
++			&item.CircuitReason,
++			&item.CooldownUntil,
 +		); err != nil {
 +			return nil, err
 +		}
 +		stats.BySubsite = append(stats.BySubsite, item)
 +	}
-+	return stats, rows.Err()
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	breakers, err := r.ListActiveCircuitBreakers(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.CircuitBreakers = breakers
++	return stats, nil
++}
++
++func (r *subsiteRepository) ListActiveCircuitBreakers(ctx context.Context) ([]service.SubsiteCircuitBreaker, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		SELECT id, scope, target_id, COALESCE(subsite_id, ''), COALESCE(account_id, 0),
++			COALESCE(lease_id, ''), reason, failures, cooldown_until, last_error, created_at, updated_at
++		FROM subsite_circuit_breakers
++		WHERE deleted_at IS NULL
++		  AND cooldown_until > NOW()
++		ORDER BY cooldown_until DESC, updated_at DESC
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list active subsite circuit breakers: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteCircuitBreaker, 0)
++	for rows.Next() {
++		var item service.SubsiteCircuitBreaker
++		if err := rows.Scan(
++			&item.ID,
++			&item.Scope,
++			&item.TargetID,
++			&item.SubsiteID,
++			&item.AccountID,
++			&item.LeaseID,
++			&item.Reason,
++			&item.Failures,
++			&item.CooldownUntil,
++			&item.LastError,
++			&item.CreatedAt,
++			&item.UpdatedAt,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *subsiteRepository) upsertCircuitBreaker(ctx context.Context, event *service.SubsiteForwardEvent) error {
++	if event == nil {
++		return nil
++	}
++	scope := "subsite"
++	targetID := strings.TrimSpace(event.AttemptedSubsiteID)
++	if targetID == "" {
++		targetID = strings.TrimSpace(event.SubsiteID)
++	}
++	accountID := int64(0)
++	leaseID := ""
++	if event.AccountID > 0 {
++		scope = "account"
++		targetID = fmt.Sprint(event.AccountID)
++		accountID = event.AccountID
++	}
++	if strings.TrimSpace(event.LeaseID) != "" {
++		scope = "lease"
++		targetID = strings.TrimSpace(event.LeaseID)
++		leaseID = targetID
++		accountID = event.AccountID
++	}
++	if targetID == "" {
++		return nil
++	}
++	reason := strings.TrimSpace(event.Reason)
++	if reason == "" {
++		reason = event.Outcome
++	}
++	cooldown := time.Now().Add(2 * time.Minute)
++	_, err := r.db.ExecContext(ctx, `
++		INSERT INTO subsite_circuit_breakers (
++			scope, target_id, subsite_id, account_id, lease_id, reason,
++			failures, cooldown_until, last_error
++		)
++		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, 0), NULLIF($5, ''), $6, 1, $7, $8)
++		ON CONFLICT (scope, target_id) DO UPDATE
++		SET subsite_id = COALESCE(EXCLUDED.subsite_id, subsite_circuit_breakers.subsite_id),
++			account_id = COALESCE(EXCLUDED.account_id, subsite_circuit_breakers.account_id),
++			lease_id = COALESCE(EXCLUDED.lease_id, subsite_circuit_breakers.lease_id),
++			reason = EXCLUDED.reason,
++			failures = subsite_circuit_breakers.failures + 1,
++			cooldown_until = GREATEST(subsite_circuit_breakers.cooldown_until, EXCLUDED.cooldown_until),
++			last_error = EXCLUDED.last_error,
++			updated_at = NOW(),
++			deleted_at = NULL
++	`, scope, targetID, event.SubsiteID, accountID, leaseID, reason, cooldown, event.Error)
++	if err != nil {
++		return fmt.Errorf("upsert subsite circuit breaker: %w", err)
++	}
++	return nil
++}
++
++func (r *subsiteRepository) clearCircuitBreaker(ctx context.Context, scope, targetID string) error {
++	targetID = strings.TrimSpace(targetID)
++	if targetID == "" {
++		return nil
++	}
++	_, err := r.db.ExecContext(ctx, `
++		UPDATE subsite_circuit_breakers
++		SET deleted_at = NOW(), updated_at = NOW()
++		WHERE scope = $1 AND target_id = $2 AND deleted_at IS NULL
++	`, scope, targetID)
++	if err != nil {
++		return fmt.Errorf("clear subsite circuit breaker: %w", err)
++	}
++	return nil
 +}
 +
  type accountLeaseRepository struct {
  	db *sql.DB
  }
-@@ -546,14 +852,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+@@ -546,14 +1009,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
  
  	lease, err := scanAccountLease(tx.QueryRowContext(ctx, `
  		SELECT al.id, al.lease_id, al.subsite_id, al.account_id, al.group_id,
@@ -1070,7 +759,7 @@ index 782fff0..af13cf0 100644
  		WHERE al.lease_id = $1
  		  AND al.subsite_id = $2
  		  AND al.deleted_at IS NULL
-@@ -1070,6 +1374,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
+@@ -1070,6 +1531,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
  	return reservation, nil
  }
  
@@ -1212,7 +901,7 @@ index 782fff0..af13cf0 100644
  	if len(raw) == 0 {
  		return []string{}
 diff --git a/backend/internal/server/middleware/master_data_plane_guard.go b/backend/internal/server/middleware/master_data_plane_guard.go
-index 8725039..a832e61 100644
+index 8725039..afef002 100644
 --- a/backend/internal/server/middleware/master_data_plane_guard.go
 +++ b/backend/internal/server/middleware/master_data_plane_guard.go
 @@ -2,6 +2,7 @@ package middleware
@@ -1234,7 +923,7 @@ index 8725039..a832e61 100644
  		if settingService == nil || settingService.IsMasterDataPlaneEnabled(c.Request.Context()) {
  			c.Next()
  			return
-@@ -24,3 +29,10 @@ func MasterDataPlaneGuard(settingService *service.SettingService) gin.HandlerFun
+@@ -24,3 +29,14 @@ func MasterDataPlaneGuard(settingService *service.SettingService) gin.HandlerFun
  		})
  	}
  }
@@ -1243,17 +932,22 @@ index 8725039..a832e61 100644
 +	if !strings.EqualFold(method, http.MethodGet) {
 +		return false
 +	}
-+	return strings.TrimRight(strings.TrimSpace(path), "/") == "/v1/models"
++	normalized := strings.TrimRight(strings.TrimSpace(path), "/")
++	return normalized == "/v1/models" ||
++		normalized == "/models" ||
++		normalized == "/v1beta/models" ||
++		strings.HasPrefix(normalized, "/v1beta/models/")
 +}
 diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
-index 0b4a98b..c76d378 100644
+index 0b4a98b..a2edc16 100644
 --- a/backend/internal/server/routes/admin.go
 +++ b/backend/internal/server/routes/admin.go
-@@ -184,6 +184,11 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+@@ -184,6 +184,12 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
  func registerSubsiteRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
  	subsites := admin.Group("/subsites")
  	{
 +		subsites.GET("/forward-stats", h.Admin.Subsite.ForwardStats)
++		subsites.PUT("/forward-mode", h.Admin.Subsite.UpdateForwardMode)
 +		subsites.GET("/forward-affinities", h.Admin.Subsite.ListForwardAffinities)
 +		subsites.POST("/forward-affinities", h.Admin.Subsite.UpsertForwardAffinity)
 +		subsites.DELETE("/forward-affinities/:affinity_id", h.Admin.Subsite.DeleteForwardAffinity)
@@ -1262,7 +956,7 @@ index 0b4a98b..c76d378 100644
  		subsites.POST("", h.Admin.Subsite.Create)
  		subsites.PATCH("/:id", h.Admin.Subsite.Update)
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 2302ae5..33f37cf 100644
+index 2302ae5..d374de9 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -2,6 +2,8 @@ package routes
@@ -1274,12 +968,16 @@ index 2302ae5..33f37cf 100644
  
  	"github.com/Wei-Shaw/sub2api/internal/config"
  	"github.com/Wei-Shaw/sub2api/internal/handler"
-@@ -27,6 +29,22 @@ func RegisterGatewayRoutes(
+@@ -27,6 +29,26 @@ func RegisterGatewayRoutes(
  	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
  	endpointNorm := handler.InboundEndpointMiddleware()
  	masterDataPlaneGuard := middleware.MasterDataPlaneGuard(settingService)
 +	masterDataPlaneOrSubsiteForward := func(c *gin.Context) {
-+		mode := subsiteForwardMode()
++		mode := subsiteForwardMode(c, h)
++		if mode == "direct" {
++			abortDirectSubsiteOnly(c)
++			return
++		}
 +		if mode == "local" {
 +			c.Next()
 +			return
@@ -1297,7 +995,7 @@ index 2302ae5..33f37cf 100644
  
  	// 未分组 Key 拦截中间件（按协议格式区分错误响应）
  	requireGroupAnthropic := middleware.RequireGroupAssignment(settingService, middleware.AnthropicErrorWriter)
-@@ -34,7 +52,6 @@ func RegisterGatewayRoutes(
+@@ -34,7 +56,6 @@ func RegisterGatewayRoutes(
  
  	// API网关（Claude API兼容）
  	gateway := r.Group("/v1")
@@ -1305,7 +1003,7 @@ index 2302ae5..33f37cf 100644
  	gateway.Use(bodyLimit)
  	gateway.Use(clientRequestID)
  	gateway.Use(opsErrorLogger)
-@@ -44,6 +61,10 @@ func RegisterGatewayRoutes(
+@@ -44,6 +65,10 @@ func RegisterGatewayRoutes(
  	{
  		// /v1/messages: auto-route based on group platform
  		gateway.POST("/messages", func(c *gin.Context) {
@@ -1316,7 +1014,7 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				h.OpenAIGateway.Messages(c)
  				return
-@@ -52,6 +73,10 @@ func RegisterGatewayRoutes(
+@@ -52,6 +77,10 @@ func RegisterGatewayRoutes(
  		})
  		// /v1/messages/count_tokens: OpenAI groups get 404
  		gateway.POST("/messages/count_tokens", func(c *gin.Context) {
@@ -1327,12 +1025,12 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"type": "error",
-@@ -64,10 +89,14 @@ func RegisterGatewayRoutes(
+@@ -64,10 +93,14 @@ func RegisterGatewayRoutes(
  			}
  			h.Gateway.CountTokens(c)
  		})
 -		gateway.GET("/models", h.Gateway.Models)
-+		gateway.GET("/models", masterDataPlaneOrSubsiteForward, h.Gateway.Models)
++		gateway.GET("/models", masterDataPlaneGuard, h.Gateway.Models)
  		gateway.GET("/usage", h.Gateway.Usage)
  		// OpenAI Responses API: auto-route based on group platform
  		gateway.POST("/responses", func(c *gin.Context) {
@@ -1343,7 +1041,7 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				h.OpenAIGateway.Responses(c)
  				return
-@@ -75,15 +104,23 @@ func RegisterGatewayRoutes(
+@@ -75,15 +108,23 @@ func RegisterGatewayRoutes(
  			h.Gateway.Responses(c)
  		})
  		gateway.POST("/responses/*subpath", func(c *gin.Context) {
@@ -1368,7 +1066,7 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				h.OpenAIGateway.ChatCompletions(c)
  				return
-@@ -91,6 +128,10 @@ func RegisterGatewayRoutes(
+@@ -91,6 +132,10 @@ func RegisterGatewayRoutes(
  			h.Gateway.ChatCompletions(c)
  		})
  		gateway.POST("/images/generations", func(c *gin.Context) {
@@ -1379,7 +1077,7 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) != service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"error": gin.H{
-@@ -103,6 +144,10 @@ func RegisterGatewayRoutes(
+@@ -103,6 +148,10 @@ func RegisterGatewayRoutes(
  			h.OpenAIGateway.Images(c)
  		})
  		gateway.POST("/images/edits", func(c *gin.Context) {
@@ -1390,7 +1088,7 @@ index 2302ae5..33f37cf 100644
  			if getGroupPlatform(c) != service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"error": gin.H{
-@@ -118,7 +163,6 @@ func RegisterGatewayRoutes(
+@@ -118,7 +167,6 @@ func RegisterGatewayRoutes(
  
  	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
  	gemini := r.Group("/v1beta")
@@ -1398,14 +1096,14 @@ index 2302ae5..33f37cf 100644
  	gemini.Use(bodyLimit)
  	gemini.Use(clientRequestID)
  	gemini.Use(opsErrorLogger)
-@@ -126,39 +170,51 @@ func RegisterGatewayRoutes(
+@@ -126,39 +174,51 @@ func RegisterGatewayRoutes(
  	gemini.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
  	gemini.Use(requireGroupGoogle)
  	{
 -		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
 -		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
-+		gemini.GET("/models", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaListModels)
-+		gemini.GET("/models/:model", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaGetModel)
++		gemini.GET("/models", masterDataPlaneGuard, h.Gateway.GeminiV1BetaListModels)
++		gemini.GET("/models/:model", masterDataPlaneGuard, h.Gateway.GeminiV1BetaGetModel)
  		// Gin treats ":" as a param marker, but Gemini uses "{model}:{action}" in the same segment.
 -		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
 +		gemini.POST("/models/*modelAction", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaModels)
@@ -1434,7 +1132,8 @@ index 2302ae5..33f37cf 100644
  	{
  		codexDirect.POST("/responses", responsesHandler)
  		codexDirect.POST("/responses/*subpath", responsesHandler)
- 		codexDirect.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
+-		codexDirect.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
++		codexDirect.GET("/responses", masterDataPlaneGuard, h.OpenAIGateway.ResponsesWebSocket)
  	}
  	// OpenAI Chat Completions API（不带v1前缀的别名）— auto-route based on group platform
 -	r.POST("/chat/completions", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
@@ -1458,7 +1157,7 @@ index 2302ae5..33f37cf 100644
  		if getGroupPlatform(c) != service.PlatformOpenAI {
  			c.JSON(http.StatusNotFound, gin.H{
  				"error": gin.H{
-@@ -170,7 +226,11 @@ func RegisterGatewayRoutes(
+@@ -170,7 +230,11 @@ func RegisterGatewayRoutes(
  		}
  		h.OpenAIGateway.Images(c)
  	})
@@ -1471,21 +1170,16 @@ index 2302ae5..33f37cf 100644
  		if getGroupPlatform(c) != service.PlatformOpenAI {
  			c.JSON(http.StatusNotFound, gin.H{
  				"error": gin.H{
-@@ -220,6 +280,28 @@ func RegisterGatewayRoutes(
+@@ -220,6 +284,33 @@ func RegisterGatewayRoutes(
  
  }
  
-+func subsiteForwardMode() string {
-+	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUBSITE_FORWARD_MODE"))) {
-+	case "local", "master", "master_local":
-+		return "local"
-+	case "direct", "subsite", "subsite_direct":
-+		return "direct"
-+	case "forward", "subsite_forward", "":
-+		return "forward"
-+	default:
-+		return "forward"
++func subsiteForwardMode(c *gin.Context, h *handler.Handlers) string {
++	fallback := os.Getenv("SUBSITE_FORWARD_MODE")
++	if h != nil && h.SubsiteForwarder != nil && c != nil && c.Request != nil {
++		return h.SubsiteForwarder.Mode(c.Request.Context(), fallback)
 +	}
++	return service.NormalizeSubsiteForwardMode(fallback)
 +}
 +
 +func subsiteForwardLocalFallbackEnabled() bool {
@@ -1497,14 +1191,207 @@ index 2302ae5..33f37cf 100644
 +	}
 +}
 +
++func abortDirectSubsiteOnly(c *gin.Context) {
++	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
++		"error": gin.H{
++			"type":    "subsite_direct_only",
++			"code":    "SUBSITE_DIRECT_ONLY",
++			"message": "master is in direct-subsite-only mode; send model requests through a subsite endpoint or switch forwarding mode",
++		},
++	})
++}
++
  // getGroupPlatform extracts the group platform from the API Key stored in context.
  func getGroupPlatform(c *gin.Context) string {
  	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+diff --git a/backend/internal/service/domain_constants.go b/backend/internal/service/domain_constants.go
+index 0981342..9af4c8d 100644
+--- a/backend/internal/service/domain_constants.go
++++ b/backend/internal/service/domain_constants.go
+@@ -378,6 +378,9 @@ const (
+ 	// SettingKeySubsiteOnlyGatewayEnabled legacy inverse of master_data_plane_enabled.
+ 	SettingKeySubsiteOnlyGatewayEnabled = "subsite_only_gateway_enabled"
+ 
++	// SettingKeySubsiteForwardMode controls master/subsite gateway routing: local, forward, or direct.
++	SettingKeySubsiteForwardMode = "subsite_forward_mode"
++
+ 	// Gateway Forwarding Behavior
+ 	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
+ 	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
+diff --git a/backend/internal/service/setting_service.go b/backend/internal/service/setting_service.go
+index 2a56a15..64e8ac9 100644
+--- a/backend/internal/service/setting_service.go
++++ b/backend/internal/service/setting_service.go
+@@ -93,6 +93,18 @@ const masterDataPlaneCacheTTL = 60 * time.Second
+ const masterDataPlaneErrorTTL = 5 * time.Second
+ const masterDataPlaneDBTimeout = 5 * time.Second
+ 
++type cachedSubsiteForwardMode struct {
++	value     string
++	expiresAt int64 // unix nano
++}
++
++var subsiteForwardModeCache atomic.Value // *cachedSubsiteForwardMode
++var subsiteForwardModeSF singleflight.Group
++
++const subsiteForwardModeCacheTTL = 60 * time.Second
++const subsiteForwardModeErrorTTL = 5 * time.Second
++const subsiteForwardModeDBTimeout = 5 * time.Second
++
+ // cachedGatewayForwardingSettings 缓存网关转发行为设置（进程内缓存，60s TTL）
+ type cachedGatewayForwardingSettings struct {
+ 	fingerprintUnification       bool
+@@ -628,6 +640,7 @@ func (s *SettingService) GetPublicSettings(ctx context.Context) (*PublicSettings
+ 		SettingKeyBackendModeEnabled,
+ 		SettingKeyMasterDataPlaneEnabled,
+ 		SettingKeySubsiteOnlyGatewayEnabled,
++		SettingKeySubsiteForwardMode,
+ 		SettingPaymentEnabled,
+ 		SettingKeyOIDCConnectEnabled,
+ 		SettingKeyOIDCConnectProviderName,
+@@ -1709,6 +1722,7 @@ func (s *SettingService) buildSystemSettingsUpdates(ctx context.Context, setting
+ 	// Master data plane. Keep the legacy inverse key in sync for compatibility.
+ 	updates[SettingKeyMasterDataPlaneEnabled] = strconv.FormatBool(settings.MasterDataPlaneEnabled)
+ 	updates[SettingKeySubsiteOnlyGatewayEnabled] = strconv.FormatBool(!settings.MasterDataPlaneEnabled)
++	updates[SettingKeySubsiteForwardMode] = NormalizeSubsiteForwardMode(settings.SubsiteForwardMode)
+ 
+ 	// Gateway forwarding behavior
+ 	updates[SettingKeyEnableFingerprintUnification] = strconv.FormatBool(settings.EnableFingerprintUnification)
+@@ -1788,6 +1802,10 @@ func (s *SettingService) refreshCachedSettings(settings *SystemSettings) {
+ 		value:     settings.MasterDataPlaneEnabled,
+ 		expiresAt: time.Now().Add(masterDataPlaneCacheTTL).UnixNano(),
+ 	})
++	subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++		value:     NormalizeSubsiteForwardMode(settings.SubsiteForwardMode),
++		expiresAt: time.Now().Add(subsiteForwardModeCacheTTL).UnixNano(),
++	})
+ 	gatewayForwardingSF.Forget("gateway_forwarding")
+ 	gatewayForwardingCache.Store(&cachedGatewayForwardingSettings{
+ 		fingerprintUnification:       settings.EnableFingerprintUnification,
+@@ -1956,6 +1974,75 @@ func parseMasterDataPlaneEnabled(settings map[string]string) bool {
+ 	return true
+ }
+ 
++func NormalizeSubsiteForwardMode(mode string) string {
++	switch strings.ToLower(strings.TrimSpace(mode)) {
++	case "local", "master", "master_local":
++		return "local"
++	case "direct", "subsite", "subsite_direct":
++		return "direct"
++	case "forward", "subsite_forward", "":
++		return "forward"
++	default:
++		return "forward"
++	}
++}
++
++func (s *SettingService) GetSubsiteForwardMode(ctx context.Context, fallback string) string {
++	if cached, ok := subsiteForwardModeCache.Load().(*cachedSubsiteForwardMode); ok && cached != nil {
++		if time.Now().UnixNano() < cached.expiresAt {
++			return cached.value
++		}
++	}
++	result, _, _ := subsiteForwardModeSF.Do("subsite_forward_mode", func() (any, error) {
++		if cached, ok := subsiteForwardModeCache.Load().(*cachedSubsiteForwardMode); ok && cached != nil {
++			if time.Now().UnixNano() < cached.expiresAt {
++				return cached.value, nil
++			}
++		}
++		if s == nil || s.settingRepo == nil {
++			return NormalizeSubsiteForwardMode(fallback), nil
++		}
++		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subsiteForwardModeDBTimeout)
++		defer cancel()
++		value, err := s.settingRepo.GetValue(dbCtx, SettingKeySubsiteForwardMode)
++		if err != nil {
++			slog.Warn("failed to get subsite forward mode setting", "error", err)
++			mode := NormalizeSubsiteForwardMode(fallback)
++			subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++				value:     mode,
++				expiresAt: time.Now().Add(subsiteForwardModeErrorTTL).UnixNano(),
++			})
++			return mode, nil
++		}
++		mode := NormalizeSubsiteForwardMode(firstNonEmpty(value, fallback))
++		subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++			value:     mode,
++			expiresAt: time.Now().Add(subsiteForwardModeCacheTTL).UnixNano(),
++		})
++		return mode, nil
++	})
++	if mode, ok := result.(string); ok {
++		return NormalizeSubsiteForwardMode(mode)
++	}
++	return NormalizeSubsiteForwardMode(fallback)
++}
++
++func (s *SettingService) SetSubsiteForwardMode(ctx context.Context, mode string) (string, error) {
++	normalized := NormalizeSubsiteForwardMode(mode)
++	if s == nil || s.settingRepo == nil {
++		return normalized, ErrSettingNotFound
++	}
++	if err := s.settingRepo.Set(ctx, SettingKeySubsiteForwardMode, normalized); err != nil {
++		return "", err
++	}
++	subsiteForwardModeSF.Forget("subsite_forward_mode")
++	subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++		value:     normalized,
++		expiresAt: time.Now().Add(subsiteForwardModeCacheTTL).UnixNano(),
++	})
++	return normalized, nil
++}
++
+ type gatewayForwardingSettingsResult struct {
+ 	fp, mp, cch, cacheTTL1h bool
+ }
+@@ -2537,6 +2624,7 @@ func (s *SettingService) InitializeDefaultSettings(ctx context.Context) error {
+ 		SettingKeyUserPrivateGroupCommissionRate:            "0.005",
+ 		SettingKeyMasterDataPlaneEnabled:                    "true",
+ 		SettingKeySubsiteOnlyGatewayEnabled:                 "false",
++		SettingKeySubsiteForwardMode:                        "forward",
+ 		SettingPaymentVisibleMethodAlipaySource:             "",
+ 		SettingPaymentVisibleMethodWxpaySource:              "",
+ 		SettingPaymentVisibleMethodAlipayEnabled:            "false",
+@@ -2596,6 +2684,7 @@ func (s *SettingService) parseSettings(settings map[string]string) *SystemSettin
+ 		BackendModeEnabled:               settings[SettingKeyBackendModeEnabled] == "true",
+ 		MasterDataPlaneEnabled:           parseMasterDataPlaneEnabled(settings),
+ 		SubsiteOnlyGatewayEnabled:        !parseMasterDataPlaneEnabled(settings),
++		SubsiteForwardMode:               NormalizeSubsiteForwardMode(settings[SettingKeySubsiteForwardMode]),
+ 	}
+ 	result.TableDefaultPageSize, result.TablePageSizeOptions = parseTablePreferences(
+ 		settings[SettingKeyTableDefaultPageSize],
+diff --git a/backend/internal/service/settings_view.go b/backend/internal/service/settings_view.go
+index 46f5e7c..5f4c607 100644
+--- a/backend/internal/service/settings_view.go
++++ b/backend/internal/service/settings_view.go
+@@ -189,6 +189,9 @@ type SystemSettings struct {
+ 	// Deprecated: use MasterDataPlaneEnabled.
+ 	SubsiteOnlyGatewayEnabled bool
+ 
++	// Subsite forward mode: local, forward, or direct.
++	SubsiteForwardMode string
++
+ 	// Gateway forwarding behavior
+ 	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
+ 	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..28a3a1c 100644
+index 8cfa424..7a37c02 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
-@@ -384,6 +384,121 @@ type SubsiteMaintenanceResult struct {
+@@ -48,6 +48,12 @@ const (
+ 	SubsiteAuthHeaderBodySHA   = "X-Subsite-Body-SHA256"
+ 	SubsiteAuthHeaderSignature = "X-Subsite-Signature"
+ 
++	SubsiteRouteHeaderPreferredLeaseID   = "X-Sub2API-Preferred-Lease-ID"
++	SubsiteRouteHeaderPreferredAccountID = "X-Sub2API-Preferred-Account-ID"
++	SubsiteRouteHeaderTimestamp          = "X-Sub2API-Route-Timestamp"
++	SubsiteRouteHeaderNonce              = "X-Sub2API-Route-Nonce"
++	SubsiteRouteHeaderSignature          = "X-Sub2API-Route-Signature"
++
+ 	DefaultSubsiteHeartbeatTimeout       = 45 * time.Second
+ 	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
+ 	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
+@@ -384,6 +390,141 @@ type SubsiteMaintenanceResult struct {
  	ReservationExpiryGraceSecs int64 `json:"reservation_expiry_grace_secs"`
  }
  
@@ -1567,10 +1454,12 @@ index 8cfa424..28a3a1c 100644
 +	Events24h       int64                    `json:"events_24h"`
 +	Failures24h     int64                    `json:"failures_24h"`
 +	Failovers24h    int64                    `json:"failovers_24h"`
++	CircuitOpen     int64                    `json:"circuit_open"`
 +	OnlineSubsites  int64                    `json:"online_subsites"`
 +	AvgLatencyMS24h float64                  `json:"avg_latency_ms_24h"`
 +	Mode            string                   `json:"mode"`
 +	BySubsite       []SubsiteForwardSiteStat `json:"by_subsite"`
++	CircuitBreakers []SubsiteCircuitBreaker  `json:"circuit_breakers"`
 +}
 +
 +type SubsiteForwardSiteStat struct {
@@ -1589,6 +1478,24 @@ index 8cfa424..28a3a1c 100644
 +	AvgLatencyMS24h float64    `json:"avg_latency_ms_24h"`
 +	Affinities      int64      `json:"affinities"`
 +	LockedAffinity  int64      `json:"locked_affinities"`
++	CircuitOpen     bool       `json:"circuit_open"`
++	CircuitReason   string     `json:"circuit_reason"`
++	CooldownUntil   *time.Time `json:"cooldown_until,omitempty"`
++}
++
++type SubsiteCircuitBreaker struct {
++	ID            int64     `json:"id"`
++	Scope         string    `json:"scope"`
++	TargetID      string    `json:"target_id"`
++	SubsiteID     string    `json:"subsite_id"`
++	AccountID     int64     `json:"account_id,omitempty"`
++	LeaseID       string    `json:"lease_id,omitempty"`
++	Reason        string    `json:"reason"`
++	Failures      int       `json:"failures"`
++	CooldownUntil time.Time `json:"cooldown_until"`
++	LastError     string    `json:"last_error"`
++	CreatedAt     time.Time `json:"created_at"`
++	UpdatedAt     time.Time `json:"updated_at"`
 +}
 +
 +type UpsertSubsiteForwardAffinityInput struct {
@@ -1626,7 +1533,7 @@ index 8cfa424..28a3a1c 100644
  type SubsiteRepository interface {
  	Create(ctx context.Context, subsite *Subsite) error
  	GetBySubsiteID(ctx context.Context, subsiteID string) (*Subsite, error)
-@@ -395,6 +510,16 @@ type SubsiteRepository interface {
+@@ -395,6 +536,17 @@ type SubsiteRepository interface {
  	MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error)
  }
  
@@ -1638,12 +1545,13 @@ index 8cfa424..28a3a1c 100644
 +	RecordForwardEvent(ctx context.Context, event *SubsiteForwardEvent) error
 +	ListForwardEvents(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardEventsFilter) ([]SubsiteForwardEvent, *pagination.PaginationResult, error)
 +	ForwardStats(ctx context.Context) (*SubsiteForwardStats, error)
++	ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error)
 +}
 +
  type AccountLeaseRepository interface {
  	Create(ctx context.Context, lease *AccountLease) error
  	GetByLeaseID(ctx context.Context, leaseID string) (*AccountLease, error)
-@@ -436,12 +561,17 @@ type SubsiteNonceStore interface {
+@@ -436,12 +588,17 @@ type SubsiteNonceStore interface {
  }
  
  type SubsiteService struct {
@@ -1664,7 +1572,7 @@ index 8cfa424..28a3a1c 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -605,6 +735,99 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -605,6 +762,117 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	return s.repo.GetBySubsiteID(ctx, hb.SubsiteID)
  }
  
@@ -1761,10 +1669,28 @@ index 8cfa424..28a3a1c 100644
 +	return s.forwardRepo.ForwardStats(ctx)
 +}
 +
++func (s *SubsiteService) ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite service dependencies are nil")
++	}
++	return s.forwardRepo.ListActiveCircuitBreakers(ctx)
++}
++
++func (s *SubsiteService) SignRouteHint(ctx context.Context, subsiteID, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) (string, error) {
++	if s == nil || s.repo == nil || s.encryptor == nil {
++		return "", errors.New("subsite service dependencies are nil")
++	}
++	secret, err := s.decryptSecret(ctx, subsiteID)
++	if err != nil {
++		return "", err
++	}
++	return SignSubsiteRouteHint(secret, method, path, timestamp, nonce, preferredLeaseID, preferredAccountID), nil
++}
++
  func (s *SubsiteService) decryptSecret(ctx context.Context, subsiteID string) (string, error) {
  	subsite, err := s.repo.GetBySubsiteID(ctx, strings.TrimSpace(subsiteID))
  	if err != nil {
-@@ -671,6 +894,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
+@@ -671,6 +939,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
  	return nil
  }
  
@@ -1798,11 +1724,39 @@ index 8cfa424..28a3a1c 100644
  type SubsiteSignedRequest struct {
  	SubsiteID  string
  	Method     string
+@@ -705,6 +1000,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+ 	return hex.EncodeToString(mac.Sum(nil))
+ }
+ 
++func SignSubsiteRouteHint(secret, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) string {
++	canonical := strings.Join([]string{
++		strings.ToUpper(strings.TrimSpace(method)),
++		strings.TrimSpace(path),
++		strings.TrimSpace(timestamp),
++		strings.TrimSpace(nonce),
++		strings.TrimSpace(preferredLeaseID),
++		fmt.Sprint(preferredAccountID),
++	}, "\n")
++	mac := hmac.New(sha256.New, []byte(secret))
++	_, _ = mac.Write([]byte(canonical))
++	return hex.EncodeToString(mac.Sum(nil))
++}
++
+ type AccountLeaseService struct {
+ 	leaseRepo   AccountLeaseRepository
+ 	subsiteRepo SubsiteRepository
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
-index fe0842b..2b3f265 100644
+index fe0842b..20f2dbb 100644
 --- a/backend/internal/subsite/agent/server.go
 +++ b/backend/internal/subsite/agent/server.go
-@@ -10,6 +10,7 @@ import (
+@@ -4,12 +4,14 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"crypto/sha256"
++	"crypto/subtle"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
  	"fmt"
  	"io"
  	"net/http"
@@ -1810,7 +1764,7 @@ index fe0842b..2b3f265 100644
  	"strings"
  	"time"
  
-@@ -140,6 +141,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
+@@ -140,6 +142,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
  		})
  		return
  	}
@@ -1818,7 +1772,7 @@ index fe0842b..2b3f265 100644
  	s.credentials.Set(authorization)
  
  	result, err := s.proxyAuthorizedRequest(c, authorization, body)
-@@ -151,6 +153,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
+@@ -151,6 +154,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
  			s.credentials.Set(retryAuthorization)
  			result, err = s.proxyAuthorizedRequest(c, retryAuthorization, body)
  			authorization = retryAuthorization
@@ -1826,7 +1780,7 @@ index fe0842b..2b3f265 100644
  			if err == nil {
  				goto enqueue
  			}
-@@ -198,6 +201,18 @@ enqueue:
+@@ -198,6 +202,18 @@ enqueue:
  	}
  }
  
@@ -1845,16 +1799,61 @@ index fe0842b..2b3f265 100644
  func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResponse, []byte, error) {
  	body, err := io.ReadAll(c.Request.Body)
  	if err != nil {
-@@ -219,6 +234,8 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+@@ -209,6 +225,7 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+ 		return nil, nil, fmt.Errorf("api key is required")
+ 	}
+ 	requestedModel := extractRequestedModel(c, body)
++	preferredLeaseID, preferredAccountID := s.verifiedRouteHint(c)
+ 	input := service.AuthorizeSubsiteRequestInput{
+ 		SubsiteID:          s.cfg.Subsite.ID,
+ 		APIKey:             apiKey,
+@@ -219,6 +236,8 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
  		ClientIP:           clientIP(c),
  		UserAgent:          c.GetHeader("User-Agent"),
  		InboundEndpoint:    c.Request.URL.Path,
-+		PreferredLeaseID:   strings.TrimSpace(c.GetHeader("X-Sub2API-Preferred-Lease-ID")),
-+		PreferredAccountID: parsePreferredAccountID(c.GetHeader("X-Sub2API-Preferred-Account-ID")),
++		PreferredLeaseID:   preferredLeaseID,
++		PreferredAccountID: preferredAccountID,
  	}
  	if err := populateAuthorizeCostHints(&input, c, body); err != nil {
  		return nil, nil, err
-@@ -287,6 +304,14 @@ func extractClientAPIKey(c *gin.Context) string {
+@@ -230,6 +249,36 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+ 	return authorization, body, nil
+ }
+ 
++func (s *Server) verifiedRouteHint(c *gin.Context) (string, int64) {
++	if s == nil || s.cfg == nil {
++		return "", 0
++	}
++	leaseID := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderPreferredLeaseID))
++	accountID := parsePreferredAccountID(c.GetHeader(service.SubsiteRouteHeaderPreferredAccountID))
++	if leaseID == "" && accountID <= 0 {
++		return "", 0
++	}
++	timestamp := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderTimestamp))
++	nonce := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderNonce))
++	signature := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderSignature))
++	if timestamp == "" || nonce == "" || signature == "" {
++		return "", 0
++	}
++	ts, err := time.Parse(time.RFC3339, timestamp)
++	if err != nil {
++		return "", 0
++	}
++	now := time.Now()
++	if ts.Before(now.Add(-5*time.Minute)) || ts.After(now.Add(5*time.Minute)) {
++		return "", 0
++	}
++	expected := service.SignSubsiteRouteHint(s.cfg.Master.Secret, c.Request.Method, c.Request.URL.RequestURI(), timestamp, nonce, leaseID, accountID)
++	if subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) != 1 {
++		return "", 0
++	}
++	return leaseID, accountID
++}
++
+ func (s *Server) cancelReservation(ctx context.Context, requestID string) error {
+ 	payload := map[string]string{"request_id": requestID}
+ 	return s.master.PostRaw(ctx, "/api/internal/requests/cancel", payload, nil)
+@@ -287,6 +336,14 @@ func extractClientAPIKey(c *gin.Context) string {
  	return ""
  }
  
@@ -1869,85 +1868,6 @@ index fe0842b..2b3f265 100644
  func populateAuthorizeCostHints(input *service.AuthorizeSubsiteRequestInput, c *gin.Context, body []byte) error {
  	if input == nil {
  		return fmt.Errorf("authorize input is required")
-diff --git a/backend/migrations/144_subsite_forwarding_observability.sql b/backend/migrations/144_subsite_forwarding_observability.sql
-new file mode 100644
-index 0000000..2a07659
---- /dev/null
-+++ b/backend/migrations/144_subsite_forwarding_observability.sql
-@@ -0,0 +1,73 @@
-+CREATE TABLE IF NOT EXISTS subsite_forward_affinities (
-+    id                   BIGSERIAL PRIMARY KEY,
-+    affinity_key         VARCHAR(256) NOT NULL UNIQUE,
-+    affinity_type        VARCHAR(32) NOT NULL DEFAULT 'session',
-+    subsite_id           VARCHAR(64) NOT NULL REFERENCES subsites(subsite_id) ON DELETE CASCADE,
-+    lease_id             VARCHAR(80),
-+    account_id           BIGINT,
-+    api_key_id           BIGINT,
-+    user_id              BIGINT,
-+    group_id             BIGINT,
-+    model                VARCHAR(160) NOT NULL DEFAULT '',
-+    session_id           VARCHAR(256) NOT NULL DEFAULT '',
-+    source               VARCHAR(32) NOT NULL DEFAULT 'auto',
-+    locked               BOOLEAN NOT NULL DEFAULT FALSE,
-+    hits                 BIGINT NOT NULL DEFAULT 0,
-+    last_reason          VARCHAR(64) NOT NULL DEFAULT '',
-+    last_error           TEXT NOT NULL DEFAULT '',
-+    expires_at           TIMESTAMPTZ NOT NULL,
-+    last_used_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-+    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-+    deleted_at           TIMESTAMPTZ,
-+    CONSTRAINT subsite_forward_affinities_type_check CHECK (affinity_type IN ('session', 'api_key', 'account', 'manual')),
-+    CONSTRAINT subsite_forward_affinities_source_check CHECK (source IN ('auto', 'manual', 'fallback', 'imported'))
-+);
-+
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_subsite
-+    ON subsite_forward_affinities (subsite_id, last_used_at DESC)
-+    WHERE deleted_at IS NULL;
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_api_key
-+    ON subsite_forward_affinities (api_key_id, last_used_at DESC)
-+    WHERE deleted_at IS NULL AND api_key_id IS NOT NULL;
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_account
-+    ON subsite_forward_affinities (account_id, last_used_at DESC)
-+    WHERE deleted_at IS NULL AND account_id IS NOT NULL;
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_expires
-+    ON subsite_forward_affinities (expires_at)
-+    WHERE deleted_at IS NULL AND locked = FALSE;
-+
-+CREATE TABLE IF NOT EXISTS subsite_forward_events (
-+    id                   BIGSERIAL PRIMARY KEY,
-+    request_id           VARCHAR(128) NOT NULL DEFAULT '',
-+    affinity_key         VARCHAR(256) NOT NULL DEFAULT '',
-+    subsite_id           VARCHAR(64) REFERENCES subsites(subsite_id) ON DELETE SET NULL,
-+    attempted_subsite_id VARCHAR(64) NOT NULL DEFAULT '',
-+    fallback_from        VARCHAR(64) NOT NULL DEFAULT '',
-+    lease_id             VARCHAR(80),
-+    account_id           BIGINT,
-+    api_key_id           BIGINT,
-+    user_id              BIGINT,
-+    group_id             BIGINT,
-+    model                VARCHAR(160) NOT NULL DEFAULT '',
-+    session_id           VARCHAR(256) NOT NULL DEFAULT '',
-+    method               VARCHAR(16) NOT NULL DEFAULT '',
-+    path                 TEXT NOT NULL DEFAULT '',
-+    status_code          INT NOT NULL DEFAULT 0,
-+    latency_ms           BIGINT NOT NULL DEFAULT 0,
-+    request_bytes        BIGINT NOT NULL DEFAULT 0,
-+    response_bytes       BIGINT NOT NULL DEFAULT 0,
-+    reason               VARCHAR(64) NOT NULL DEFAULT '',
-+    outcome              VARCHAR(32) NOT NULL DEFAULT '',
-+    error                TEXT NOT NULL DEFAULT '',
-+    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
-+    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-+    CONSTRAINT subsite_forward_events_outcome_check CHECK (outcome IN ('success', 'failed', 'no_candidate', 'fallback'))
-+);
-+
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_created
-+    ON subsite_forward_events (created_at DESC);
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_subsite_created
-+    ON subsite_forward_events (subsite_id, created_at DESC);
-+CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_affinity_created
-+    ON subsite_forward_events (affinity_key, created_at DESC);
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
 index 7ff95d3..bd6ed44 100644
 --- a/frontend/src/api/admin/index.ts
@@ -1959,10 +1879,10 @@ index 7ff95d3..bd6ed44 100644
 -export type { Subsite, AccountLease, ResetSubsiteSecretResult } from './subsites'
 +export type { Subsite, AccountLease, ResetSubsiteSecretResult, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..2419ac4 100644
+index 1faa4eb..35271e0 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
-@@ -43,6 +43,103 @@ export interface AccountLease {
+@@ -43,6 +43,125 @@ export interface AccountLease {
    updated_at: string
  }
  
@@ -1982,6 +1902,24 @@ index 1faa4eb..2419ac4 100644
 +  avg_latency_ms_24h: number
 +  affinities: number
 +  locked_affinities: number
++  circuit_open: boolean
++  circuit_reason: string
++  cooldown_until?: string
++}
++
++export interface SubsiteCircuitBreaker {
++  id: number
++  scope: string
++  target_id: string
++  subsite_id: string
++  account_id?: number
++  lease_id?: string
++  reason: string
++  failures: number
++  cooldown_until: string
++  last_error: string
++  created_at: string
++  updated_at: string
 +}
 +
 +export interface SubsiteForwardStats {
@@ -1992,11 +1930,15 @@ index 1faa4eb..2419ac4 100644
 +  events_24h: number
 +  failures_24h: number
 +  failovers_24h: number
++  circuit_open: number
 +  online_subsites: number
 +  avg_latency_ms_24h: number
 +  mode: string
 +  by_subsite: SubsiteForwardSiteStat[]
++  circuit_breakers: SubsiteCircuitBreaker[]
 +}
++
++export type SubsiteForwardMode = 'local' | 'forward' | 'direct'
 +
 +export interface SubsiteForwardAffinity {
 +  id: number
@@ -2066,12 +2008,17 @@ index 1faa4eb..2419ac4 100644
  export interface CreateSubsiteRequest {
    subsite_id?: string
    name: string
-@@ -187,6 +284,50 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+@@ -187,6 +306,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
    await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
  }
  
 +export async function forwardStats(): Promise<SubsiteForwardStats> {
 +  const { data } = await apiClient.get<SubsiteForwardStats>('/admin/subsites/forward-stats')
++  return data
++}
++
++export async function updateForwardMode(mode: SubsiteForwardMode): Promise<{ mode: SubsiteForwardMode }> {
++  const { data } = await apiClient.put<{ mode: SubsiteForwardMode }>('/admin/subsites/forward-mode', { mode })
 +  return data
 +}
 +
@@ -2117,46 +2064,441 @@ index 1faa4eb..2419ac4 100644
  export default {
    list,
    create,
-@@ -202,5 +343,10 @@ export default {
+@@ -202,5 +370,11 @@ export default {
    releaseLease,
    renewLease,
    updateLease,
 -  deleteLease
 +  deleteLease,
 +  forwardStats,
++  updateForwardMode,
 +  listForwardAffinities,
 +  upsertForwardAffinity,
 +  deleteForwardAffinity,
 +  listForwardEvents
  }
+diff --git a/frontend/src/components/layout/AppSidebar.vue b/frontend/src/components/layout/AppSidebar.vue
+index d6c7269..279e44f 100644
+--- a/frontend/src/components/layout/AppSidebar.vue
++++ b/frontend/src/components/layout/AppSidebar.vue
+@@ -740,7 +740,7 @@ const adminNavItems = computed((): NavItem[] => {
+     },
+     { path: '/admin/subscriptions', label: t('nav.subscriptions'), icon: CreditCardIcon, hideInSimpleMode: true },
+     { path: '/admin/accounts', label: t('nav.accounts'), icon: GlobeIcon },
+-    { path: '/admin/subsites', label: '子站管理', icon: ServerIcon, hideInSimpleMode: true },
++    { path: '/admin/subsites', label: t('nav.subsites'), icon: ServerIcon, hideInSimpleMode: true },
+     { path: '/admin/announcements', label: t('nav.announcements'), icon: BellIcon },
+     { path: '/admin/proxies', label: t('nav.proxies'), icon: ServerIcon },
+     { path: '/admin/risk-control', label: t('nav.riskControl'), icon: ShieldIcon, hideInSimpleMode: true, featureFlag: flagRiskControl },
+diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
+index 55c44e1..291d6b0 100644
+--- a/frontend/src/i18n/locales/en.ts
++++ b/frontend/src/i18n/locales/en.ts
+@@ -355,6 +355,7 @@ export default {
+     subscriptions: 'Subscriptions',
+     accounts: 'Accounts',
+     myAccounts: 'My Accounts',
++    subsites: 'Subsites',
+     proxies: 'Proxies',
+     redeemCodes: 'Redeem Codes',
+     ops: 'Ops',
+@@ -1649,6 +1650,165 @@ export default {
+         file: 'File',
+       },
+     },
++    subsites: {
++      title: 'Subsite Management',
++      description: 'Manage edge subsites, forwarding mode, sticky sessions, route events, leases, load, and failover state.',
++      searchPlaceholder: 'Search name, ID, or URL',
++      allStatuses: 'All statuses',
++      createSubsite: 'New subsite',
++      copyUrlTitle: 'Copy URL',
++      limitsLabel: 'QPS {qps} / concurrency {concurrency}',
++      columns: {
++        publicUrl: 'Entry URL',
++        limits: 'Limits',
++      },
++      actions: {
++        leases: 'Leases',
++        copyConfig: 'Copy config',
++        repair: 'Repair',
++        activate: 'Activate',
++        pause: 'Pause',
++        resume: 'Resume',
++      },
++      status: {
++        pending: 'Pending',
++        active: 'Active',
++        maintenance: 'Maintenance',
++        unhealthy: 'Unhealthy',
++        disabled: 'Disabled',
++      },
++      form: {
++        createTitle: 'New subsite',
++        editTitle: 'Edit subsite',
++        subsiteId: 'Subsite ID',
++        subsiteIdPlaceholder: 'Leave empty to generate automatically',
++        region: 'Region',
++        version: 'Version',
++        maxQps: 'Max QPS',
++        maxConcurrency: 'Max concurrency',
++        capabilities: 'Capability tags',
++      },
++      secret: {
++        title: 'Subsite secret',
++        onceHint: 'The secret is shown only once. Put it into the subsite agent environment variables.',
++      },
++      reset: {
++        title: 'Repair subsite connectivity',
++        warning: 'This resets the master authentication secret for {name}. The old subsite secret becomes invalid immediately. Write the new secret to the subsite environment file and restart the subsite agent to restore heartbeats.',
++        masterUrlHint: 'Make sure SUBSITE_MASTER_URL is the root master URL reachable by the subsite. Do not include /api/v1.',
++        copyEnv: 'Copy environment variables',
++        repairing: 'Repairing...',
++        resetSecret: 'Reset secret',
++      },
++      forward: {
++        requests24h: '24h Requests',
++        avgLatency: 'Avg {ms} ms',
++        failures24h: '24h Failures',
++        failuresHint: 'Includes no-candidate, proxy failures, and subsite 429/5xx responses.',
++        stickySessions: 'Sticky Sessions',
++        lockedCount: '{count} locked',
++        mode: 'Forward Mode',
++        modes: {
++          local: 'Master local handling',
++          forward: 'Master forwards to subsites',
++          direct: 'Direct subsite only',
++        },
++        policyHint: 'Healthy subsites first. {count} circuit breakers currently open.',
++        loadTitle: 'Subsite Load',
++        loadDescription: 'Latest heartbeat, route volume, sticky sessions, failures, and circuit state.',
++        subsite: 'Subsite',
++        load: 'Load',
++        last24h: '24h',
++        sticky: 'Sticky',
++        health: 'Health',
++        activeQueue: 'active {active} / queue {queue}',
++        qpsCpu: 'qps {qps} / cpu {cpu}%',
++        reqCount: '{count} req',
++        failCount: '{count} fail',
++        totalCount: '{count} total',
++        circuitOpen: 'Circuit open',
++        circuitBreakers: 'Circuit Breakers',
++        failures: '{count} failures',
++        until: 'Until {value}',
++        noCircuitBreakers: 'No circuit breakers are open.',
++        fallbackFrom: 'Fallback from {value}',
++        manualLock: 'Manual Sticky Lock',
++        manualLockHint: 'Lock an affinity key to a subsite, optionally forcing a lease or account hint.',
++        affinityKeyPlaceholder: 'affinity key, e.g. api:1:user:2:...',
++        selectSubsite: 'Select subsite',
++        leaseId: 'lease id',
++        accountId: 'account id',
++        apiKeyId: 'api key id',
++        ttlHours: 'ttl hours',
++        keepLocked: 'Keep locked until manually deleted',
++        saveLock: 'Save sticky lock',
++        hits: 'hits {count}',
++        locked: 'locked',
++        accountValue: 'account {value}',
++        leaseValue: 'lease {value}',
++        noSticky: 'No sticky sessions yet.',
++        routeEvents: 'Route Events',
++        noEvents: 'No route events yet.',
++        deleteStickyConfirm: 'Delete this sticky session?',
++      },
++      leases: {
++        titleWithName: 'Leases - {name}',
++        requestsUsage: 'Requests {used} / {max}',
++        renew24h: 'Renew 24h',
++        drain: 'Drain',
++        release: 'Release',
++        createTitle: 'Create lease',
++        loadingAccounts: 'Loading master accounts by group...',
++        group: 'Group',
++        selectGroup: 'Select group',
++        account: 'Account',
++        accountSearchPlaceholder: 'Search by account ID, name, or platform',
++        selectAccount: 'Select account',
++        ttlHours: 'TTL hours',
++        maxRequests: 'Max requests',
++        maxTokens: 'Max tokens',
++        randomCount: 'Random count',
++        creating: 'Creating...',
++        createLease: 'Create lease',
++        addingProgress: 'Adding {done}/{total}',
++        addAllAccounts: 'Add all {count} accounts',
++        randomAccounts: 'Random {count}',
++        randomCustomAccounts: 'Random custom {count}',
++        bulkEditTitle: 'Bulk edit settings',
++        selectedLeases: '{count} leases selected',
++        savingProgress: 'Saving {done}/{total}',
++        saveSelectedSettings: 'Save selected lease settings',
++        bulkRenew: 'Bulk renew',
++        bulkRelease: 'Bulk release',
++        bulkDelete: 'Bulk delete',
++        selectGroupFirst: 'Select a group first',
++        noMatchedAccounts: 'No available account matches the current search',
++        noAvailableAccounts: 'No active available account in this group',
++        confirmUpdateSelected: 'Update request and max token settings for {count} leases?',
++        bulkSummarySave: 'Bulk save completed: {success} succeeded, {failed} failed',
++        actionRenew24h: 'renew for 24 hours',
++        actionRelease: 'release',
++        actionDelete: 'delete',
++        confirmBulkAction: 'Confirm {action} for {count} leases?',
++        bulkSummaryAction: 'Bulk {action} completed: {success} succeeded, {failed} failed',
++        confirmCreateAll: 'Create leases for all {count} accounts in the current filter?',
++        confirmCreateRandom: 'Create leases for {count} randomly selected available accounts?',
++        bulkSummaryAdd: 'Bulk add completed: {success} succeeded, {failed} failed',
++        notSchedulable: 'not schedulable',
++        confirmDeleteLease: 'Delete lease {lease}? This cannot be undone.',
++        usage: 'Usage',
++        expiresAt: 'Expires at',
++        unboundGroup: 'Unbound group',
++        status: {
++          active: 'Available',
++          renewing: 'Renewing',
++          draining: 'Draining',
++          released: 'Released',
++          expired: 'Expired',
++          revoked: 'Revoked',
++        },
++      },
++    },
+     // Dashboard
+     dashboard: {
+       title: 'Admin Dashboard',
+diff --git a/frontend/src/i18n/locales/zh.ts b/frontend/src/i18n/locales/zh.ts
+index 4a23db1..73fd3f0 100644
+--- a/frontend/src/i18n/locales/zh.ts
++++ b/frontend/src/i18n/locales/zh.ts
+@@ -355,6 +355,7 @@ export default {
+     subscriptions: '订阅管理',
+     accounts: '账号管理',
+     myAccounts: '我的账号',
++    subsites: '子站管理',
+     proxies: 'IP管理',
+     redeemCodes: '兑换码',
+     ops: '运维监控',
+@@ -1653,6 +1654,165 @@ export default {
+         file: '文件',
+       },
+     },
++    subsites: {
++      title: '子站管理',
++      description: '管理边缘子站、转发模式、粘性会话、路由记录、租约、负载和故障切换状态。',
++      searchPlaceholder: '搜索名称、ID 或 URL',
++      allStatuses: '全部状态',
++      createSubsite: '新建子站',
++      copyUrlTitle: '复制 URL',
++      limitsLabel: 'QPS {qps} / 并发 {concurrency}',
++      columns: {
++        publicUrl: '入口 URL',
++        limits: '限制',
++      },
++      actions: {
++        leases: '租约',
++        copyConfig: '复制配置',
++        repair: '修复',
++        activate: '激活',
++        pause: '暂停',
++        resume: '恢复',
++      },
++      status: {
++        pending: '待激活',
++        active: '运行中',
++        maintenance: '维护中',
++        unhealthy: '异常',
++        disabled: '已停用',
++      },
++      form: {
++        createTitle: '新建子站',
++        editTitle: '编辑子站',
++        subsiteId: '子站 ID',
++        subsiteIdPlaceholder: '留空自动生成',
++        region: '区域',
++        version: '版本',
++        maxQps: '最大 QPS',
++        maxConcurrency: '最大并发',
++        capabilities: '能力标签',
++      },
++      secret: {
++        title: '子站密钥',
++        onceHint: '密钥只显示一次，请写入子站 agent 的环境变量。',
++      },
++      reset: {
++        title: '修复子站连通',
++        warning: '这会重置 {name} 的主站认证密钥。旧子站密钥会立即失效，必须把新密钥写入子站环境变量并重启子站后，心跳才会恢复。',
++        masterUrlHint: '请确认 SUBSITE_MASTER_URL 是子站能够访问到的主站根地址，不要带 /api/v1。',
++        copyEnv: '复制环境变量',
++        repairing: '修复中...',
++        resetSecret: '重置密钥',
++      },
++      forward: {
++        requests24h: '24 小时请求',
++        avgLatency: '平均 {ms} ms',
++        failures24h: '24 小时失败',
++        failuresHint: '包含无可用子站、代理失败和子站 429/5xx。',
++        stickySessions: '粘性会话',
++        lockedCount: '{count} 个锁定',
++        mode: '转发模式',
++        modes: {
++          local: '主站本地处理',
++          forward: '主站转发到子站',
++          direct: '仅允许直连子站',
++        },
++        policyHint: '健康子站优先，当前 {count} 个熔断。',
++        loadTitle: '子站负载',
++        loadDescription: '展示最新心跳、转发量、粘性会话、失败率和熔断状态。',
++        subsite: '子站',
++        load: '负载',
++        last24h: '24 小时',
++        sticky: '粘性',
++        health: '健康',
++        activeQueue: '活动 {active} / 队列 {queue}',
++        qpsCpu: 'QPS {qps} / CPU {cpu}%',
++        reqCount: '{count} 次请求',
++        failCount: '{count} 次失败',
++        totalCount: '总计 {count}',
++        circuitOpen: '熔断',
++        circuitBreakers: '故障熔断',
++        failures: '{count} 次失败',
++        until: '解除时间 {value}',
++        noCircuitBreakers: '暂无打开的熔断。',
++        fallbackFrom: '从 {value} 故障切换',
++        manualLock: '手动粘性锁定',
++        manualLockHint: '把指定 affinity key 固定到子站，可选强制指定租约或账号。',
++        affinityKeyPlaceholder: 'affinity key，例如 api:1:user:2:...',
++        selectSubsite: '选择子站',
++        leaseId: '租约 ID',
++        accountId: '账号 ID',
++        apiKeyId: 'API Key ID',
++        ttlHours: 'TTL 小时',
++        keepLocked: '保持锁定，直到手动删除',
++        saveLock: '保存粘性锁定',
++        hits: '命中 {count}',
++        locked: '已锁定',
++        accountValue: '账号 {value}',
++        leaseValue: '租约 {value}',
++        noSticky: '暂无粘性会话。',
++        routeEvents: '路由记录',
++        noEvents: '暂无路由记录。',
++        deleteStickyConfirm: '确定删除这个粘性会话吗？',
++      },
++      leases: {
++        titleWithName: '租约 - {name}',
++        requestsUsage: '请求 {used} / {max}',
++        renew24h: '续租 24h',
++        drain: '排空',
++        release: '释放',
++        createTitle: '新增租约',
++        loadingAccounts: '正在按分组加载主站账号...',
++        group: '分组',
++        selectGroup: '选择分组',
++        account: '账号',
++        accountSearchPlaceholder: '输入账号 ID、名称或平台搜索',
++        selectAccount: '选择账号',
++        ttlHours: 'TTL 小时',
++        maxRequests: '最大请求数',
++        maxTokens: '最大 Token',
++        randomCount: '随机数量',
++        creating: '创建中...',
++        createLease: '创建租约',
++        addingProgress: '添加中 {done}/{total}',
++        addAllAccounts: '添加全部 {count} 个账号',
++        randomAccounts: '随机 {count} 个',
++        randomCustomAccounts: '随机自定义 {count} 个',
++        bulkEditTitle: '批量更改设置',
++        selectedLeases: '已选择 {count} 个租约',
++        savingProgress: '保存中 {done}/{total}',
++        saveSelectedSettings: '保存所选租约设置',
++        bulkRenew: '批量续租',
++        bulkRelease: '批量释放',
++        bulkDelete: '批量删除',
++        selectGroupFirst: '请先选择分组',
++        noMatchedAccounts: '没有匹配当前搜索的可用账号',
++        noAvailableAccounts: '当前分组下没有可用活跃账号',
++        confirmUpdateSelected: '确认更新 {count} 个租约的请求数和最大 Token 设置？',
++        bulkSummarySave: '批量保存完成：成功 {success} 个，失败 {failed} 个',
++        actionRenew24h: '续租 24 小时',
++        actionRelease: '释放',
++        actionDelete: '删除',
++        confirmBulkAction: '确认{action} {count} 个租约？',
++        bulkSummaryAction: '批量{action}完成：成功 {success} 个，失败 {failed} 个',
++        confirmCreateAll: '确认给当前筛选出的 {count} 个账号全部创建租约？',
++        confirmCreateRandom: '确认随机选择 {count} 个可用账号创建租约？',
++        bulkSummaryAdd: '批量添加完成：成功 {success} 个，失败 {failed} 个',
++        notSchedulable: '不可调度',
++        confirmDeleteLease: '确认删除租约 {lease}？该操作不可撤销。',
++        usage: '用量',
++        expiresAt: '过期时间',
++        unboundGroup: '未绑定分组',
++        status: {
++          active: '可用',
++          renewing: '续租中',
++          draining: '排空中',
++          released: '已释放',
++          expired: '已过期',
++          revoked: '已撤销',
++        },
++      },
++    },
+     // Dashboard
+     dashboard: {
+       title: '管理控制台',
+diff --git a/frontend/src/router/index.ts b/frontend/src/router/index.ts
+index f59b1e7..b9e73c6 100644
+--- a/frontend/src/router/index.ts
++++ b/frontend/src/router/index.ts
+@@ -496,7 +496,9 @@ const routes: RouteRecordRaw[] = [
+     meta: {
+       requiresAuth: true,
+       requiresAdmin: true,
+-      title: 'Subsite Management'
++      title: 'Subsite Management',
++      titleKey: 'admin.subsites.title',
++      descriptionKey: 'admin.subsites.description'
+     }
+   },
+   {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..6c82619 100644
+index cb5d3f8..d3000cf 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,5 +1,158 @@
+@@ -1,19 +1,218 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
 +      <div class="grid gap-4 md:grid-cols-4">
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
-+          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">24h Requests</p>
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">{{ t('admin.subsites.forward.requests24h') }}</p>
 +          <p class="mt-2 text-2xl font-semibold text-gray-900 dark:text-white">{{ forwardStats?.events_24h ?? 0 }}</p>
-+          <p class="mt-1 text-xs text-gray-500">Avg {{ Math.round(forwardStats?.avg_latency_ms_24h || 0) }} ms</p>
++          <p class="mt-1 text-xs text-gray-500">{{ t('admin.subsites.forward.avgLatency', { ms: Math.round(forwardStats?.avg_latency_ms_24h || 0) }) }}</p>
 +        </div>
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
-+          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">24h Failures</p>
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">{{ t('admin.subsites.forward.failures24h') }}</p>
 +          <p class="mt-2 text-2xl font-semibold text-red-600">{{ forwardStats?.failures_24h ?? 0 }}</p>
-+          <p class="mt-1 text-xs text-gray-500">Includes no candidate and proxy failures</p>
++          <p class="mt-1 text-xs text-gray-500">{{ t('admin.subsites.forward.failuresHint') }}</p>
 +        </div>
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
-+          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">Sticky Sessions</p>
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">{{ t('admin.subsites.forward.stickySessions') }}</p>
 +          <p class="mt-2 text-2xl font-semibold text-gray-900 dark:text-white">{{ forwardStats?.active_affinities ?? 0 }}</p>
-+          <p class="mt-1 text-xs text-gray-500">{{ forwardStats?.locked_affinities ?? 0 }} manually locked</p>
++          <p class="mt-1 text-xs text-gray-500">{{ t('admin.subsites.forward.lockedCount', { count: forwardStats?.locked_affinities ?? 0 }) }}</p>
 +        </div>
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
-+          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">Failover Policy</p>
-+          <p class="mt-2 text-sm font-semibold text-gray-900 dark:text-white">DB sticky + account hints</p>
-+          <p class="mt-1 text-xs text-gray-500">Requests prefer the same subsite/account when healthy.</p>
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">{{ t('admin.subsites.forward.mode') }}</p>
++          <p class="mt-2 text-sm font-semibold text-gray-900 dark:text-white">{{ forwardModeLabel(forwardStats?.mode) }}</p>
++          <div class="mt-3 flex gap-2">
++            <select v-model="forwardModeForm" class="input min-h-[36px] flex-1 text-sm">
++              <option value="local">{{ t('admin.subsites.forward.modes.local') }}</option>
++              <option value="forward">{{ t('admin.subsites.forward.modes.forward') }}</option>
++              <option value="direct">{{ t('admin.subsites.forward.modes.direct') }}</option>
++            </select>
++            <button class="btn btn-sm btn-secondary" :disabled="forwardModeSaving || forwardModeForm === (forwardStats?.mode || 'forward')" @click="saveForwardMode">
++              {{ t('common.save') }}
++            </button>
++          </div>
++          <p class="mt-2 text-xs text-gray-500">{{ t('admin.subsites.forward.policyHint', { count: forwardStats?.circuit_open ?? 0 }) }}</p>
 +        </div>
 +      </div>
 +
@@ -2164,8 +2506,8 @@ index cb5d3f8..6c82619 100644
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
 +          <div class="mb-3 flex items-center justify-between gap-3">
 +            <div>
-+              <h2 class="text-base font-semibold text-gray-900 dark:text-white">Subsite Load</h2>
-+              <p class="text-xs text-gray-500">Latest heartbeat, route volume, sticky sessions and failures.</p>
++              <h2 class="text-base font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.forward.loadTitle') }}</h2>
++              <p class="text-xs text-gray-500">{{ t('admin.subsites.forward.loadDescription') }}</p>
 +            </div>
 +            <button class="btn btn-sm btn-secondary" :disabled="forwardLoading" @click="loadForwardConsole">
 +              <Icon name="refresh" size="sm" :class="forwardLoading ? 'animate-spin' : ''" />
@@ -2175,11 +2517,11 @@ index cb5d3f8..6c82619 100644
 +            <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-600">
 +              <thead class="text-left text-xs uppercase tracking-wide text-gray-500">
 +                <tr>
-+                  <th class="py-2 pr-4">Subsite</th>
-+                  <th class="py-2 pr-4">Load</th>
-+                  <th class="py-2 pr-4">24h</th>
-+                  <th class="py-2 pr-4">Sticky</th>
-+                  <th class="py-2">Health</th>
++                  <th class="py-2 pr-4">{{ t('admin.subsites.forward.subsite') }}</th>
++                  <th class="py-2 pr-4">{{ t('admin.subsites.forward.load') }}</th>
++                  <th class="py-2 pr-4">{{ t('admin.subsites.forward.last24h') }}</th>
++                  <th class="py-2 pr-4">{{ t('admin.subsites.forward.sticky') }}</th>
++                  <th class="py-2">{{ t('admin.subsites.forward.health') }}</th>
 +                </tr>
 +              </thead>
 +              <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
@@ -2189,20 +2531,22 @@ index cb5d3f8..6c82619 100644
 +                    <code class="text-xs text-gray-500">{{ site.subsite_id }}</code>
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
-+                    active {{ site.active_requests }} / queue {{ site.queued_usage }}<br />
-+                    qps {{ site.qps.toFixed(2) }} / cpu {{ site.cpu_percent.toFixed(1) }}%
++                    {{ t('admin.subsites.forward.activeQueue', { active: site.active_requests, queue: site.queued_usage }) }}<br />
++                    {{ t('admin.subsites.forward.qpsCpu', { qps: site.qps.toFixed(2), cpu: site.cpu_percent.toFixed(1) }) }}
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
-+                    {{ site.events_24h }} req<br />
-+                    <span :class="site.failures_24h > 0 ? 'text-red-600' : 'text-emerald-600'">{{ site.failures_24h }} fail</span>
++                    {{ t('admin.subsites.forward.reqCount', { count: site.events_24h }) }}<br />
++                    <span :class="site.failures_24h > 0 ? 'text-red-600' : 'text-emerald-600'">{{ t('admin.subsites.forward.failCount', { count: site.failures_24h }) }}</span>
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
-+                    {{ site.affinities }} total<br />
-+                    {{ site.locked_affinities }} locked
++                    {{ t('admin.subsites.forward.totalCount', { count: site.affinities }) }}<br />
++                    {{ t('admin.subsites.forward.lockedCount', { count: site.locked_affinities }) }}
 +                  </td>
 +                  <td class="py-3">
 +                    <span :class="['badge', statusClass(site.status)]">{{ site.health_score }}%</span>
++                    <span v-if="site.circuit_open" class="ml-1 badge badge-danger">{{ t('admin.subsites.forward.circuitOpen') }}</span>
 +                    <div class="mt-1 text-xs text-gray-500">{{ formatDate(site.last_heartbeat_at) }}</div>
++                    <div v-if="site.circuit_open" class="mt-1 text-xs text-red-500">{{ site.circuit_reason || '-' }}</div>
 +                  </td>
 +                </tr>
 +              </tbody>
@@ -2211,27 +2555,27 @@ index cb5d3f8..6c82619 100644
 +        </div>
 +
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
-+          <h2 class="text-base font-semibold text-gray-900 dark:text-white">Manual Sticky Lock</h2>
-+          <p class="mt-1 text-xs text-gray-500">Lock an affinity key to a subsite, optionally forcing a lease/account hint.</p>
++          <h2 class="text-base font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.forward.manualLock') }}</h2>
++          <p class="mt-1 text-xs text-gray-500">{{ t('admin.subsites.forward.manualLockHint') }}</p>
 +          <div class="mt-4 space-y-3">
-+            <input v-model.trim="forwardLockForm.affinity_key" class="input" placeholder="affinity key, e.g. api:1:user:2:..." />
++            <input v-model.trim="forwardLockForm.affinity_key" class="input" :placeholder="t('admin.subsites.forward.affinityKeyPlaceholder')" />
 +            <select v-model="forwardLockForm.subsite_id" class="input">
-+              <option value="">Select subsite</option>
++              <option value="">{{ t('admin.subsites.forward.selectSubsite') }}</option>
 +              <option v-for="site in subsites" :key="site.subsite_id" :value="site.subsite_id">{{ site.name }} / {{ site.subsite_id }}</option>
 +            </select>
 +            <div class="grid grid-cols-2 gap-3">
-+              <input v-model.trim="forwardLockForm.lease_id" class="input" placeholder="lease id" />
-+              <input v-model.number="forwardLockForm.account_id" type="number" min="0" class="input" placeholder="account id" />
++              <input v-model.trim="forwardLockForm.lease_id" class="input" :placeholder="t('admin.subsites.forward.leaseId')" />
++              <input v-model.number="forwardLockForm.account_id" type="number" min="0" class="input" :placeholder="t('admin.subsites.forward.accountId')" />
 +            </div>
 +            <div class="grid grid-cols-2 gap-3">
-+              <input v-model.number="forwardLockForm.api_key_id" type="number" min="0" class="input" placeholder="api key id" />
-+              <input v-model.number="forwardLockForm.ttl_hours" type="number" min="1" class="input" placeholder="ttl hours" />
++              <input v-model.number="forwardLockForm.api_key_id" type="number" min="0" class="input" :placeholder="t('admin.subsites.forward.apiKeyId')" />
++              <input v-model.number="forwardLockForm.ttl_hours" type="number" min="1" class="input" :placeholder="t('admin.subsites.forward.ttlHours')" />
 +            </div>
 +            <label class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
 +              <input v-model="forwardLockForm.locked" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-primary-600" />
-+              Keep locked until manually deleted
++              {{ t('admin.subsites.forward.keepLocked') }}
 +            </label>
-+            <button class="btn btn-primary w-full" :disabled="forwardSaving" @click="saveForwardLock">Save sticky lock</button>
++            <button class="btn btn-primary w-full" :disabled="forwardSaving" @click="saveForwardLock">{{ t('admin.subsites.forward.saveLock') }}</button>
 +          </div>
 +        </div>
 +      </div>
@@ -2239,8 +2583,8 @@ index cb5d3f8..6c82619 100644
 +      <div class="grid gap-4 xl:grid-cols-2">
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
 +          <div class="mb-3 flex items-center justify-between">
-+            <h2 class="text-base font-semibold text-gray-900 dark:text-white">Sticky Sessions</h2>
-+            <button class="btn btn-sm btn-secondary" @click="loadForwardAffinities">Refresh</button>
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.forward.stickySessions') }}</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardAffinities">{{ t('common.refresh') }}</button>
 +          </div>
 +          <div class="space-y-2">
 +            <div v-for="item in forwardAffinities" :key="item.id" class="rounded-xl border border-gray-100 p-3 text-sm dark:border-dark-700">
@@ -2249,23 +2593,51 @@ index cb5d3f8..6c82619 100644
 +                  <div class="truncate font-medium text-gray-900 dark:text-white">{{ item.model || '-' }} / {{ item.subsite_id }}</div>
 +                  <code class="block truncate text-xs text-gray-500">{{ item.affinity_key }}</code>
 +                </div>
-+                <button class="btn btn-sm btn-secondary" @click="deleteForwardAffinity(item.id)">Delete</button>
++                <button class="btn btn-sm btn-secondary" @click="deleteForwardAffinity(item.id)">{{ t('common.delete') }}</button>
 +              </div>
 +              <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-500">
-+                <span>hits {{ item.hits }}</span>
-+                <span>{{ item.locked ? 'locked' : item.source }}</span>
-+                <span>account {{ item.account_id || '-' }}</span>
-+                <span>lease {{ item.lease_id || '-' }}</span>
++                <span>{{ t('admin.subsites.forward.hits', { count: item.hits }) }}</span>
++                <span>{{ item.locked ? t('admin.subsites.forward.locked') : item.source }}</span>
++                <span>{{ t('admin.subsites.forward.accountValue', { value: item.account_id || '-' }) }}</span>
++                <span>{{ t('admin.subsites.forward.leaseValue', { value: item.lease_id || '-' }) }}</span>
 +              </div>
 +            </div>
-+            <p v-if="!forwardAffinities.length" class="text-sm text-gray-500">No sticky sessions yet.</p>
++            <p v-if="!forwardAffinities.length" class="text-sm text-gray-500">{{ t('admin.subsites.forward.noSticky') }}</p>
 +          </div>
 +        </div>
 +
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
 +          <div class="mb-3 flex items-center justify-between">
-+            <h2 class="text-base font-semibold text-gray-900 dark:text-white">Route Events</h2>
-+            <button class="btn btn-sm btn-secondary" @click="loadForwardEvents">Refresh</button>
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.forward.circuitBreakers') }}</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardStats">{{ t('common.refresh') }}</button>
++          </div>
++          <div class="space-y-2">
++            <div v-for="breaker in forwardStats?.circuit_breakers || []" :key="breaker.id" class="rounded-xl border border-red-100 bg-red-50/50 p-3 text-sm dark:border-red-900/40 dark:bg-red-950/20">
++              <div class="flex items-start justify-between gap-3">
++                <div class="min-w-0">
++                  <div class="truncate font-medium text-red-700 dark:text-red-200">
++                    {{ breaker.scope }} / {{ breaker.target_id }}
++                  </div>
++                  <div class="truncate text-xs text-red-500 dark:text-red-300">{{ breaker.subsite_id || '-' }}</div>
++                </div>
++                <span class="badge badge-danger">{{ t('admin.subsites.forward.failures', { count: breaker.failures }) }}</span>
++              </div>
++              <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-600 dark:text-gray-300">
++                <span>{{ t('admin.subsites.forward.accountValue', { value: breaker.account_id || '-' }) }}</span>
++                <span>{{ t('admin.subsites.forward.leaseValue', { value: breaker.lease_id || '-' }) }}</span>
++                <span>{{ breaker.reason || '-' }}</span>
++                <span>{{ t('admin.subsites.forward.until', { value: formatDate(breaker.cooldown_until) }) }}</span>
++              </div>
++              <p v-if="breaker.last_error" class="mt-2 break-all text-xs text-red-600 dark:text-red-300">{{ breaker.last_error }}</p>
++            </div>
++            <p v-if="!(forwardStats?.circuit_breakers || []).length" class="text-sm text-gray-500">{{ t('admin.subsites.forward.noCircuitBreakers') }}</p>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between">
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.forward.routeEvents') }}</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardEvents">{{ t('common.refresh') }}</button>
 +          </div>
 +          <div class="space-y-2">
 +            <div v-for="event in forwardEvents" :key="event.id" class="rounded-xl border border-gray-100 p-3 text-sm dark:border-dark-700">
@@ -2280,10 +2652,16 @@ index cb5d3f8..6c82619 100644
 +                <span>{{ event.status_code || '-' }}</span>
 +                <span>{{ event.latency_ms }} ms</span>
 +                <span>{{ formatDate(event.created_at) }}</span>
++                <span>{{ event.reason || '-' }}</span>
++                <span>{{ t('admin.subsites.forward.accountValue', { value: event.account_id || '-' }) }}</span>
++                <span>{{ t('admin.subsites.forward.leaseValue', { value: event.lease_id || '-' }) }}</span>
++              </div>
++              <div v-if="event.fallback_from" class="mt-2 text-xs text-amber-600 dark:text-amber-300">
++                {{ t('admin.subsites.forward.fallbackFrom', { value: event.fallback_from }) }}
 +              </div>
 +              <p v-if="event.error" class="mt-2 break-all text-xs text-red-600">{{ event.error }}</p>
 +            </div>
-+            <p v-if="!forwardEvents.length" class="text-sm text-gray-500">No route events yet.</p>
++            <p v-if="!forwardEvents.length" class="text-sm text-gray-500">{{ t('admin.subsites.forward.noEvents') }}</p>
 +          </div>
 +        </div>
 +      </div>
@@ -2292,17 +2670,370 @@ index cb5d3f8..6c82619 100644
      <TablePageLayout>
        <template #filters>
          <div class="flex flex-wrap items-center gap-3">
-@@ -370,7 +523,7 @@
+           <div class="relative w-full sm:w-72">
+             <Icon name="search" size="md" class="absolute left-3 top-1/2 -translate-y-1/2 text-gray-400" />
+-            <input v-model="search" type="text" class="input min-h-[44px] pl-10" placeholder="搜索名称、ID 或 URL" @input="handleSearch" />
++            <input v-model="search" type="text" class="input min-h-[44px] pl-10" :placeholder="t('admin.subsites.searchPlaceholder')" @input="handleSearch" />
+           </div>
+           <select v-model="status" class="input min-h-[44px] w-full sm:w-44" @change="reload">
+-            <option value="">全部状态</option>
+-            <option value="pending">待激活</option>
+-            <option value="active">运行中</option>
+-            <option value="maintenance">维护中</option>
+-            <option value="unhealthy">异常</option>
+-            <option value="disabled">已停用</option>
++            <option value="">{{ t('admin.subsites.allStatuses') }}</option>
++            <option value="pending">{{ t('admin.subsites.status.pending') }}</option>
++            <option value="active">{{ t('admin.subsites.status.active') }}</option>
++            <option value="maintenance">{{ t('admin.subsites.status.maintenance') }}</option>
++            <option value="unhealthy">{{ t('admin.subsites.status.unhealthy') }}</option>
++            <option value="disabled">{{ t('admin.subsites.status.disabled') }}</option>
+           </select>
+           <div class="ml-auto flex flex-wrap gap-2">
+             <button class="btn btn-secondary" :disabled="loading" @click="reload">
+@@ -21,7 +220,7 @@
+             </button>
+             <button class="btn btn-primary" @click="openCreate">
+               <Icon name="plus" size="md" class="mr-2" />
+-              新建子站
++              {{ t('admin.subsites.createSubsite') }}
+             </button>
+           </div>
+         </div>
+@@ -46,7 +245,7 @@
+                 {{ value }}
+               </a>
+               <span v-else class="text-sm text-gray-400">-</span>
+-              <button v-if="value" class="rounded p-1 text-gray-400 hover:text-primary-600 dark:hover:text-primary-300" title="复制 URL" @click.stop="copy(value)">
++              <button v-if="value" class="rounded p-1 text-gray-400 hover:text-primary-600 dark:hover:text-primary-300" :title="t('admin.subsites.copyUrlTitle')" @click.stop="copy(value)">
+                 <Icon name="copy" size="sm" />
+               </button>
+             </div>
+@@ -61,19 +260,19 @@
+ 
+           <template #cell-limits="{ row }">
+             <div class="text-sm text-gray-700 dark:text-gray-200">
+-              QPS {{ row.max_qps || '-' }} / 并发 {{ row.max_concurrency || '-' }}
++              {{ t('admin.subsites.limitsLabel', { qps: row.max_qps || '-', concurrency: row.max_concurrency || '-' }) }}
+             </div>
+           </template>
+ 
+           <template #cell-actions="{ row }">
+             <div class="flex flex-wrap justify-end gap-1.5">
+-              <button class="btn btn-sm btn-secondary" @click="openLeases(row)">租约</button>
+-              <button class="btn btn-sm btn-secondary" @click="copyClientConfig(row)">复制配置</button>
+-              <button v-if="row.status === 'pending' || row.status === 'unhealthy'" class="btn btn-sm btn-secondary" @click="openResetSecret(row)">修复</button>
+-              <button class="btn btn-sm btn-secondary" @click="openEdit(row)">编辑</button>
+-              <button v-if="row.status === 'pending' || row.status === 'unhealthy'" class="btn btn-sm btn-primary" @click="changeStatus(row, 'activate')">激活</button>
+-              <button v-if="row.status === 'active'" class="btn btn-sm btn-secondary" @click="changeStatus(row, 'pause')">暂停</button>
+-              <button v-if="row.status === 'maintenance'" class="btn btn-sm btn-primary" @click="changeStatus(row, 'resume')">恢复</button>
++              <button class="btn btn-sm btn-secondary" @click="openLeases(row)">{{ t('admin.subsites.actions.leases') }}</button>
++              <button class="btn btn-sm btn-secondary" @click="copyClientConfig(row)">{{ t('admin.subsites.actions.copyConfig') }}</button>
++              <button v-if="row.status === 'pending' || row.status === 'unhealthy'" class="btn btn-sm btn-secondary" @click="openResetSecret(row)">{{ t('admin.subsites.actions.repair') }}</button>
++              <button class="btn btn-sm btn-secondary" @click="openEdit(row)">{{ t('common.edit') }}</button>
++              <button v-if="row.status === 'pending' || row.status === 'unhealthy'" class="btn btn-sm btn-primary" @click="changeStatus(row, 'activate')">{{ t('admin.subsites.actions.activate') }}</button>
++              <button v-if="row.status === 'active'" class="btn btn-sm btn-secondary" @click="changeStatus(row, 'pause')">{{ t('admin.subsites.actions.pause') }}</button>
++              <button v-if="row.status === 'maintenance'" class="btn btn-sm btn-primary" @click="changeStatus(row, 'resume')">{{ t('admin.subsites.actions.resume') }}</button>
+             </div>
+           </template>
+         </DataTable>
+@@ -91,88 +290,88 @@
+       </template>
+     </TablePageLayout>
+ 
+-    <BaseDialog :show="showForm" :title="editing ? '编辑子站' : '新建子站'" width="wide" @close="closeForm">
++    <BaseDialog :show="showForm" :title="editing ? t('admin.subsites.form.editTitle') : t('admin.subsites.form.createTitle')" width="wide" @close="closeForm">
+       <form class="space-y-4" @submit.prevent="saveSubsite">
+         <div class="grid gap-4 md:grid-cols-2">
+           <label class="form-field">
+-            <span class="form-label">名称</span>
++            <span class="form-label">{{ t('common.name') }}</span>
+             <input v-model.trim="form.name" class="input" required />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">子站 ID</span>
+-            <input v-model.trim="form.subsite_id" class="input" :disabled="!!editing" placeholder="留空自动生成" />
++            <span class="form-label">{{ t('admin.subsites.form.subsiteId') }}</span>
++            <input v-model.trim="form.subsite_id" class="input" :disabled="!!editing" :placeholder="t('admin.subsites.form.subsiteIdPlaceholder')" />
+           </label>
+           <label class="form-field md:col-span-2">
+             <span class="form-label">Public URL</span>
+             <input v-model.trim="form.public_url" class="input" placeholder="https://edge.example.com" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">区域</span>
++            <span class="form-label">{{ t('admin.subsites.form.region') }}</span>
+             <input v-model.trim="form.region" class="input" placeholder="us-east-1" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">版本</span>
++            <span class="form-label">{{ t('admin.subsites.form.version') }}</span>
+             <input v-model.trim="form.version" class="input" placeholder="subsite-agent" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大 QPS</span>
++            <span class="form-label">{{ t('admin.subsites.form.maxQps') }}</span>
+             <input v-model.number="form.max_qps" type="number" min="0" class="input" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大并发</span>
++            <span class="form-label">{{ t('admin.subsites.form.maxConcurrency') }}</span>
+             <input v-model.number="form.max_concurrency" type="number" min="0" class="input" />
+           </label>
+         </div>
+         <label class="form-field">
+-          <span class="form-label">能力标签</span>
++          <span class="form-label">{{ t('admin.subsites.form.capabilities') }}</span>
+           <input v-model.trim="capabilitiesText" class="input" placeholder="openai,claude,gemini,images,websocket" />
+         </label>
+         <div class="flex justify-end gap-2 pt-2">
+-          <button type="button" class="btn btn-secondary" @click="closeForm">取消</button>
+-          <button type="submit" class="btn btn-primary" :disabled="saving">{{ saving ? '保存中...' : '保存' }}</button>
++          <button type="button" class="btn btn-secondary" @click="closeForm">{{ t('common.cancel') }}</button>
++          <button type="submit" class="btn btn-primary" :disabled="saving">{{ saving ? t('common.saving') : t('common.save') }}</button>
+         </div>
+       </form>
+     </BaseDialog>
+ 
+-    <BaseDialog :show="!!createdSecret" title="子站密钥" width="normal" @close="createdSecret = ''">
++    <BaseDialog :show="!!createdSecret" :title="t('admin.subsites.secret.title')" width="normal" @close="createdSecret = ''">
+       <div class="space-y-4">
+-        <p class="text-sm text-gray-600 dark:text-gray-300">密钥只显示一次，请写入子站镜像服务的环境变量。</p>
++        <p class="text-sm text-gray-600 dark:text-gray-300">{{ t('admin.subsites.secret.onceHint') }}</p>
+         <div class="flex items-center gap-2 rounded border border-gray-200 bg-gray-50 p-3 dark:border-dark-500 dark:bg-dark-700">
+           <code class="min-w-0 flex-1 break-all text-sm">{{ createdSecret }}</code>
+-          <button class="btn btn-secondary" @click="copy(createdSecret)">复制</button>
++          <button class="btn btn-secondary" @click="copy(createdSecret)">{{ t('common.copy') }}</button>
+         </div>
+       </div>
+     </BaseDialog>
+ 
+-    <BaseDialog :show="!!resetTarget" title="修复子站连通" width="normal" @close="closeResetSecret">
++    <BaseDialog :show="!!resetTarget" :title="t('admin.subsites.reset.title')" width="normal" @close="closeResetSecret">
+       <div class="space-y-4">
+         <div class="rounded border border-amber-200 bg-amber-50 p-4 text-sm text-amber-900 dark:border-amber-600/40 dark:bg-amber-900/20 dark:text-amber-100">
+-          这会重置 {{ resetTarget?.name }} 的主站认证密钥。旧子站密钥会立即失效，必须把新密钥写入子站环境变量并重启子站后，心跳才会恢复。
++          {{ t('admin.subsites.reset.warning', { name: resetTarget?.name || '-' }) }}
+         </div>
+         <div v-if="resetSecretResult" class="space-y-3">
+           <div class="flex items-center gap-2 rounded border border-gray-200 bg-gray-50 p-3 dark:border-dark-500 dark:bg-dark-700">
+             <code class="min-w-0 flex-1 break-all text-sm">{{ resetSecretResult.secret }}</code>
+-            <button class="btn btn-secondary" @click="copy(resetSecretResult.secret)">复制</button>
++            <button class="btn btn-secondary" @click="copy(resetSecretResult.secret)">{{ t('common.copy') }}</button>
+           </div>
+           <div class="rounded border border-gray-200 bg-gray-50 p-3 dark:border-dark-500 dark:bg-dark-700">
+             <pre class="whitespace-pre-wrap break-all text-xs text-gray-700 dark:text-gray-200">{{ resetEnvText }}</pre>
+           </div>
+-          <p class="text-xs text-gray-500 dark:text-gray-400">请确认 SUBSITE_MASTER_URL 是子站能够访问到的主站根地址，不要带 /api/v1。</p>
++          <p class="text-xs text-gray-500 dark:text-gray-400">{{ t('admin.subsites.reset.masterUrlHint') }}</p>
+           <div class="flex justify-end gap-2">
+-            <button class="btn btn-secondary" @click="copy(resetEnvText)">复制环境变量</button>
+-            <button class="btn btn-primary" @click="closeResetSecret">完成</button>
++            <button class="btn btn-secondary" @click="copy(resetEnvText)">{{ t('admin.subsites.reset.copyEnv') }}</button>
++            <button class="btn btn-primary" @click="closeResetSecret">{{ t('common.close') }}</button>
+           </div>
+         </div>
+         <div v-else class="flex justify-end gap-2">
+-          <button class="btn btn-secondary" :disabled="resettingSecret" @click="closeResetSecret">取消</button>
++          <button class="btn btn-secondary" :disabled="resettingSecret" @click="closeResetSecret">{{ t('common.cancel') }}</button>
+           <button class="btn btn-danger" :disabled="resettingSecret" @click="resetSubsiteSecret">
+-            {{ resettingSecret ? '修复中...' : '重置密钥' }}
++            {{ resettingSecret ? t('admin.subsites.reset.repairing') : t('admin.subsites.reset.resetSecret') }}
+           </button>
+         </div>
+       </div>
+     </BaseDialog>
+ 
+-    <BaseDialog :show="!!leaseSubsite" :title="leaseSubsite ? `租约 - ${leaseSubsite.name}` : '租约'" width="full" @close="closeLeases">
++    <BaseDialog :show="!!leaseSubsite" :title="leaseSubsite ? t('admin.subsites.leases.titleWithName', { name: leaseSubsite.name }) : t('admin.subsites.actions.leases')" width="full" @close="closeLeases">
+       <div class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_24rem]">
+         <div class="min-w-0">
+           <DataTable :columns="leaseColumns" :data="leases" :loading="leasesLoading">
+@@ -210,7 +409,7 @@
+             </template>
+             <template #cell-usage="{ row }">
+               <div class="text-sm text-gray-700 dark:text-gray-200">
+-                请求 {{ row.used_requests }} / {{ row.max_requests || '-' }}
++                {{ t('admin.subsites.leases.requestsUsage', { used: row.used_requests, max: row.max_requests || '-' }) }}
+                 <br />
+                 Token {{ row.used_tokens }} / {{ row.max_tokens || '-' }}
+               </div>
+@@ -220,10 +419,10 @@
+             </template>
+             <template #cell-actions="{ row }">
+               <div class="flex flex-wrap justify-end gap-1.5">
+-                <button class="btn btn-sm btn-secondary" @click="renewLease(row)">续租 24h</button>
+-                <button v-if="row.status === 'active' || row.status === 'renewing'" class="btn btn-sm btn-secondary" @click="drainLease(row)">排空</button>
+-                <button v-if="row.status !== 'released'" class="btn btn-sm btn-danger" @click="releaseLease(row)">释放</button>
+-                <button class="btn btn-sm btn-danger" @click="deleteLease(row)">删除</button>
++                <button class="btn btn-sm btn-secondary" @click="renewLease(row)">{{ t('admin.subsites.leases.renew24h') }}</button>
++                <button v-if="row.status === 'active' || row.status === 'renewing'" class="btn btn-sm btn-secondary" @click="drainLease(row)">{{ t('admin.subsites.leases.drain') }}</button>
++                <button v-if="row.status !== 'released'" class="btn btn-sm btn-danger" @click="releaseLease(row)">{{ t('admin.subsites.leases.release') }}</button>
++                <button class="btn btn-sm btn-danger" @click="deleteLease(row)">{{ t('common.delete') }}</button>
+               </div>
+             </template>
+           </DataTable>
+@@ -241,26 +440,26 @@
+         <div class="space-y-4">
+         <form class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-dark-500" @submit.prevent="createLease">
+           <div>
+-            <h3 class="text-sm font-semibold text-gray-900 dark:text-white">新增租约</h3>
+-            <p v-if="leaseAccountsLoading" class="mt-1 text-xs text-gray-500 dark:text-gray-400">正在按分组加载主站账号...</p>
++            <h3 class="text-sm font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.leases.createTitle') }}</h3>
++            <p v-if="leaseAccountsLoading" class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.subsites.leases.loadingAccounts') }}</p>
+           </div>
+           <label class="form-field">
+-            <span class="form-label">分组</span>
++            <span class="form-label">{{ t('admin.subsites.leases.group') }}</span>
+             <select v-model.number="leaseForm.group_id" class="input" required @change="handleLeaseGroupChange">
+-              <option :value="0" disabled>选择分组</option>
++              <option :value="0" disabled>{{ t('admin.subsites.leases.selectGroup') }}</option>
+               <option v-for="group in leaseGroupOptions" :key="group.id" :value="group.id">{{ group.name }}</option>
+             </select>
+           </label>
+           <label class="form-field">
+-            <span class="form-label">账号</span>
++            <span class="form-label">{{ t('admin.subsites.leases.account') }}</span>
+             <input
+               v-model.trim="leaseAccountSearch"
+               class="input"
+               :disabled="leaseForm.group_id <= 0"
+-              placeholder="输入账号 ID、名称或平台搜索"
++              :placeholder="t('admin.subsites.leases.accountSearchPlaceholder')"
+             />
+             <select v-if="filteredAccountOptions.length > 0" v-model.number="leaseForm.account_id" class="input" required :disabled="leaseForm.group_id <= 0">
+-              <option :value="0" disabled>选择账号</option>
++              <option :value="0" disabled>{{ t('admin.subsites.leases.selectAccount') }}</option>
+               <option v-for="account in filteredAccountOptions" :key="account.id" :value="account.id">{{ account.label }}</option>
+             </select>
+             <div v-else class="rounded border border-dashed border-gray-300 px-3 py-2 text-sm text-gray-500 dark:border-dark-500 dark:text-gray-400">
+@@ -269,19 +468,19 @@
+             <p v-if="leaseBulkSummary" class="text-xs text-gray-500 dark:text-gray-400">{{ leaseBulkSummary }}</p>
+           </label>
+           <label class="form-field">
+-            <span class="form-label">TTL 小时</span>
++            <span class="form-label">{{ t('admin.subsites.leases.ttlHours') }}</span>
+             <input v-model.number="leaseForm.ttl_hours" type="number" min="1" class="input" required />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大请求数</span>
++            <span class="form-label">{{ t('admin.subsites.leases.maxRequests') }}</span>
+             <input v-model.number="leaseForm.max_requests" type="number" min="0" class="input" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大 Token</span>
++            <span class="form-label">{{ t('admin.subsites.leases.maxTokens') }}</span>
+             <input v-model.number="leaseForm.max_tokens" type="number" min="0" class="input" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">随机数量</span>
++            <span class="form-label">{{ t('admin.subsites.leases.randomCount') }}</span>
+             <input
+               v-model.number="leaseRandomCount"
+               type="number"
+@@ -293,7 +492,7 @@
+           </label>
+           <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
+             <button type="submit" class="btn btn-primary w-full" :disabled="leaseSaving || leaseBulkSaving || leaseForm.account_id <= 0">
+-              {{ leaseSaving ? '创建中...' : '创建租约' }}
++              {{ leaseSaving ? t('admin.subsites.leases.creating') : t('admin.subsites.leases.createLease') }}
+             </button>
+             <button
+               type="button"
+@@ -301,7 +500,7 @@
+               :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
+               @click="createAllVisibleLeases"
+             >
+-              {{ leaseBulkSaving ? `添加中 ${leaseBulkProgress.done}/${leaseBulkProgress.total}` : `添加全部 ${bulkLeaseAccounts.length} 个账号` }}
++              {{ leaseBulkSaving ? t('admin.subsites.leases.addingProgress', { done: leaseBulkProgress.done, total: leaseBulkProgress.total }) : t('admin.subsites.leases.addAllAccounts', { count: bulkLeaseAccounts.length }) }}
+             </button>
+             <button
+               type="button"
+@@ -309,7 +508,7 @@
+               :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
+               @click="createRandomLeases(10)"
+             >
+-              随机 {{ randomTenCount }} 个
++              {{ t('admin.subsites.leases.randomAccounts', { count: randomTenCount }) }}
+             </button>
+             <button
+               type="button"
+@@ -317,7 +516,7 @@
+               :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
+               @click="createRandomLeases(20)"
+             >
+-              随机 {{ randomTwentyCount }} 个
++              {{ t('admin.subsites.leases.randomAccounts', { count: randomTwentyCount }) }}
+             </button>
+             <button
+               type="button"
+@@ -325,39 +524,39 @@
+               :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0 || normalizedLeaseRandomCount <= 0"
+               @click="createRandomLeases(normalizedLeaseRandomCount)"
+             >
+-              随机自定义 {{ normalizedLeaseRandomCount }} 个
++              {{ t('admin.subsites.leases.randomCustomAccounts', { count: normalizedLeaseRandomCount }) }}
+             </button>
+           </div>
+         </form>
+         <form class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-dark-500" @submit.prevent="updateSelectedLeaseLimits">
+           <div>
+-            <h3 class="text-sm font-semibold text-gray-900 dark:text-white">批量更改设置</h3>
+-            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">已选择 {{ selectedLeaseIDs.size }} 个租约</p>
++            <h3 class="text-sm font-semibold text-gray-900 dark:text-white">{{ t('admin.subsites.leases.bulkEditTitle') }}</h3>
++            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">{{ t('admin.subsites.leases.selectedLeases', { count: selectedLeaseIDs.size }) }}</p>
+           </div>
+           <label class="form-field">
+-            <span class="form-label">最大并发</span>
++            <span class="form-label">{{ t('admin.subsites.form.maxConcurrency') }}</span>
+             <input v-model.number="leaseBulkEditForm.max_concurrency" type="number" min="0" class="input" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大请求数</span>
++            <span class="form-label">{{ t('admin.subsites.leases.maxRequests') }}</span>
+             <input v-model.number="leaseBulkEditForm.max_requests" type="number" min="0" class="input" />
+           </label>
+           <label class="form-field">
+-            <span class="form-label">最大 Token</span>
++            <span class="form-label">{{ t('admin.subsites.leases.maxTokens') }}</span>
+             <input v-model.number="leaseBulkEditForm.max_tokens" type="number" min="0" class="input" />
+           </label>
+           <button type="submit" class="btn btn-primary w-full" :disabled="leaseBulkUpdating || selectedLeaseIDs.size === 0">
+-            {{ leaseBulkUpdating ? `保存中 ${leaseBulkProgress.done}/${leaseBulkProgress.total}` : '保存所选租约设置' }}
++            {{ leaseBulkUpdating ? t('admin.subsites.leases.savingProgress', { done: leaseBulkProgress.done, total: leaseBulkProgress.total }) : t('admin.subsites.leases.saveSelectedSettings') }}
+           </button>
+           <div class="grid gap-2 sm:grid-cols-3 xl:grid-cols-1 2xl:grid-cols-3">
+             <button type="button" class="btn btn-secondary w-full" :disabled="leaseBulkUpdating || selectedLeaseIDs.size === 0" @click="renewSelectedLeases">
+-              批量续租
++              {{ t('admin.subsites.leases.bulkRenew') }}
+             </button>
+             <button type="button" class="btn btn-secondary w-full" :disabled="leaseBulkUpdating || selectedLeaseIDs.size === 0" @click="releaseSelectedLeases">
+-              批量释放
++              {{ t('admin.subsites.leases.bulkRelease') }}
+             </button>
+             <button type="button" class="btn btn-danger w-full" :disabled="leaseBulkUpdating || selectedLeaseIDs.size === 0" @click="deleteSelectedLeases">
+-              批量删除
++              {{ t('admin.subsites.leases.bulkDelete') }}
+             </button>
+           </div>
+         </form>
+@@ -368,9 +567,9 @@
+ </template>
+ 
  <script setup lang="ts">
- import { computed, onMounted, reactive, ref } from 'vue'
+-import { computed, onMounted, reactive, ref } from 'vue'
++import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
  import { adminAPI } from '@/api/admin'
 -import type { AccountLease, ResetSubsiteSecretResult, Subsite } from '@/api/admin'
 +import type { AccountLease, ResetSubsiteSecretResult, Subsite, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from '@/api/admin'
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -382,6 +535,9 @@ import type { Column } from '@/components/common/types'
+@@ -380,8 +579,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
+ import Icon from '@/components/icons/Icon.vue'
+ import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
++import { useI18n } from 'vue-i18n'
  
  const subsites = ref<Subsite[]>([])
 +const forwardStats = ref<SubsiteForwardStats | null>(null)
@@ -2311,16 +3042,33 @@ index cb5d3f8..6c82619 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,6 +550,8 @@ const leaseBulkSaving = ref(false)
+@@ -394,12 +597,17 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
 +const forwardLoading = ref(false)
 +const forwardSaving = ref(false)
++const forwardModeSaving = ref(false)
++const forwardModeForm = ref('forward')
  const search = ref('')
  const status = ref('')
  const leaseAccountSearch = ref('')
-@@ -443,6 +601,15 @@ const leaseBulkEditForm = reactive({
+ const leaseBulkSummary = ref('')
+ const leaseRandomCount = ref(10)
+ const searchTimer = ref<number | undefined>()
++const forwardRefreshTimer = ref<number | undefined>()
+ const showForm = ref(false)
+ const editing = ref<Subsite | null>(null)
+ const createdSecret = ref('')
+@@ -408,6 +616,7 @@ const resetTarget = ref<Subsite | null>(null)
+ const resetSecretResult = ref<ResetSubsiteSecretResult | null>(null)
+ const capabilitiesText = ref('openai,claude,gemini,images,websocket')
+ const { copyToClipboard } = useClipboard()
++const { t } = useI18n()
+ 
+ const resetEnvText = computed(() => {
+   if (!resetTarget.value || !resetSecretResult.value) return ''
+@@ -443,6 +652,15 @@ const leaseBulkEditForm = reactive({
    max_tokens: 0
  })
  const selectedLeaseIDs = ref<Set<string>>(new Set())
@@ -2336,7 +3084,55 @@ index cb5d3f8..6c82619 100644
  
  const leaseGroupOptions = computed(() => leaseGroups.value
    .filter((group) => group.status === 'active')
-@@ -520,11 +687,72 @@ async function reload(): Promise<void> {
+@@ -485,30 +703,30 @@ const leaseBulkProgress = reactive({
+ })
+ 
+ const leaseAccountEmptyText = computed(() => {
+-  if (leaseForm.group_id <= 0) return '请先选择分组'
+-  if (leaseAccountSearch.value.trim()) return '没有匹配当前搜索的可用账号'
+-  return '当前分组下没有可用活跃账号'
++  if (leaseForm.group_id <= 0) return t('admin.subsites.leases.selectGroupFirst')
++  if (leaseAccountSearch.value.trim()) return t('admin.subsites.leases.noMatchedAccounts')
++  return t('admin.subsites.leases.noAvailableAccounts')
+ })
+ 
+ const columns = computed<Column[]>(() => [
+-  { key: 'name', label: '子站' },
+-  { key: 'status', label: '状态' },
+-  { key: 'public_url', label: '入口 URL' },
+-  { key: 'region', label: '区域' },
+-  { key: 'health_score', label: '健康' },
+-  { key: 'limits', label: '限制' },
+-  { key: 'actions', label: '操作', class: 'text-right' }
++  { key: 'name', label: t('admin.subsites.forward.subsite') },
++  { key: 'status', label: t('common.status') },
++  { key: 'public_url', label: t('admin.subsites.columns.publicUrl') },
++  { key: 'region', label: t('admin.subsites.form.region') },
++  { key: 'health_score', label: t('admin.subsites.forward.health') },
++  { key: 'limits', label: t('admin.subsites.columns.limits') },
++  { key: 'actions', label: t('common.actions'), class: 'text-right' }
+ ])
+ 
+ const leaseColumns = computed<Column[]>(() => [
+   { key: 'select', label: '' },
+-  { key: 'lease_id', label: '租约 ID' },
+-  { key: 'group', label: '分组' },
+-  { key: 'account', label: '账号' },
+-  { key: 'status', label: '状态' },
+-  { key: 'usage', label: '用量' },
+-  { key: 'expires_at', label: '过期时间' },
+-  { key: 'actions', label: '操作', class: 'text-right' }
++  { key: 'lease_id', label: t('admin.subsites.forward.leaseId') },
++  { key: 'group', label: t('admin.subsites.leases.group') },
++  { key: 'account', label: t('admin.subsites.leases.account') },
++  { key: 'status', label: t('common.status') },
++  { key: 'usage', label: t('admin.subsites.leases.usage') },
++  { key: 'expires_at', label: t('admin.subsites.leases.expiresAt') },
++  { key: 'actions', label: t('common.actions'), class: 'text-right' }
+ ])
+ 
+ async function reload(): Promise<void> {
+@@ -520,11 +738,90 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -2363,6 +3159,7 @@ index cb5d3f8..6c82619 100644
 +
 +async function loadForwardStats(): Promise<void> {
 +  forwardStats.value = await adminAPI.subsites.forwardStats()
++  forwardModeForm.value = forwardStats.value.mode || 'forward'
 +}
 +
 +async function loadForwardAffinities(): Promise<void> {
@@ -2400,19 +3197,192 @@ index cb5d3f8..6c82619 100644
 +}
 +
 +async function deleteForwardAffinity(id: number): Promise<void> {
-+  const confirmed = window.confirm('Delete this sticky session?')
++  const confirmed = window.confirm(t('admin.subsites.forward.deleteStickyConfirm'))
 +  if (!confirmed) return
 +  await adminAPI.subsites.deleteForwardAffinity(id)
 +  await loadForwardConsole()
 +}
 +
++function forwardModeLabel(value?: string): string {
++  if (value === 'local') return t('admin.subsites.forward.modes.local')
++  if (value === 'direct') return t('admin.subsites.forward.modes.direct')
++  return t('admin.subsites.forward.modes.forward')
++}
++
++async function saveForwardMode(): Promise<void> {
++  forwardModeSaving.value = true
++  try {
++    const result = await adminAPI.subsites.updateForwardMode(forwardModeForm.value as 'local' | 'forward' | 'direct')
++    forwardModeForm.value = result.mode
++    await loadForwardStats()
++  } finally {
++    forwardModeSaving.value = false
++  }
++}
++
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -1029,5 +1257,6 @@ function formatDate(value?: string): string {
+@@ -776,7 +1073,7 @@ async function createLease(): Promise<void> {
+ async function updateSelectedLeaseLimits(): Promise<void> {
+   if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
+   const leaseIDs = [...selectedLeaseIDs.value]
+-  const confirmed = window.confirm(`确认更新 ${leaseIDs.length} 个租约的请求数和最大 Token 设置？`)
++  const confirmed = window.confirm(t('admin.subsites.leases.confirmUpdateSelected', { count: leaseIDs.length }))
+   if (!confirmed) return
+ 
+   leaseBulkUpdating.value = true
+@@ -800,7 +1097,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+         leaseBulkProgress.done += 1
+       }
+     }
+-    leaseBulkSummary.value = `批量保存完成：成功 ${success} 个，失败 ${failed} 个`
++    leaseBulkSummary.value = t('admin.subsites.leases.bulkSummarySave', { success, failed })
+     selectedLeaseIDs.value = new Set()
+     await loadLeases()
+   } finally {
+@@ -809,21 +1106,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+ }
+ 
+ async function renewSelectedLeases(): Promise<void> {
+-  await runSelectedLeaseAction('续租 24 小时', async (leaseID) => {
++  await runSelectedLeaseAction(t('admin.subsites.leases.actionRenew24h'), async (leaseID) => {
+     if (!leaseSubsite.value) return
+     await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, leaseID, { ttl_seconds: 24 * 3600 })
+   })
+ }
+ 
+ async function releaseSelectedLeases(): Promise<void> {
+-  await runSelectedLeaseAction('释放', async (leaseID) => {
++  await runSelectedLeaseAction(t('admin.subsites.leases.actionRelease'), async (leaseID) => {
+     if (!leaseSubsite.value) return
+     await adminAPI.subsites.releaseLease(leaseSubsite.value.subsite_id, leaseID)
+   })
+ }
+ 
+ async function deleteSelectedLeases(): Promise<void> {
+-  await runSelectedLeaseAction('删除', async (leaseID) => {
++  await runSelectedLeaseAction(t('admin.subsites.leases.actionDelete'), async (leaseID) => {
+     if (!leaseSubsite.value) return
+     await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, leaseID)
+   })
+@@ -832,7 +1129,7 @@ async function deleteSelectedLeases(): Promise<void> {
+ async function runSelectedLeaseAction(label: string, action: (leaseID: string) => Promise<void>): Promise<void> {
+   if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
+   const leaseIDs = [...selectedLeaseIDs.value]
+-  const confirmed = window.confirm(`确认${label} ${leaseIDs.length} 个租约？`)
++  const confirmed = window.confirm(t('admin.subsites.leases.confirmBulkAction', { action: label, count: leaseIDs.length }))
+   if (!confirmed) return
+ 
+   leaseBulkUpdating.value = true
+@@ -852,7 +1149,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+         leaseBulkProgress.done += 1
+       }
+     }
+-    leaseBulkSummary.value = `批量${label}完成：成功 ${success} 个，失败 ${failed} 个`
++    leaseBulkSummary.value = t('admin.subsites.leases.bulkSummaryAction', { action: label, success, failed })
+     selectedLeaseIDs.value = new Set()
+     await loadLeases()
+   } finally {
+@@ -863,7 +1160,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+ async function createAllVisibleLeases(): Promise<void> {
+   if (!leaseSubsite.value || bulkLeaseAccounts.value.length === 0) return
+   const accounts = [...bulkLeaseAccounts.value]
+-  await createBulkLeases(accounts, `确认给当前筛选出的 ${accounts.length} 个账号全部创建租约？`)
++  await createBulkLeases(accounts, t('admin.subsites.leases.confirmCreateAll', { count: accounts.length }))
+ }
+ 
+ async function createRandomLeases(count: number): Promise<void> {
+@@ -871,7 +1168,7 @@ async function createRandomLeases(count: number): Promise<void> {
+   const normalizedCount = Math.min(Math.max(Math.floor(count), 0), bulkLeaseAccounts.value.length)
+   if (normalizedCount <= 0) return
+   const accounts = shuffleAccounts(bulkLeaseAccounts.value).slice(0, normalizedCount)
+-  await createBulkLeases(accounts, `确认随机选择 ${accounts.length} 个可用账号创建租约？`)
++  await createBulkLeases(accounts, t('admin.subsites.leases.confirmCreateRandom', { count: accounts.length }))
+ }
+ 
+ async function createBulkLeases(accounts: Account[], confirmMessage: string): Promise<void> {
+@@ -896,7 +1193,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
+         leaseBulkProgress.done += 1
+       }
+     }
+-    leaseBulkSummary.value = `批量添加完成：成功 ${success} 个，失败 ${failed} 个`
++    leaseBulkSummary.value = t('admin.subsites.leases.bulkSummaryAdd', { success, failed })
+     leaseForm.account_id = 0
+     leasePagination.page = 1
+     await loadLeases()
+@@ -934,7 +1231,7 @@ function normalizeNonNegativeNumber(value: number): number {
+ function accountOptionLabel(account: Account): string {
+   const parts = [`#${account.id}`, account.name || account.platform || 'account']
+   if (account.account_level && account.account_level !== 'unknown') parts.push(account.account_level)
+-  if (!account.schedulable) parts.push('不可调度')
++  if (!account.schedulable) parts.push(t('admin.subsites.leases.notSchedulable'))
+   return parts.join(' · ')
+ }
+ 
+@@ -970,7 +1267,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
+ 
+ async function deleteLease(row: AccountLease): Promise<void> {
+   if (!leaseSubsite.value) return
+-  const confirmed = window.confirm(`确认删除租约 ${row.lease_id}？该操作不可撤销。`)
++  const confirmed = window.confirm(t('admin.subsites.leases.confirmDeleteLease', { lease: row.lease_id }))
+   if (!confirmed) return
+   await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, row.lease_id)
+   selectedLeaseIDs.value = new Set([...selectedLeaseIDs.value].filter((leaseID) => leaseID !== row.lease_id))
+@@ -995,7 +1292,13 @@ async function copyClientConfig(row: Subsite): Promise<void> {
+ }
+ 
+ function statusLabel(value: string): string {
+-  return ({ pending: '待激活', active: '运行中', maintenance: '维护中', unhealthy: '异常', disabled: '已停用' } as Record<string, string>)[value] || value
++  return ({
++    pending: t('admin.subsites.status.pending'),
++    active: t('admin.subsites.status.active'),
++    maintenance: t('admin.subsites.status.maintenance'),
++    unhealthy: t('admin.subsites.status.unhealthy'),
++    disabled: t('admin.subsites.status.disabled')
++  } as Record<string, string>)[value] || value
+ }
+ 
+ function statusClass(value: string): string {
+@@ -1003,7 +1306,14 @@ function statusClass(value: string): string {
+ }
+ 
+ function leaseStatusLabel(value: string): string {
+-  return ({ active: '可用', renewing: '续租中', draining: '排空中', released: '已释放', expired: '已过期', revoked: '已撤销' } as Record<string, string>)[value] || value
++  return ({
++    active: t('admin.subsites.leases.status.active'),
++    renewing: t('admin.subsites.leases.status.renewing'),
++    draining: t('admin.subsites.leases.status.draining'),
++    released: t('admin.subsites.leases.status.released'),
++    expired: t('admin.subsites.leases.status.expired'),
++    revoked: t('admin.subsites.leases.status.revoked')
++  } as Record<string, string>)[value] || value
+ }
+ 
+ function leaseStatusClass(value: string): string {
+@@ -1015,7 +1325,7 @@ function leaseGroupLabel(row: AccountLease): string {
+ }
+ 
+ function leaseGroupMeta(row: AccountLease): string {
+-  return row.group_id ? `Group ID: ${row.group_id}` : '未绑定分组'
++  return row.group_id ? `Group ID: ${row.group_id}` : t('admin.subsites.leases.unboundGroup')
+ }
+ 
+ function leaseAccountLabel(row: AccountLease): string {
+@@ -1029,5 +1339,16 @@ function formatDate(value?: string): string {
  
  onMounted(() => {
    void reload()
 +  void loadForwardConsole()
++  forwardRefreshTimer.value = window.setInterval(() => {
++    if (!forwardLoading.value) {
++      void loadForwardConsole()
++    }
++  }, 15000)
++})
++
++onBeforeUnmount(() => {
++  window.clearTimeout(searchTimer.value)
++  window.clearInterval(forwardRefreshTimer.value)
  })
  </script>
