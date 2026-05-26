@@ -262,9 +262,18 @@ index 1738de6..068d85f 100644
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..55a031d 100644
+index 782fff0..34d6fc9 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
+@@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
+ 	res, err := tx.ExecContext(ctx, `
+ 		UPDATE subsites
+ 		SET status = CASE
+-				WHEN status IN ('disabled', 'maintenance', 'pending') THEN status
++				WHEN status IN ('disabled', 'maintenance') THEN status
+ 				WHEN $2 IN ('active', 'unhealthy') THEN $2
+ 				ELSE status
+ 			END,
 @@ -281,6 +281,19 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
  	if affected, _ := res.RowsAffected(); affected == 0 {
  		return service.ErrSubsiteNotFound
@@ -956,7 +965,7 @@ index 0b4a98b..a2edc16 100644
  		subsites.POST("", h.Admin.Subsite.Create)
  		subsites.PATCH("/:id", h.Admin.Subsite.Update)
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 2302ae5..d374de9 100644
+index 2302ae5..7e9e6ad 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -2,6 +2,8 @@ package routes
@@ -1025,12 +1034,18 @@ index 2302ae5..d374de9 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"type": "error",
-@@ -64,10 +93,14 @@ func RegisterGatewayRoutes(
+@@ -64,10 +93,20 @@ func RegisterGatewayRoutes(
  			}
  			h.Gateway.CountTokens(c)
  		})
 -		gateway.GET("/models", h.Gateway.Models)
-+		gateway.GET("/models", masterDataPlaneGuard, h.Gateway.Models)
++		gateway.GET("/models", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.Models(c)
++		})
  		gateway.GET("/usage", h.Gateway.Usage)
  		// OpenAI Responses API: auto-route based on group platform
  		gateway.POST("/responses", func(c *gin.Context) {
@@ -1041,7 +1056,7 @@ index 2302ae5..d374de9 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				h.OpenAIGateway.Responses(c)
  				return
-@@ -75,15 +108,23 @@ func RegisterGatewayRoutes(
+@@ -75,15 +114,23 @@ func RegisterGatewayRoutes(
  			h.Gateway.Responses(c)
  		})
  		gateway.POST("/responses/*subpath", func(c *gin.Context) {
@@ -1066,7 +1081,7 @@ index 2302ae5..d374de9 100644
  			if getGroupPlatform(c) == service.PlatformOpenAI {
  				h.OpenAIGateway.ChatCompletions(c)
  				return
-@@ -91,6 +132,10 @@ func RegisterGatewayRoutes(
+@@ -91,6 +138,10 @@ func RegisterGatewayRoutes(
  			h.Gateway.ChatCompletions(c)
  		})
  		gateway.POST("/images/generations", func(c *gin.Context) {
@@ -1077,7 +1092,7 @@ index 2302ae5..d374de9 100644
  			if getGroupPlatform(c) != service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"error": gin.H{
-@@ -103,6 +148,10 @@ func RegisterGatewayRoutes(
+@@ -103,6 +154,10 @@ func RegisterGatewayRoutes(
  			h.OpenAIGateway.Images(c)
  		})
  		gateway.POST("/images/edits", func(c *gin.Context) {
@@ -1088,7 +1103,7 @@ index 2302ae5..d374de9 100644
  			if getGroupPlatform(c) != service.PlatformOpenAI {
  				c.JSON(http.StatusNotFound, gin.H{
  					"error": gin.H{
-@@ -118,7 +167,6 @@ func RegisterGatewayRoutes(
+@@ -118,7 +173,6 @@ func RegisterGatewayRoutes(
  
  	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
  	gemini := r.Group("/v1beta")
@@ -1096,14 +1111,26 @@ index 2302ae5..d374de9 100644
  	gemini.Use(bodyLimit)
  	gemini.Use(clientRequestID)
  	gemini.Use(opsErrorLogger)
-@@ -126,39 +174,51 @@ func RegisterGatewayRoutes(
+@@ -126,39 +180,63 @@ func RegisterGatewayRoutes(
  	gemini.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
  	gemini.Use(requireGroupGoogle)
  	{
 -		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
 -		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
-+		gemini.GET("/models", masterDataPlaneGuard, h.Gateway.GeminiV1BetaListModels)
-+		gemini.GET("/models/:model", masterDataPlaneGuard, h.Gateway.GeminiV1BetaGetModel)
++		gemini.GET("/models", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.GeminiV1BetaListModels(c)
++		})
++		gemini.GET("/models/:model", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.GeminiV1BetaGetModel(c)
++		})
  		// Gin treats ":" as a param marker, but Gemini uses "{model}:{action}" in the same segment.
 -		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
 +		gemini.POST("/models/*modelAction", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaModels)
@@ -1157,7 +1184,7 @@ index 2302ae5..d374de9 100644
  		if getGroupPlatform(c) != service.PlatformOpenAI {
  			c.JSON(http.StatusNotFound, gin.H{
  				"error": gin.H{
-@@ -170,7 +230,11 @@ func RegisterGatewayRoutes(
+@@ -170,7 +248,11 @@ func RegisterGatewayRoutes(
  		}
  		h.OpenAIGateway.Images(c)
  	})
@@ -1170,7 +1197,7 @@ index 2302ae5..d374de9 100644
  		if getGroupPlatform(c) != service.PlatformOpenAI {
  			c.JSON(http.StatusNotFound, gin.H{
  				"error": gin.H{
-@@ -220,6 +284,33 @@ func RegisterGatewayRoutes(
+@@ -220,6 +302,33 @@ func RegisterGatewayRoutes(
  
  }
  
@@ -1375,7 +1402,7 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..7a37c02 100644
+index 8cfa424..0c5977e 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -48,6 +48,12 @@ const (
@@ -1572,7 +1599,34 @@ index 8cfa424..7a37c02 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -605,6 +762,117 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -580,11 +737,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+ 	if strings.TrimSpace(input.SubsiteID) == "" {
+ 		return nil, ErrSubsiteInvalidInput
+ 	}
+-	if strings.TrimSpace(input.Status) == "" {
+-		input.Status = SubsiteStatusActive
+-	}
+-	if input.ReportedAt.IsZero() {
+-		input.ReportedAt = time.Now()
++	input.Status = normalizeSubsiteHeartbeatStatus(input.Status)
++	now := time.Now()
++	if !input.ReportedAt.IsZero() {
++		metadata := normalizeSubsiteMap(input.Metadata)
++		metadata["agent_reported_at"] = input.ReportedAt.UTC().Format(time.RFC3339Nano)
++		input.Metadata = metadata
+ 	}
+ 	hb := &SubsiteHeartbeat{
+ 		SubsiteID:      strings.TrimSpace(input.SubsiteID),
+@@ -596,7 +754,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+ 		CPUPercent:     math.Max(0, input.CPUPercent),
+ 		MemoryBytes:    int64(math.Max(0, float64(input.MemoryBytes))),
+ 		Metadata:       normalizeSubsiteMap(input.Metadata),
+-		ReportedAt:     input.ReportedAt,
++		ReportedAt:     now,
+ 		RemoteIP:       strings.TrimSpace(input.RemoteIP),
+ 	}
+ 	if err := s.repo.RecordHeartbeat(ctx, hb); err != nil {
+@@ -605,6 +763,117 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	return s.repo.GetBySubsiteID(ctx, hb.SubsiteID)
  }
  
@@ -1690,7 +1744,7 @@ index 8cfa424..7a37c02 100644
  func (s *SubsiteService) decryptSecret(ctx context.Context, subsiteID string) (string, error) {
  	subsite, err := s.repo.GetBySubsiteID(ctx, strings.TrimSpace(subsiteID))
  	if err != nil {
-@@ -671,6 +939,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
+@@ -671,6 +940,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
  	return nil
  }
  
@@ -1724,7 +1778,7 @@ index 8cfa424..7a37c02 100644
  type SubsiteSignedRequest struct {
  	SubsiteID  string
  	Method     string
-@@ -705,6 +1000,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+@@ -705,6 +1001,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
  	return hex.EncodeToString(mac.Sum(nil))
  }
  
@@ -1745,6 +1799,24 @@ index 8cfa424..7a37c02 100644
  type AccountLeaseService struct {
  	leaseRepo   AccountLeaseRepository
  	subsiteRepo SubsiteRepository
+@@ -1977,6 +2287,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
+ 	return copySubsiteMap(in)
+ }
+ 
++func normalizeSubsiteHeartbeatStatus(status string) string {
++	switch strings.ToLower(strings.TrimSpace(status)) {
++	case "", "ok", "ready", "healthy", "online", SubsiteStatusActive:
++		return SubsiteStatusActive
++	case "error", "failed", "offline", SubsiteStatusUnhealthy:
++		return SubsiteStatusUnhealthy
++	default:
++		return SubsiteStatusActive
++	}
++}
++
+ func copySubsiteMap(in map[string]any) map[string]any {
+ 	if in == nil {
+ 		return map[string]any{}
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
 index fe0842b..20f2dbb 100644
 --- a/backend/internal/subsite/agent/server.go
@@ -2462,10 +2534,10 @@ index f59b1e7..b9e73c6 100644
    },
    {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..d3000cf 100644
+index cb5d3f8..4c4b400 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,19 +1,218 @@
+@@ -1,19 +1,219 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -2543,8 +2615,9 @@ index cb5d3f8..d3000cf 100644
 +                    {{ t('admin.subsites.forward.lockedCount', { count: site.locked_affinities }) }}
 +                  </td>
 +                  <td class="py-3">
-+                    <span :class="['badge', statusClass(site.status)]">{{ site.health_score }}%</span>
++                    <span :class="['badge', statusClass(effectiveSubsiteStatus(site))]">{{ site.health_score }}%</span>
 +                    <span v-if="site.circuit_open" class="ml-1 badge badge-danger">{{ t('admin.subsites.forward.circuitOpen') }}</span>
++                    <div class="mt-1 text-xs text-gray-600 dark:text-gray-300">{{ statusLabel(effectiveSubsiteStatus(site)) }}</div>
 +                    <div class="mt-1 text-xs text-gray-500">{{ formatDate(site.last_heartbeat_at) }}</div>
 +                    <div v-if="site.circuit_open" class="mt-1 text-xs text-red-500">{{ site.circuit_reason || '-' }}</div>
 +                  </td>
@@ -2691,7 +2764,7 @@ index cb5d3f8..d3000cf 100644
            </select>
            <div class="ml-auto flex flex-wrap gap-2">
              <button class="btn btn-secondary" :disabled="loading" @click="reload">
-@@ -21,7 +220,7 @@
+@@ -21,7 +221,7 @@
              </button>
              <button class="btn btn-primary" @click="openCreate">
                <Icon name="plus" size="md" class="mr-2" />
@@ -2700,7 +2773,21 @@ index cb5d3f8..d3000cf 100644
              </button>
            </div>
          </div>
-@@ -46,7 +245,7 @@
+@@ -36,8 +236,11 @@
+             </div>
+           </template>
+ 
+-          <template #cell-status="{ value }">
+-            <span :class="['badge', statusClass(value)]">{{ statusLabel(value) }}</span>
++          <template #cell-status="{ row }">
++            <div class="flex flex-col gap-1">
++              <span :class="['badge w-fit', statusClass(effectiveSubsiteStatus(row))]">{{ statusLabel(effectiveSubsiteStatus(row)) }}</span>
++              <span v-if="row.status !== effectiveSubsiteStatus(row)" class="text-xs text-gray-500">{{ statusLabel(row.status) }}</span>
++            </div>
+           </template>
+ 
+           <template #cell-public_url="{ value }">
+@@ -46,7 +249,7 @@
                  {{ value }}
                </a>
                <span v-else class="text-sm text-gray-400">-</span>
@@ -2709,7 +2796,15 @@ index cb5d3f8..d3000cf 100644
                  <Icon name="copy" size="sm" />
                </button>
              </div>
-@@ -61,19 +260,19 @@
+@@ -54,26 +257,26 @@
+ 
+           <template #cell-health_score="{ row }">
+             <div class="flex flex-col gap-1">
+-              <span class="text-sm font-medium text-gray-900 dark:text-white">{{ row.health_score }}%</span>
++              <span class="text-sm font-medium text-gray-900 dark:text-white">{{ effectiveHealthScore(row) }}%</span>
+               <span class="text-xs text-gray-500">{{ formatDate(row.last_heartbeat_at) }}</span>
+             </div>
+           </template>
  
            <template #cell-limits="{ row }">
              <div class="text-sm text-gray-700 dark:text-gray-200">
@@ -2737,7 +2832,7 @@ index cb5d3f8..d3000cf 100644
              </div>
            </template>
          </DataTable>
-@@ -91,88 +290,88 @@
+@@ -91,88 +294,88 @@
        </template>
      </TablePageLayout>
  
@@ -2849,7 +2944,7 @@ index cb5d3f8..d3000cf 100644
        <div class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_24rem]">
          <div class="min-w-0">
            <DataTable :columns="leaseColumns" :data="leases" :loading="leasesLoading">
-@@ -210,7 +409,7 @@
+@@ -210,7 +413,7 @@
              </template>
              <template #cell-usage="{ row }">
                <div class="text-sm text-gray-700 dark:text-gray-200">
@@ -2858,7 +2953,7 @@ index cb5d3f8..d3000cf 100644
                  <br />
                  Token {{ row.used_tokens }} / {{ row.max_tokens || '-' }}
                </div>
-@@ -220,10 +419,10 @@
+@@ -220,10 +423,10 @@
              </template>
              <template #cell-actions="{ row }">
                <div class="flex flex-wrap justify-end gap-1.5">
@@ -2873,7 +2968,7 @@ index cb5d3f8..d3000cf 100644
                </div>
              </template>
            </DataTable>
-@@ -241,26 +440,26 @@
+@@ -241,26 +444,26 @@
          <div class="space-y-4">
          <form class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-dark-500" @submit.prevent="createLease">
            <div>
@@ -2907,7 +3002,7 @@ index cb5d3f8..d3000cf 100644
                <option v-for="account in filteredAccountOptions" :key="account.id" :value="account.id">{{ account.label }}</option>
              </select>
              <div v-else class="rounded border border-dashed border-gray-300 px-3 py-2 text-sm text-gray-500 dark:border-dark-500 dark:text-gray-400">
-@@ -269,19 +468,19 @@
+@@ -269,19 +472,19 @@
              <p v-if="leaseBulkSummary" class="text-xs text-gray-500 dark:text-gray-400">{{ leaseBulkSummary }}</p>
            </label>
            <label class="form-field">
@@ -2931,7 +3026,7 @@ index cb5d3f8..d3000cf 100644
              <input
                v-model.number="leaseRandomCount"
                type="number"
-@@ -293,7 +492,7 @@
+@@ -293,7 +496,7 @@
            </label>
            <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
              <button type="submit" class="btn btn-primary w-full" :disabled="leaseSaving || leaseBulkSaving || leaseForm.account_id <= 0">
@@ -2940,7 +3035,7 @@ index cb5d3f8..d3000cf 100644
              </button>
              <button
                type="button"
-@@ -301,7 +500,7 @@
+@@ -301,7 +504,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createAllVisibleLeases"
              >
@@ -2949,7 +3044,7 @@ index cb5d3f8..d3000cf 100644
              </button>
              <button
                type="button"
-@@ -309,7 +508,7 @@
+@@ -309,7 +512,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(10)"
              >
@@ -2958,7 +3053,7 @@ index cb5d3f8..d3000cf 100644
              </button>
              <button
                type="button"
-@@ -317,7 +516,7 @@
+@@ -317,7 +520,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(20)"
              >
@@ -2967,7 +3062,7 @@ index cb5d3f8..d3000cf 100644
              </button>
              <button
                type="button"
-@@ -325,39 +524,39 @@
+@@ -325,39 +528,39 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0 || normalizedLeaseRandomCount <= 0"
                @click="createRandomLeases(normalizedLeaseRandomCount)"
              >
@@ -3017,7 +3112,7 @@ index cb5d3f8..d3000cf 100644
              </button>
            </div>
          </form>
-@@ -368,9 +567,9 @@
+@@ -368,9 +571,9 @@
  </template>
  
  <script setup lang="ts">
@@ -3029,7 +3124,7 @@ index cb5d3f8..d3000cf 100644
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -380,8 +579,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
+@@ -380,8 +583,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
  import Icon from '@/components/icons/Icon.vue'
  import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
@@ -3042,7 +3137,7 @@ index cb5d3f8..d3000cf 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,12 +597,17 @@ const leaseBulkSaving = ref(false)
+@@ -394,12 +601,17 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
@@ -3060,7 +3155,7 @@ index cb5d3f8..d3000cf 100644
  const showForm = ref(false)
  const editing = ref<Subsite | null>(null)
  const createdSecret = ref('')
-@@ -408,6 +616,7 @@ const resetTarget = ref<Subsite | null>(null)
+@@ -408,6 +620,7 @@ const resetTarget = ref<Subsite | null>(null)
  const resetSecretResult = ref<ResetSubsiteSecretResult | null>(null)
  const capabilitiesText = ref('openai,claude,gemini,images,websocket')
  const { copyToClipboard } = useClipboard()
@@ -3068,7 +3163,7 @@ index cb5d3f8..d3000cf 100644
  
  const resetEnvText = computed(() => {
    if (!resetTarget.value || !resetSecretResult.value) return ''
-@@ -443,6 +652,15 @@ const leaseBulkEditForm = reactive({
+@@ -443,6 +656,15 @@ const leaseBulkEditForm = reactive({
    max_tokens: 0
  })
  const selectedLeaseIDs = ref<Set<string>>(new Set())
@@ -3084,7 +3179,7 @@ index cb5d3f8..d3000cf 100644
  
  const leaseGroupOptions = computed(() => leaseGroups.value
    .filter((group) => group.status === 'active')
-@@ -485,30 +703,30 @@ const leaseBulkProgress = reactive({
+@@ -485,30 +707,30 @@ const leaseBulkProgress = reactive({
  })
  
  const leaseAccountEmptyText = computed(() => {
@@ -3132,7 +3227,7 @@ index cb5d3f8..d3000cf 100644
  ])
  
  async function reload(): Promise<void> {
-@@ -520,11 +738,90 @@ async function reload(): Promise<void> {
+@@ -520,11 +742,90 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -3223,7 +3318,7 @@ index cb5d3f8..d3000cf 100644
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -776,7 +1073,7 @@ async function createLease(): Promise<void> {
+@@ -776,7 +1077,7 @@ async function createLease(): Promise<void> {
  async function updateSelectedLeaseLimits(): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -3232,7 +3327,7 @@ index cb5d3f8..d3000cf 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -800,7 +1097,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -800,7 +1101,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
          leaseBulkProgress.done += 1
        }
      }
@@ -3241,7 +3336,7 @@ index cb5d3f8..d3000cf 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -809,21 +1106,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -809,21 +1110,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
  }
  
  async function renewSelectedLeases(): Promise<void> {
@@ -3266,7 +3361,7 @@ index cb5d3f8..d3000cf 100644
      if (!leaseSubsite.value) return
      await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, leaseID)
    })
-@@ -832,7 +1129,7 @@ async function deleteSelectedLeases(): Promise<void> {
+@@ -832,7 +1133,7 @@ async function deleteSelectedLeases(): Promise<void> {
  async function runSelectedLeaseAction(label: string, action: (leaseID: string) => Promise<void>): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -3275,7 +3370,7 @@ index cb5d3f8..d3000cf 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -852,7 +1149,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -852,7 +1153,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
          leaseBulkProgress.done += 1
        }
      }
@@ -3284,7 +3379,7 @@ index cb5d3f8..d3000cf 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -863,7 +1160,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -863,7 +1164,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
  async function createAllVisibleLeases(): Promise<void> {
    if (!leaseSubsite.value || bulkLeaseAccounts.value.length === 0) return
    const accounts = [...bulkLeaseAccounts.value]
@@ -3293,7 +3388,7 @@ index cb5d3f8..d3000cf 100644
  }
  
  async function createRandomLeases(count: number): Promise<void> {
-@@ -871,7 +1168,7 @@ async function createRandomLeases(count: number): Promise<void> {
+@@ -871,7 +1172,7 @@ async function createRandomLeases(count: number): Promise<void> {
    const normalizedCount = Math.min(Math.max(Math.floor(count), 0), bulkLeaseAccounts.value.length)
    if (normalizedCount <= 0) return
    const accounts = shuffleAccounts(bulkLeaseAccounts.value).slice(0, normalizedCount)
@@ -3302,7 +3397,7 @@ index cb5d3f8..d3000cf 100644
  }
  
  async function createBulkLeases(accounts: Account[], confirmMessage: string): Promise<void> {
-@@ -896,7 +1193,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
+@@ -896,7 +1197,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
          leaseBulkProgress.done += 1
        }
      }
@@ -3311,7 +3406,7 @@ index cb5d3f8..d3000cf 100644
      leaseForm.account_id = 0
      leasePagination.page = 1
      await loadLeases()
-@@ -934,7 +1231,7 @@ function normalizeNonNegativeNumber(value: number): number {
+@@ -934,7 +1235,7 @@ function normalizeNonNegativeNumber(value: number): number {
  function accountOptionLabel(account: Account): string {
    const parts = [`#${account.id}`, account.name || account.platform || 'account']
    if (account.account_level && account.account_level !== 'unknown') parts.push(account.account_level)
@@ -3320,7 +3415,7 @@ index cb5d3f8..d3000cf 100644
    return parts.join(' · ')
  }
  
-@@ -970,7 +1267,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
+@@ -970,7 +1271,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
  
  async function deleteLease(row: AccountLease): Promise<void> {
    if (!leaseSubsite.value) return
@@ -3329,7 +3424,7 @@ index cb5d3f8..d3000cf 100644
    if (!confirmed) return
    await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, row.lease_id)
    selectedLeaseIDs.value = new Set([...selectedLeaseIDs.value].filter((leaseID) => leaseID !== row.lease_id))
-@@ -995,7 +1292,13 @@ async function copyClientConfig(row: Subsite): Promise<void> {
+@@ -995,15 +1296,46 @@ async function copyClientConfig(row: Subsite): Promise<void> {
  }
  
  function statusLabel(value: string): string {
@@ -3344,9 +3439,27 @@ index cb5d3f8..d3000cf 100644
  }
  
  function statusClass(value: string): string {
-@@ -1003,7 +1306,14 @@ function statusClass(value: string): string {
+   return ({ active: 'badge-success', pending: 'badge-warning', maintenance: 'badge-warning', unhealthy: 'badge-danger', disabled: 'badge-gray' } as Record<string, string>)[value] || 'badge-gray'
  }
  
++function isRecentHeartbeat(value?: string): boolean {
++  if (!value) return false
++  const timestamp = new Date(value).getTime()
++  if (!Number.isFinite(timestamp)) return false
++  return Date.now() - timestamp <= 90_000
++}
++
++function effectiveSubsiteStatus(row: Pick<Subsite, 'status' | 'last_heartbeat_at'> | { status: string; last_heartbeat_at?: string }): string {
++  if (row.status === 'maintenance' || row.status === 'disabled') return row.status
++  if (isRecentHeartbeat(row.last_heartbeat_at)) return 'active'
++  return row.status || 'unhealthy'
++}
++
++function effectiveHealthScore(row: Pick<Subsite, 'status' | 'health_score' | 'last_heartbeat_at'>): number {
++  if (effectiveSubsiteStatus(row) === 'active' && row.health_score <= 0) return 100
++  return row.health_score
++}
++
  function leaseStatusLabel(value: string): string {
 -  return ({ active: '可用', renewing: '续租中', draining: '排空中', released: '已释放', expired: '已过期', revoked: '已撤销' } as Record<string, string>)[value] || value
 +  return ({
@@ -3360,7 +3473,7 @@ index cb5d3f8..d3000cf 100644
  }
  
  function leaseStatusClass(value: string): string {
-@@ -1015,7 +1325,7 @@ function leaseGroupLabel(row: AccountLease): string {
+@@ -1015,7 +1347,7 @@ function leaseGroupLabel(row: AccountLease): string {
  }
  
  function leaseGroupMeta(row: AccountLease): string {
@@ -3369,7 +3482,7 @@ index cb5d3f8..d3000cf 100644
  }
  
  function leaseAccountLabel(row: AccountLease): string {
-@@ -1029,5 +1339,16 @@ function formatDate(value?: string): string {
+@@ -1029,5 +1361,16 @@ function formatDate(value?: string): string {
  
  onMounted(() => {
    void reload()
