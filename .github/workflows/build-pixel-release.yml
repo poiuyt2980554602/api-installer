@@ -91,10 +91,11 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for arch in amd64 arm64; do
+          for arch in amd64; do
             out="package-${arch}"
             agent_out="subsite-agent-package-${arch}"
             mkdir -p "$out" "$agent_out"
+            echo "::group::Build server linux/${arch}"
             (
               cd pixel-src/backend
               GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
@@ -104,6 +105,11 @@ jobs:
                 -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=release" \
                 -o "../../${out}/sub2api" \
                 ./cmd/server
+            )
+            echo "::endgroup::"
+            echo "::group::Build subsite agent linux/${arch}"
+            (
+              cd pixel-src/backend
               GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
                 -p=1 \
                 -trimpath \
@@ -111,6 +117,7 @@ jobs:
                 -o "../../${agent_out}/sub2api-subsite-agent" \
                 ./cmd/subsite-agent
             )
+            echo "::endgroup::"
             cp -R pixel-src/deploy "$out/deploy"
             cp pixel-src/README.md "$out/README.md"
             cp pixel-src/LICENSE "$out/LICENSE"
