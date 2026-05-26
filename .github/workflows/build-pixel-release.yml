@@ -64,7 +64,9 @@ jobs:
 
       - name: Setup pnpm
         run: |
-          npm install -g pnpm@9.0.0
+          curl -fsSL https://github.com/pnpm/pnpm/releases/download/v9.0.0/pnpm-linux-x64 -o /tmp/pnpm
+          chmod +x /tmp/pnpm
+          sudo mv /tmp/pnpm /usr/local/bin/pnpm
           pnpm --version
 
       - name: Build frontend
