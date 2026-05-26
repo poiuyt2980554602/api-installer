@@ -138,9 +138,7 @@ jobs:
           curl -sSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/deploy/install.sh | sudo bash
           \`\`\`
           EOF
-          gh release delete "$tag" --yes --cleanup-tag || true
-          git tag -f "$tag"
-          git push -f origin "$tag"
+          gh release delete "$tag" --yes || true
           gh release create "$tag" dist/*.tar.gz dist/checksums.txt \
             --title "Pixel ${PIXEL_VERSION} Sub2API forwarder binaries" \
             --notes-file "$body_file"
