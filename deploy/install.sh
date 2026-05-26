@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.12}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.13}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api"
@@ -26,6 +26,7 @@ SERVICE_FILE="/etc/systemd/system/sub2api.service"
 
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${SERVER_PORT:-8080}"
+SUBSITE_FORWARD_MODE="${SUBSITE_FORWARD_MODE:-forward}"
 FORCE_YES="${FORCE_YES:-false}"
 PURGE_CONFIG="${PURGE_CONFIG:-false}"
 SERVER_CONFIGURED="${SERVER_CONFIGURED:-false}"
@@ -122,12 +123,14 @@ Options:
   -v, --version VER   Install Pixel version, default ${PIXEL_VERSION}
   --host HOST         Server listen address, default ${SERVER_HOST}
   --port PORT         Server port, default ${SERVER_PORT}
+  --forward-mode MODE Subsite routing mode: forward, local, or direct. Default ${SUBSITE_FORWARD_MODE}
 
 Environment overrides:
   RELEASE_REPO=${RELEASE_REPO}
   RELEASE_TAG=${RELEASE_TAG}
   SERVER_HOST=${SERVER_HOST}
   SERVER_PORT=${SERVER_PORT}
+  SUBSITE_FORWARD_MODE=${SUBSITE_FORWARD_MODE}
 EOF
 }
 
@@ -278,7 +281,7 @@ install_files() {
 verify_forwarder_binary() {
     local binary_path="${INSTALL_DIR}/${APP_NAME}"
 
-    if binary_contains "$binary_path" "SUBSITE_FORWARD"; then
+    if binary_contains "$binary_path" "SUBSITE_FORWARD" && binary_contains "$binary_path" "SUBSITE_FORWARD_MODE"; then
         print_success "Forwarder patch marker found in installed binary"
         return 0
     fi
@@ -316,6 +319,8 @@ ReadWritePaths=${INSTALL_DIR}
 Environment=GIN_MODE=release
 Environment=SERVER_HOST=${SERVER_HOST}
 Environment=SERVER_PORT=${SERVER_PORT}
+Environment=SUBSITE_FORWARD_MODE=${SUBSITE_FORWARD_MODE}
+Environment=SUBSITE_FORWARD_LOCAL_FALLBACK=false
 
 [Install]
 WantedBy=multi-user.target
@@ -361,6 +366,7 @@ Version:        Pixel ${PIXEL_VERSION}
 Install dir:    ${INSTALL_DIR}
 Config dir:     ${CONFIG_DIR}
 Listen address: ${SERVER_HOST}:${SERVER_PORT}
+Subsite mode:   ${SUBSITE_FORWARD_MODE}
 
 Open the setup page:
   http://${display_host}:${SERVER_PORT}
@@ -479,6 +485,18 @@ main() {
                     exit 1
                 fi
                 SERVER_CONFIGURED="true"
+                shift
+                ;;
+            --forward-mode)
+                if [ -z "${2:-}" ]; then
+                    print_error "--forward-mode requires a value: forward, local, or direct"
+                    exit 1
+                fi
+                SUBSITE_FORWARD_MODE="$2"
+                shift 2
+                ;;
+            --forward-mode=*)
+                SUBSITE_FORWARD_MODE="${1#*=}"
                 shift
                 ;;
             --version=*)
