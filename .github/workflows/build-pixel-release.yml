@@ -64,8 +64,7 @@ jobs:
 
       - name: Setup pnpm
         run: |
-          corepack enable
-          corepack prepare pnpm@9.0.0 --activate
+          npm install -g pnpm@9.0.0
           pnpm --version
 
       - name: Build frontend
