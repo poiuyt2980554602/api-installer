@@ -262,7 +262,7 @@ index 1738de6..068d85f 100644
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..34d6fc9 100644
+index 782fff0..603b3ca 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -538,7 +538,7 @@ index 782fff0..34d6fc9 100644
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome <> 'success'),
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome = 'fallback'),
 +			(SELECT COUNT(*) FROM subsite_circuit_breakers WHERE deleted_at IS NULL AND cooldown_until > NOW()),
-+			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '90 seconds'),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes'),
 +			COALESCE((SELECT AVG(latency_ms)::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0)
 +	`).Scan(
 +		&stats.TotalAffinities,
@@ -965,7 +965,7 @@ index 0b4a98b..a2edc16 100644
  		subsites.POST("", h.Admin.Subsite.Create)
  		subsites.PATCH("/:id", h.Admin.Subsite.Update)
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 2302ae5..7e9e6ad 100644
+index 2302ae5..d3b4100 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -2,6 +2,8 @@ package routes
@@ -1040,7 +1040,7 @@ index 2302ae5..7e9e6ad 100644
  		})
 -		gateway.GET("/models", h.Gateway.Models)
 +		gateway.GET("/models", func(c *gin.Context) {
-+			masterDataPlaneOrSubsiteForward(c)
++			masterDataPlaneGuard(c)
 +			if c.IsAborted() {
 +				return
 +			}
@@ -1118,14 +1118,14 @@ index 2302ae5..7e9e6ad 100644
 -		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
 -		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
 +		gemini.GET("/models", func(c *gin.Context) {
-+			masterDataPlaneOrSubsiteForward(c)
++			masterDataPlaneGuard(c)
 +			if c.IsAborted() {
 +				return
 +			}
 +			h.Gateway.GeminiV1BetaListModels(c)
 +		})
 +		gemini.GET("/models/:model", func(c *gin.Context) {
-+			masterDataPlaneOrSubsiteForward(c)
++			masterDataPlaneGuard(c)
 +			if c.IsAborted() {
 +				return
 +			}
@@ -1402,23 +1402,34 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..0c5977e 100644
+index 8cfa424..e75f81d 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
-@@ -48,6 +48,12 @@ const (
+@@ -48,7 +48,14 @@ const (
  	SubsiteAuthHeaderBodySHA   = "X-Subsite-Body-SHA256"
  	SubsiteAuthHeaderSignature = "X-Subsite-Signature"
  
+-	DefaultSubsiteHeartbeatTimeout       = 45 * time.Second
 +	SubsiteRouteHeaderPreferredLeaseID   = "X-Sub2API-Preferred-Lease-ID"
 +	SubsiteRouteHeaderPreferredAccountID = "X-Sub2API-Preferred-Account-ID"
++	SubsiteRouteHeaderPreferredStrict    = "X-Sub2API-Preferred-Strict"
 +	SubsiteRouteHeaderTimestamp          = "X-Sub2API-Route-Timestamp"
 +	SubsiteRouteHeaderNonce              = "X-Sub2API-Route-Nonce"
 +	SubsiteRouteHeaderSignature          = "X-Sub2API-Route-Signature"
 +
- 	DefaultSubsiteHeartbeatTimeout       = 45 * time.Second
++	DefaultSubsiteHeartbeatTimeout       = 120 * time.Second
  	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
  	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
-@@ -384,6 +390,141 @@ type SubsiteMaintenanceResult struct {
+ 	DefaultSubsiteReservationExpiryGrace = 24 * time.Hour
+@@ -265,6 +272,7 @@ type AuthorizeSubsiteRequestInput struct {
+ 	InboundEndpoint                string   `json:"inbound_endpoint"`
+ 	PreferredLeaseID               string   `json:"preferred_lease_id,omitempty"`
+ 	PreferredAccountID             int64    `json:"preferred_account_id,omitempty"`
++	PreferredStrict                bool     `json:"preferred_strict,omitempty"`
+ 	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
+ 	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
+ }
+@@ -384,6 +392,141 @@ type SubsiteMaintenanceResult struct {
  	ReservationExpiryGraceSecs int64 `json:"reservation_expiry_grace_secs"`
  }
  
@@ -1560,7 +1571,7 @@ index 8cfa424..0c5977e 100644
  type SubsiteRepository interface {
  	Create(ctx context.Context, subsite *Subsite) error
  	GetBySubsiteID(ctx context.Context, subsiteID string) (*Subsite, error)
-@@ -395,6 +536,17 @@ type SubsiteRepository interface {
+@@ -395,6 +538,17 @@ type SubsiteRepository interface {
  	MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error)
  }
  
@@ -1578,7 +1589,7 @@ index 8cfa424..0c5977e 100644
  type AccountLeaseRepository interface {
  	Create(ctx context.Context, lease *AccountLease) error
  	GetByLeaseID(ctx context.Context, leaseID string) (*AccountLease, error)
-@@ -436,12 +588,17 @@ type SubsiteNonceStore interface {
+@@ -436,12 +590,17 @@ type SubsiteNonceStore interface {
  }
  
  type SubsiteService struct {
@@ -1599,7 +1610,7 @@ index 8cfa424..0c5977e 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -580,11 +737,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -580,11 +739,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	if strings.TrimSpace(input.SubsiteID) == "" {
  		return nil, ErrSubsiteInvalidInput
  	}
@@ -1617,7 +1628,7 @@ index 8cfa424..0c5977e 100644
  	}
  	hb := &SubsiteHeartbeat{
  		SubsiteID:      strings.TrimSpace(input.SubsiteID),
-@@ -596,7 +754,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -596,7 +756,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  		CPUPercent:     math.Max(0, input.CPUPercent),
  		MemoryBytes:    int64(math.Max(0, float64(input.MemoryBytes))),
  		Metadata:       normalizeSubsiteMap(input.Metadata),
@@ -1626,7 +1637,7 @@ index 8cfa424..0c5977e 100644
  		RemoteIP:       strings.TrimSpace(input.RemoteIP),
  	}
  	if err := s.repo.RecordHeartbeat(ctx, hb); err != nil {
-@@ -605,6 +763,117 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -605,6 +765,117 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	return s.repo.GetBySubsiteID(ctx, hb.SubsiteID)
  }
  
@@ -1744,7 +1755,7 @@ index 8cfa424..0c5977e 100644
  func (s *SubsiteService) decryptSecret(ctx context.Context, subsiteID string) (string, error) {
  	subsite, err := s.repo.GetBySubsiteID(ctx, strings.TrimSpace(subsiteID))
  	if err != nil {
-@@ -671,6 +940,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
+@@ -671,6 +942,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
  	return nil
  }
  
@@ -1778,7 +1789,7 @@ index 8cfa424..0c5977e 100644
  type SubsiteSignedRequest struct {
  	SubsiteID  string
  	Method     string
-@@ -705,6 +1001,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+@@ -705,6 +1003,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
  	return hex.EncodeToString(mac.Sum(nil))
  }
  
@@ -1799,7 +1810,136 @@ index 8cfa424..0c5977e 100644
  type AccountLeaseService struct {
  	leaseRepo   AccountLeaseRepository
  	subsiteRepo SubsiteRepository
-@@ -1977,6 +2287,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
+@@ -1170,52 +1482,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+ 		return nil, nil, err
+ 	}
+ 	now := time.Now()
+-	preferredOnly := input.PreferredLeaseID != "" || input.PreferredAccountID > 0
+-	for i := range leases {
+-		lease := &leases[i]
+-		if lease.Status != AccountLeaseStatusActive && lease.Status != AccountLeaseStatusRenewing {
+-			continue
+-		}
+-		if !lease.ExpiresAt.After(now) {
+-			continue
+-		}
+-		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
+-			continue
+-		}
+-		if lease.MaxTokens > 0 && lease.UsedTokens >= lease.MaxTokens {
+-			continue
+-		}
+-		if lease.GroupID != groupID {
+-			continue
++	preferredRequested := input.PreferredLeaseID != "" || input.PreferredAccountID > 0
++	for pass := 0; pass < 2; pass++ {
++		enforcePreferred := preferredRequested && pass == 0
++		if pass == 1 && (!preferredRequested || input.PreferredStrict) {
++			break
+ 		}
+-		if input.PreferredLeaseID != "" && lease.LeaseID != input.PreferredLeaseID {
+-			continue
+-		}
+-		if input.PreferredAccountID > 0 && lease.AccountID != input.PreferredAccountID {
+-			continue
+-		}
+-		if containsStringTrimmed(input.ExcludedLeaseIDs, lease.LeaseID) {
+-			continue
+-		}
+-		if containsInt64(input.ExcludedAccountIDs, lease.AccountID) {
+-			continue
+-		}
+-		if input.Platform != "" && lease.Platform != "" && !strings.EqualFold(lease.Platform, input.Platform) {
+-			continue
+-		}
+-		account, err := s.accountRepo.GetByID(ctx, lease.AccountID)
+-		if err != nil {
+-			return nil, nil, err
+-		}
+-		if account == nil || !account.IsSchedulable() {
+-			continue
+-		}
+-		if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
+-			continue
++		for i := range leases {
++			lease := &leases[i]
++			if lease.Status != AccountLeaseStatusActive && lease.Status != AccountLeaseStatusRenewing {
++				continue
++			}
++			if !lease.ExpiresAt.After(now) {
++				continue
++			}
++			if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
++				continue
++			}
++			if lease.MaxTokens > 0 && lease.UsedTokens >= lease.MaxTokens {
++				continue
++			}
++			if lease.GroupID != groupID {
++				continue
++			}
++			if enforcePreferred && input.PreferredLeaseID != "" && lease.LeaseID != input.PreferredLeaseID {
++				continue
++			}
++			if enforcePreferred && input.PreferredAccountID > 0 && lease.AccountID != input.PreferredAccountID {
++				continue
++			}
++			if containsStringTrimmed(input.ExcludedLeaseIDs, lease.LeaseID) {
++				continue
++			}
++			if containsInt64(input.ExcludedAccountIDs, lease.AccountID) {
++				continue
++			}
++			if input.Platform != "" && lease.Platform != "" && !strings.EqualFold(lease.Platform, input.Platform) {
++				continue
++			}
++			account, err := s.accountRepo.GetByID(ctx, lease.AccountID)
++			if err != nil {
++				return nil, nil, err
++			}
++			if account == nil || !account.IsSchedulable() {
++				continue
++			}
++			if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
++				continue
++			}
++			return lease, account, nil
+ 		}
+-		return lease, account, nil
+ 	}
+-	if !preferredOnly && isPrivateSubsiteAutoLeaseEligible(apiKey) {
++	if !input.PreferredStrict && isPrivateSubsiteAutoLeaseEligible(apiKey) {
+ 		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
+ 		if err != nil {
+ 			return nil, nil, err
+@@ -1224,7 +1542,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+ 			return lease, account, nil
+ 		}
+ 	}
+-	if preferredOnly {
++	if preferredRequested && input.PreferredStrict {
+ 		return nil, nil, ErrSubsiteAuthorizeNoLease
+ 	}
+ 	return nil, nil, ErrSubsiteAuthorizeNoLease
+@@ -1289,7 +1607,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+ 			ExpiresAt:          expiresAt,
+ 		}
+ 		if err := s.reservationRepo.Create(ctx, reservation); err != nil {
+-			if errors.Is(err, ErrSubsiteLeaseCapacityExceeded) && currentInput.PreferredLeaseID == "" && currentInput.PreferredAccountID <= 0 {
++			if errors.Is(err, ErrSubsiteLeaseCapacityExceeded) && !currentInput.PreferredStrict {
+ 				if _, seen := triedLeaseIDs[lease.LeaseID]; !seen {
+ 					triedLeaseIDs[lease.LeaseID] = struct{}{}
+ 					currentInput.ExcludedLeaseIDs = append(currentInput.ExcludedLeaseIDs, lease.LeaseID)
+@@ -1298,6 +1616,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+ 					triedAccountIDs[account.ID] = struct{}{}
+ 					currentInput.ExcludedAccountIDs = append(currentInput.ExcludedAccountIDs, account.ID)
+ 				}
++				currentInput.PreferredLeaseID = ""
++				currentInput.PreferredAccountID = 0
+ 				continue
+ 			}
+ 			return nil, nil, nil, err
+@@ -1977,6 +2297,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
  	return copySubsiteMap(in)
  }
  
@@ -1817,11 +1957,163 @@ index 8cfa424..0c5977e 100644
  func copySubsiteMap(in map[string]any) map[string]any {
  	if in == nil {
  		return map[string]any{}
+diff --git a/backend/internal/service/subsite_usage_ingest_test.go b/backend/internal/service/subsite_usage_ingest_test.go
+index 3774d55..4c1ba7c 100644
+--- a/backend/internal/service/subsite_usage_ingest_test.go
++++ b/backend/internal/service/subsite_usage_ingest_test.go
+@@ -1139,6 +1139,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
+ 	require.Equal(t, "lease_open", reservationRepo.created.LeaseID)
+ }
+ 
++func TestRequestAuthorize_PreferredLeaseCapacityFallsBackWhenNotStrict(t *testing.T) {
++	now := time.Now()
++	groupID := int64(7)
++	reservationRepo := &subsiteAuthorizeReservationRepoStub{
++		capacityByLeaseID: map[string]error{
++			"lease_sticky": ErrSubsiteLeaseCapacityExceeded,
++		},
++	}
++	svc := NewRequestAuthorizeService(
++		&subsiteAuthorizeRepoStub{subsite: &Subsite{SubsiteID: "site_1", Status: SubsiteStatusActive}},
++		&subsiteAuthorizeLeaseRepoStub{leases: []AccountLease{
++			{
++				LeaseID:        "lease_sticky",
++				SubsiteID:      "site_1",
++				AccountID:      100,
++				GroupID:        groupID,
++				Platform:       PlatformOpenAI,
++				Status:         AccountLeaseStatusActive,
++				MaxConcurrency: 1,
++				ExpiresAt:      now.Add(time.Hour),
++			},
++			{
++				LeaseID:        "lease_fallback",
++				SubsiteID:      "site_1",
++				AccountID:      101,
++				GroupID:        groupID,
++				Platform:       PlatformOpenAI,
++				Status:         AccountLeaseStatusActive,
++				MaxConcurrency: 1,
++				ExpiresAt:      now.Add(time.Hour),
++			},
++		}},
++		reservationRepo,
++		NewAPIKeyService(&subsiteAuthorizeAPIKeyRepoStub{apiKey: &APIKey{
++			ID:      200,
++			Key:     "client-key",
++			UserID:  300,
++			GroupID: &groupID,
++			Status:  StatusActive,
++			User:    &User{ID: 300, Status: StatusActive, Balance: 10},
++			Group:   &Group{ID: groupID, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: 1},
++		}}, nil, nil, nil, nil, nil, &config.Config{}),
++		nil,
++		&subsiteAuthorizeAccountRepoStub{accounts: map[int64]*Account{
++			100: {ID: 100, Type: AccountTypeAPIKey, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true},
++			101: {ID: 101, Type: AccountTypeAPIKey, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true},
++		}},
++		NewBillingService(&config.Config{}, nil),
++		nil,
++	)
++
++	authorization, err := svc.Authorize(context.Background(), AuthorizeSubsiteRequestInput{
++		SubsiteID:             "site_1",
++		APIKey:                "client-key",
++		Platform:              PlatformOpenAI,
++		RequestedModel:        "gpt-5.4",
++		RequestFingerprint:    "fp_preferred_capacity_fallback",
++		ClientIP:              "127.0.0.1",
++		InboundEndpoint:       "/v1/responses",
++		PreferredLeaseID:      "lease_sticky",
++		PreferredAccountID:    100,
++		EstimatedInputTokens:  1000,
++		EstimatedOutputTokens: 1000,
++	})
++
++	require.NoError(t, err)
++	require.NotNil(t, authorization)
++	require.Equal(t, "lease_fallback", authorization.LeaseID)
++	require.Equal(t, int64(101), authorization.AccountID)
++}
++
++func TestRequestAuthorize_PreferredLeaseCapacityStaysStrictWhenLocked(t *testing.T) {
++	now := time.Now()
++	groupID := int64(7)
++	reservationRepo := &subsiteAuthorizeReservationRepoStub{
++		capacityByLeaseID: map[string]error{
++			"lease_sticky": ErrSubsiteLeaseCapacityExceeded,
++		},
++	}
++	svc := NewRequestAuthorizeService(
++		&subsiteAuthorizeRepoStub{subsite: &Subsite{SubsiteID: "site_1", Status: SubsiteStatusActive}},
++		&subsiteAuthorizeLeaseRepoStub{leases: []AccountLease{
++			{
++				LeaseID:        "lease_sticky",
++				SubsiteID:      "site_1",
++				AccountID:      100,
++				GroupID:        groupID,
++				Platform:       PlatformOpenAI,
++				Status:         AccountLeaseStatusActive,
++				MaxConcurrency: 1,
++				ExpiresAt:      now.Add(time.Hour),
++			},
++			{
++				LeaseID:        "lease_fallback",
++				SubsiteID:      "site_1",
++				AccountID:      101,
++				GroupID:        groupID,
++				Platform:       PlatformOpenAI,
++				Status:         AccountLeaseStatusActive,
++				MaxConcurrency: 1,
++				ExpiresAt:      now.Add(time.Hour),
++			},
++		}},
++		reservationRepo,
++		NewAPIKeyService(&subsiteAuthorizeAPIKeyRepoStub{apiKey: &APIKey{
++			ID:      200,
++			Key:     "client-key",
++			UserID:  300,
++			GroupID: &groupID,
++			Status:  StatusActive,
++			User:    &User{ID: 300, Status: StatusActive, Balance: 10},
++			Group:   &Group{ID: groupID, SubscriptionType: SubscriptionTypeStandard, RateMultiplier: 1},
++		}}, nil, nil, nil, nil, nil, &config.Config{}),
++		nil,
++		&subsiteAuthorizeAccountRepoStub{accounts: map[int64]*Account{
++			100: {ID: 100, Type: AccountTypeAPIKey, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true},
++			101: {ID: 101, Type: AccountTypeAPIKey, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true},
++		}},
++		NewBillingService(&config.Config{}, nil),
++		nil,
++	)
++
++	authorization, err := svc.Authorize(context.Background(), AuthorizeSubsiteRequestInput{
++		SubsiteID:             "site_1",
++		APIKey:                "client-key",
++		Platform:              PlatformOpenAI,
++		RequestedModel:        "gpt-5.4",
++		RequestFingerprint:    "fp_preferred_capacity_strict",
++		ClientIP:              "127.0.0.1",
++		InboundEndpoint:       "/v1/responses",
++		PreferredLeaseID:      "lease_sticky",
++		PreferredAccountID:    100,
++		PreferredStrict:       true,
++		EstimatedInputTokens:  1000,
++		EstimatedOutputTokens: 1000,
++	})
++
++	require.Nil(t, authorization)
++	require.ErrorIs(t, err, ErrSubsiteLeaseCapacityExceeded)
++}
++
+ func TestRequestAuthorize_RejectsLeaseGroupMismatch(t *testing.T) {
+ 	now := time.Now()
+ 	apiKeyGroupID := int64(7)
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
-index fe0842b..20f2dbb 100644
+index fe0842b..f3b29ff 100644
 --- a/backend/internal/subsite/agent/server.go
 +++ b/backend/internal/subsite/agent/server.go
-@@ -4,12 +4,14 @@ import (
+@@ -4,16 +4,18 @@ import (
  	"bytes"
  	"context"
  	"crypto/sha256"
@@ -1832,10 +2124,15 @@ index fe0842b..20f2dbb 100644
  	"fmt"
  	"io"
  	"net/http"
++	"net/url"
 +	"strconv"
  	"strings"
  	"time"
  
+-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+ 	"github.com/Wei-Shaw/sub2api/internal/service"
+ 	masterclient "github.com/Wei-Shaw/sub2api/internal/subsite/client"
+ 	"github.com/Wei-Shaw/sub2api/internal/subsite/queue"
 @@ -140,6 +142,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
  		})
  		return
@@ -1879,16 +2176,17 @@ index fe0842b..20f2dbb 100644
  	input := service.AuthorizeSubsiteRequestInput{
  		SubsiteID:          s.cfg.Subsite.ID,
  		APIKey:             apiKey,
-@@ -219,6 +236,8 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+@@ -219,6 +236,9 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
  		ClientIP:           clientIP(c),
  		UserAgent:          c.GetHeader("User-Agent"),
  		InboundEndpoint:    c.Request.URL.Path,
 +		PreferredLeaseID:   preferredLeaseID,
 +		PreferredAccountID: preferredAccountID,
++		PreferredStrict:    (preferredLeaseID != "" || preferredAccountID > 0) && strings.EqualFold(strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderPreferredStrict)), "1"),
  	}
  	if err := populateAuthorizeCostHints(&input, c, body); err != nil {
  		return nil, nil, err
-@@ -230,6 +249,36 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+@@ -230,6 +250,36 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
  	return authorization, body, nil
  }
  
@@ -1925,7 +2223,7 @@ index fe0842b..20f2dbb 100644
  func (s *Server) cancelReservation(ctx context.Context, requestID string) error {
  	payload := map[string]string{"request_id": requestID}
  	return s.master.PostRaw(ctx, "/api/internal/requests/cancel", payload, nil)
-@@ -287,6 +336,14 @@ func extractClientAPIKey(c *gin.Context) string {
+@@ -287,6 +337,14 @@ func extractClientAPIKey(c *gin.Context) string {
  	return ""
  }
  
@@ -1940,6 +2238,99 @@ index fe0842b..20f2dbb 100644
  func populateAuthorizeCostHints(input *service.AuthorizeSubsiteRequestInput, c *gin.Context, body []byte) error {
  	if input == nil {
  		return fmt.Errorf("authorize input is required")
+@@ -470,10 +528,88 @@ func (s *Server) handleOpenAIModels(c *gin.Context) {
+ 		})
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, gin.H{
+-		"object": "list",
+-		"data":   openai.DefaultModels,
+-	})
++	target, err := s.masterModelListURL(c.Request.URL)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target, nil)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	copyClientModelHeaders(req.Header, c.Request.Header)
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	defer resp.Body.Close()
++	copyModelResponseHeaders(c.Writer.Header(), resp.Header)
++	c.Status(resp.StatusCode)
++	_, _ = io.Copy(c.Writer, resp.Body)
++}
++
++func (s *Server) masterModelListURL(original *url.URL) (string, error) {
++	if s == nil || s.cfg == nil {
++		return "", fmt.Errorf("subsite config is not initialized")
++	}
++	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(s.cfg.Master.BaseURL), "/"))
++	if err != nil {
++		return "", err
++	}
++	if base.Scheme == "" || base.Host == "" {
++		return "", fmt.Errorf("invalid master base url")
++	}
++	path := "/v1/models"
++	if original != nil && strings.TrimSpace(original.Path) == "/models" {
++		path = "/models"
++	}
++	base.Path = strings.TrimRight(base.Path, "/") + path
++	if original != nil {
++		base.RawQuery = original.RawQuery
++	}
++	return base.String(), nil
++}
++
++func copyClientModelHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if skipModelProxyRequestHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copyModelResponseHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if skipModelProxyResponseHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func skipModelProxyRequestHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length":
++		return true
++	default:
++		return false
++	}
++}
++
++func skipModelProxyResponseHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length":
++		return true
++	default:
++		return false
++	}
+ }
+ 
+ func hasUsagePayload(item service.UsageIngestItem) bool {
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
 index 7ff95d3..bd6ed44 100644
 --- a/frontend/src/api/admin/index.ts
@@ -2534,7 +2925,7 @@ index f59b1e7..b9e73c6 100644
    },
    {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..4c4b400 100644
+index cb5d3f8..43351ae 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
 @@ -1,19 +1,219 @@
@@ -3446,7 +3837,7 @@ index cb5d3f8..4c4b400 100644
 +  if (!value) return false
 +  const timestamp = new Date(value).getTime()
 +  if (!Number.isFinite(timestamp)) return false
-+  return Date.now() - timestamp <= 90_000
++  return Date.now() - timestamp <= 180_000
 +}
 +
 +function effectiveSubsiteStatus(row: Pick<Subsite, 'status' | 'last_heartbeat_at'> | { status: string; last_heartbeat_at?: string }): string {
