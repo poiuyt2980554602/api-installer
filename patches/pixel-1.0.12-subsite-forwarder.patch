@@ -2123,6 +2123,302 @@ index 3774d55..4c1ba7c 100644
  func TestRequestAuthorize_RejectsLeaseGroupMismatch(t *testing.T) {
  	now := time.Now()
  	apiKeyGroupID := int64(7)
+diff --git a/backend/internal/subsite/agent/proxy.go b/backend/internal/subsite/agent/proxy.go
+index aba49da..0f4f230 100644
+--- a/backend/internal/subsite/agent/proxy.go
++++ b/backend/internal/subsite/agent/proxy.go
+@@ -150,6 +150,22 @@ func (s *Server) proxyOpenAIChatCompletionsViaResponses(c *gin.Context, authoriz
+ 	}
+ 	defer resp.Body.Close()
+ 
++	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isSSEContentType(resp.Header.Get("Content-Type")) {
++		responseBody, metrics, err := streamResponsesSSEToChatCompletions(c, resp, originalModel)
++		if err != nil {
++			return nil, err
++		}
++		usage := buildUsageIngestItem(c, authorization, originalRequestBody, responseBody, "/v1/responses", time.Since(start), metrics)
++		if err := s.queue.Enqueue(c.Request.Context(), usage); err != nil {
++			if c.Writer.Written() {
++				fmt.Printf("subsite usage enqueue failed after stream response: %v\n", err)
++				return &proxyResult{UpstreamEndpoint: "/v1/responses"}, nil
++			}
++			return nil, fmt.Errorf("enqueue usage after stream response: %w", err)
++		}
++		return &proxyResult{UpstreamEndpoint: "/v1/responses"}, nil
++	}
++
+ 	responseBody, wroteResponse, metrics, err := streamOrBufferResponse(c, resp)
+ 	if err != nil {
+ 		return nil, err
+@@ -493,6 +509,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool,
+ 	}
+ 	c.Status(resp.StatusCode)
+ 	metrics := &responseCaptureMetrics{}
++	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isSSEContentType(contentType) {
++		body, err := streamRawResponseBody(c, resp.Body, resp.StatusCode, contentType, metrics)
++		if err != nil {
++			return body, true, metrics, fmt.Errorf("stream upstream response: %w", err)
++		}
++		return body, true, metrics, nil
++	}
+ 	body, err := readUpstreamBodyWithMetrics(resp.Body, contentType, metrics)
+ 	if err != nil {
+ 		return nil, false, nil, fmt.Errorf("read upstream response: %w", err)
+@@ -511,6 +534,133 @@ func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
+ 	c.Data(resp.StatusCode, contentType, body)
+ }
+ 
++func prepareStreamingResponse(c *gin.Context, statusCode int, contentType string) {
++	if contentType == "" {
++		contentType = "text/event-stream"
++	}
++	header := c.Writer.Header()
++	header.Set("Content-Type", contentType)
++	header.Set("Cache-Control", "no-cache")
++	header.Set("X-Accel-Buffering", "no")
++	header.Del("Content-Length")
++	c.Status(statusCode)
++	c.Writer.WriteHeaderNow()
++	c.Writer.Flush()
++}
++
++func streamRawResponseBody(c *gin.Context, reader io.Reader, statusCode int, contentType string, metrics *responseCaptureMetrics) ([]byte, error) {
++	prepareStreamingResponse(c, statusCode, contentType)
++	startedAt := time.Now()
++	var out bytes.Buffer
++	chunk := make([]byte, 32*1024)
++	var pendingSSE []byte
++	truncated := false
++	for {
++		n, err := reader.Read(chunk)
++		if n > 0 {
++			part := chunk[:n]
++			if !truncated {
++				if out.Len()+n <= maxBufferedUpstreamBody {
++					_, _ = out.Write(part)
++				} else {
++					truncated = true
++				}
++			}
++			if isSSEContentType(contentType) && metrics != nil && metrics.firstTokenMs == nil {
++				pendingSSE = append(pendingSSE, part...)
++				pendingSSE = observeSSEFirstToken(pendingSSE, startedAt, metrics)
++			}
++			if _, writeErr := c.Writer.Write(part); writeErr != nil {
++				return out.Bytes(), writeErr
++			}
++			c.Writer.Flush()
++		}
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return out.Bytes(), err
++		}
++	}
++	if isSSEContentType(contentType) && metrics != nil && metrics.firstTokenMs == nil && len(pendingSSE) > 0 {
++		_ = observeSSELine(bytes.TrimRight(pendingSSE, "\r"), startedAt, metrics)
++	}
++	return out.Bytes(), nil
++}
++
++func streamResponsesSSEToChatCompletions(c *gin.Context, resp *http.Response, originalModel string) ([]byte, *responseCaptureMetrics, error) {
++	copyResponseHeaders(c.Writer.Header(), resp.Header)
++	prepareStreamingResponse(c, resp.StatusCode, "text/event-stream")
++
++	startedAt := time.Now()
++	metrics := &responseCaptureMetrics{}
++	state := apicompat.NewResponsesEventToChatState()
++	state.Model = originalModel
++	reader := bufio.NewReader(resp.Body)
++	var upstreamBody bytes.Buffer
++	truncated := false
++
++	for {
++		line, err := reader.ReadBytes('\n')
++		if len(line) > 0 {
++			if !truncated {
++				if upstreamBody.Len()+len(line) <= maxBufferedUpstreamBody {
++					_, _ = upstreamBody.Write(line)
++				} else {
++					truncated = true
++				}
++			}
++			_ = observeSSELine(bytes.TrimRight(line, "\r\n"), startedAt, metrics)
++			if err := writeConvertedResponsesSSELine(c, bytes.TrimRight(line, "\r\n"), state); err != nil {
++				return upstreamBody.Bytes(), metrics, err
++			}
++		}
++		if err != nil {
++			if err == io.EOF {
++				break
++			}
++			return upstreamBody.Bytes(), metrics, fmt.Errorf("read responses sse: %w", err)
++		}
++	}
++	for _, chunk := range apicompat.FinalizeResponsesChatStream(state) {
++		sse, err := apicompat.ChatChunkToSSE(chunk)
++		if err != nil {
++			return upstreamBody.Bytes(), metrics, fmt.Errorf("finalize chat chunk: %w", err)
++		}
++		if _, err := c.Writer.Write([]byte(sse)); err != nil {
++			return upstreamBody.Bytes(), metrics, err
++		}
++		c.Writer.Flush()
++	}
++	if _, err := c.Writer.Write([]byte("data: [DONE]\n\n")); err != nil {
++		return upstreamBody.Bytes(), metrics, err
++	}
++	c.Writer.Flush()
++	return upstreamBody.Bytes(), metrics, nil
++}
++
++func writeConvertedResponsesSSELine(c *gin.Context, rawLine []byte, state *apicompat.ResponsesEventToChatState) error {
++	line := string(rawLine)
++	if !strings.HasPrefix(line, "data: ") || line == "data: [DONE]" {
++		return nil
++	}
++	var event apicompat.ResponsesStreamEvent
++	if err := json.Unmarshal([]byte(line[6:]), &event); err != nil {
++		return fmt.Errorf("parse responses sse event: %w", err)
++	}
++	for _, chunk := range apicompat.ResponsesEventToChatChunks(&event, state) {
++		sse, err := apicompat.ChatChunkToSSE(chunk)
++		if err != nil {
++			return fmt.Errorf("marshal chat chunk: %w", err)
++		}
++		if _, err := c.Writer.Write([]byte(sse)); err != nil {
++			return err
++		}
++		c.Writer.Flush()
++	}
++	return nil
++}
++
+ func copyResponseHeaders(dst, src http.Header) {
+ 	for key, values := range src {
+ 		lower := strings.ToLower(strings.TrimSpace(key))
+diff --git a/backend/internal/subsite/agent/proxy_test.go b/backend/internal/subsite/agent/proxy_test.go
+index de044c5..9589c05 100644
+--- a/backend/internal/subsite/agent/proxy_test.go
++++ b/backend/internal/subsite/agent/proxy_test.go
+@@ -1,6 +1,7 @@
+ package agent
+ 
+ import (
++	"bufio"
+ 	"context"
+ 	"crypto/sha256"
+ 	"crypto/tls"
+@@ -553,6 +554,108 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
+ 	require.LessOrEqual(t, *item.FirstTokenMs, *item.DurationMs)
+ }
+ 
++func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesStreamsBeforeUpstreamCompletes(t *testing.T) {
++	gin.SetMode(gin.TestMode)
++
++	const secret = "subsite-secret"
++	firstChunkSent := make(chan struct{})
++	allowComplete := make(chan struct{})
++
++	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		w.Header().Set("Content-Type", "text/event-stream")
++		flusher, ok := w.(http.Flusher)
++		require.True(t, ok)
++		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
++		flusher.Flush()
++		close(firstChunkSent)
++		<-allowComplete
++		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n"))
++		flusher.Flush()
++	}))
++	defer upstream.Close()
++
++	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		requireSubsiteSignature(t, r, secret)
++		switch r.URL.Path {
++		case "/api/internal/requests/authorize":
++			writeMasterEnvelope(t, w, service.AuthorizeSubsiteResponse{
++				RequestID:      "subreq_cc_stream_1",
++				ReservationID:  "qres_cc_stream_1",
++				SubsiteID:      "site_1",
++				LeaseID:        "lease_1",
++				AccountID:      100,
++				APIKeyID:       200,
++				UserID:         300,
++				Platform:       service.PlatformOpenAI,
++				RequestedModel: "gpt-5.4",
++				MappedModel:    "gpt-5.4",
++				MaxCost:        1,
++				ExpiresAt:      time.Now().Add(time.Minute),
++				BillingType:    service.BillingTypeBalance,
++				Credential: service.CredentialSnapshot{
++					AccountType: service.AccountTypeAPIKey,
++					Credentials: map[string]any{
++						"api_key":  "sk-upstream",
++						"base_url": upstream.URL,
++					},
++					ExpiresAt: time.Now().Add(time.Minute),
++				},
++			})
++		default:
++			t.Fatalf("unexpected master path: %s", r.URL.Path)
++		}
++	}))
++	defer master.Close()
++
++	usageQueue, err := queue.Open(filepath.Join(t.TempDir(), "usage.db"))
++	require.NoError(t, err)
++	defer usageQueue.Close()
++
++	server := NewServer(&Config{
++		ListenAddr: ":0",
++		Subsite:    SubsiteConfig{ID: "site_1"},
++		Master:     MasterConfig{BaseURL: master.URL, Secret: secret},
++		Queue:      QueueConfig{Path: filepath.Join(t.TempDir(), "unused.db")},
++	}, masterclient.NewMasterClient(master.URL, "site_1", secret), usageQueue)
++	httpServer := httptest.NewServer(server.engine)
++	defer httpServer.Close()
++
++	req, err := http.NewRequest(http.MethodPost, httpServer.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
++	require.NoError(t, err)
++	req.Header.Set("Authorization", "Bearer client-key")
++	req.Header.Set("Content-Type", "application/json")
++	resp, err := http.DefaultClient.Do(req)
++	require.NoError(t, err)
++	defer resp.Body.Close()
++	defer close(allowComplete)
++
++	require.Equal(t, http.StatusOK, resp.StatusCode)
++	require.Equal(t, "text/event-stream", strings.Split(resp.Header.Get("Content-Type"), ";")[0])
++	select {
++	case <-firstChunkSent:
++	case <-time.After(time.Second):
++		t.Fatal("upstream did not send first chunk")
++	}
++	lineCh := make(chan string, 1)
++	go func() {
++		scanner := bufio.NewScanner(resp.Body)
++		for scanner.Scan() {
++			line := scanner.Text()
++			if strings.Contains(line, "chat.completion.chunk") {
++				lineCh <- line
++				return
++			}
++		}
++		lineCh <- ""
++	}()
++	select {
++	case line := <-lineCh:
++		require.Contains(t, line, "hello")
++	case <-time.After(time.Second):
++		t.Fatal("first converted SSE chunk was not flushed before upstream completion")
++	}
++}
++
+ func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
 index fe0842b..f3b29ff 100644
 --- a/backend/internal/subsite/agent/server.go
