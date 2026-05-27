@@ -91,7 +91,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          for arch in amd64; do
+          for arch in amd64 arm64; do
             out="package-${arch}"
             agent_out="subsite-agent-package-${arch}"
             mkdir -p "$out" "$agent_out"
