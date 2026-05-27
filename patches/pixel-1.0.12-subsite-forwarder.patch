@@ -262,7 +262,7 @@ index 1738de6..068d85f 100644
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..603b3ca 100644
+index 782fff0..1b4d963 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -274,11 +274,25 @@ index 782fff0..603b3ca 100644
  				WHEN $2 IN ('active', 'unhealthy') THEN $2
  				ELSE status
  			END,
-@@ -281,6 +281,19 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
+@@ -281,7 +281,31 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
  	if affected, _ := res.RowsAffected(); affected == 0 {
  		return service.ErrSubsiteNotFound
  	}
-+	if _, err := tx.ExecContext(ctx, `
+-	return tx.Commit()
++	if err := tx.Commit(); err != nil {
++		return err
++	}
++	_ = r.recordSubsiteHealthSample(ctx, heartbeat, metadataJSON)
++	return nil
++}
++
++func (r *subsiteRepository) recordSubsiteHealthSample(ctx context.Context, heartbeat *service.SubsiteHeartbeat, metadataJSON []byte) error {
++	if heartbeat == nil {
++		return nil
++	}
++	sampleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
++	defer cancel()
++	_, err := r.db.ExecContext(sampleCtx, `
 +		INSERT INTO subsite_health_samples (
 +			subsite_id, status, health_score, active_requests, queued_usage, qps,
 +			cpu_percent, memory_bytes, version, metadata, created_at
@@ -288,13 +302,12 @@ index 782fff0..603b3ca 100644
 +			$3, $4, $5, $6, $7, $8, $9, $10
 +		)
 +	`, heartbeat.SubsiteID, heartbeat.Status, heartbeat.ActiveRequests, heartbeat.QueuedUsage,
-+		heartbeat.QPS, heartbeat.CPUPercent, heartbeat.MemoryBytes, heartbeat.Version, metadataJSON, heartbeat.ReportedAt); err != nil {
-+		return fmt.Errorf("insert subsite health sample: %w", err)
-+	}
- 	return tx.Commit()
++		heartbeat.QPS, heartbeat.CPUPercent, heartbeat.MemoryBytes, heartbeat.Version, metadataJSON, heartbeat.ReportedAt)
++	return err
  }
  
-@@ -300,6 +313,456 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
+ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error) {
+@@ -300,6 +324,456 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
  	return res.RowsAffected()
  }
  
@@ -751,7 +764,7 @@ index 782fff0..603b3ca 100644
  type accountLeaseRepository struct {
  	db *sql.DB
  }
-@@ -546,14 +1009,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+@@ -546,14 +1020,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
  
  	lease, err := scanAccountLease(tx.QueryRowContext(ctx, `
  		SELECT al.id, al.lease_id, al.subsite_id, al.account_id, al.group_id,
@@ -768,7 +781,7 @@ index 782fff0..603b3ca 100644
  		WHERE al.lease_id = $1
  		  AND al.subsite_id = $2
  		  AND al.deleted_at IS NULL
-@@ -1070,6 +1531,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
+@@ -1070,6 +1542,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
  	return reservation, nil
  }
  
