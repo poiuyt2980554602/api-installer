@@ -1,5 +1,5 @@
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
-index 55c03b8..df85fb2 100644
+index 55c03b8d5ff09699d2268df4cd3c4ffa004edcfb..df85fb260324c675f11e00aa1cfb2686b60c87fb 100644
 --- a/backend/cmd/server/wire_gen.go
 +++ b/backend/cmd/server/wire_gen.go
 @@ -260,13 +260,14 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
@@ -28,7 +28,7 @@ index 55c03b8..df85fb2 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
-index f83507c..d733e4d 100644
+index f83507c835c78d11bf020681b2552baaedfb0182..d733e4d7feae3d4bd334970a4c20f3e03a483c63 100644
 --- a/backend/internal/handler/admin/subsite_handler.go
 +++ b/backend/internal/handler/admin/subsite_handler.go
 @@ -1,6 +1,9 @@
@@ -207,7 +207,7 @@ index f83507c..d733e4d 100644
  	var input service.CreateSubsiteInput
  	if err := c.ShouldBindJSON(&input); err != nil {
 diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
-index b723365..0c77fd2 100644
+index b72336521eec5864c00086c5637921e7f7e142a5..0c77fd2365e102873585c01e4886feb81873a2f3 100644
 --- a/backend/internal/handler/handler.go
 +++ b/backend/internal/handler/handler.go
 @@ -57,6 +57,7 @@ type Handlers struct {
@@ -218,8 +218,785 @@ index b723365..0c77fd2 100644
  	Setting          *SettingHandler
  	Totp             *TotpHandler
  	Payment          *PaymentHandler
+diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
+new file mode 100644
+index 0000000000000000000000000000000000000000..7883d116f995b9153ec715dbe7465e1d538d6fd7
+--- /dev/null
++++ b/backend/internal/handler/subsite_forwarder.go
+@@ -0,0 +1,771 @@
++package handler
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"math/rand"
++	"net"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++)
++
++const (
++	subsiteForwardAffinityTTL     = 12 * time.Hour
++	subsiteForwardMaxBodyBytes    = 64 << 20
++	subsiteForwardHealthyWindow   = 3 * time.Minute
++	subsiteForwardHeader          = "X-Sub2API-Master-Forwarded"
++	subsiteForwardTargetHeader    = "X-Sub2API-Forward-Target"
++	subsiteForwardAffinityHeader  = "X-Sub2API-Forward-Affinity"
++	subsiteForwardReasonHeader    = "X-Sub2API-Forward-Reason"
++	subsiteForwardLeaseHeader     = "X-Sub2API-Lease-ID"
++	subsiteForwardAccountHeader   = "X-Sub2API-Account-ID"
++	subsiteForwardNoCandidateCode = "SUBSITE_FORWARD_NO_CANDIDATE"
++)
++
++var errSubsiteForwardNoCandidate = errors.New("no healthy subsite is available for forwarding")
++
++type SubsiteForwarder struct {
++	subsiteService *service.SubsiteService
++	settingService *service.SettingService
++	client         *http.Client
++	affinity       *subsiteAffinityStore
++}
++
++type subsiteForwardContext struct {
++	Key       string
++	Type      string
++	Model     string
++	Session   string
++	APIKeyID  int64
++	UserID    int64
++	GroupID   int64
++	AccountID int64
++	LeaseID   string
++	Strict    bool
++}
++
++type subsiteRouteCandidate struct {
++	subsite service.Subsite
++	load    service.SubsiteForwardSiteStat
++}
++
++func NewSubsiteForwarder(subsiteService *service.SubsiteService, settingService *service.SettingService) *SubsiteForwarder {
++	return &SubsiteForwarder{
++		subsiteService: subsiteService,
++		settingService: settingService,
++		client: &http.Client{
++			Timeout: 0,
++			Transport: &http.Transport{
++				Proxy:                 http.ProxyFromEnvironment,
++				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
++				ForceAttemptHTTP2:     true,
++				MaxIdleConns:          100,
++				MaxIdleConnsPerHost:   32,
++				IdleConnTimeout:       90 * time.Second,
++				TLSHandshakeTimeout:   10 * time.Second,
++				ExpectContinueTimeout: 1 * time.Second,
++			},
++		},
++		affinity: newSubsiteAffinityStore(subsiteForwardAffinityTTL),
++	}
++}
++
++func (f *SubsiteForwarder) Mode(ctx context.Context, fallback string) string {
++	if f == nil || f.settingService == nil {
++		return service.NormalizeSubsiteForwardMode(fallback)
++	}
++	return f.settingService.GetSubsiteForwardMode(ctx, fallback)
++}
++
++func (f *SubsiteForwarder) ForwardGatewayRequest(c *gin.Context) bool {
++	if f == nil || f.subsiteService == nil {
++		return false
++	}
++	if strings.EqualFold(c.GetHeader(subsiteForwardHeader), "1") {
++		writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_LOOP", "subsite forward loop detected")
++		return true
++	}
++
++	body, err := readForwardBody(c)
++	if err != nil {
++		writeSubsiteForwardError(c, http.StatusBadRequest, "SUBSITE_FORWARD_BODY", err.Error())
++		return true
++	}
++	c.Request.Body = io.NopCloser(bytes.NewReader(body))
++
++	forwardCtx := f.forwardContext(c, body)
++	excluded := make(map[string]struct{})
++	fallbackFrom := ""
++	var lastErr error
++	for attempt := 0; attempt < 3; attempt++ {
++		candidate, reason, err := f.selectSubsite(c.Request.Context(), forwardCtx, excluded)
++		if err != nil {
++			if recordErr := f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, err); recordErr != nil {
++				log.Printf("[subsite-forwarder] record no_candidate event failed: %v", recordErr)
++			}
++			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, err.Error())
++			return true
++		}
++		if candidate == nil {
++			if recordErr := f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, errSubsiteForwardNoCandidate); recordErr != nil {
++				log.Printf("[subsite-forwarder] record no_candidate event failed: %v", recordErr)
++			}
++			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, errSubsiteForwardNoCandidate.Error())
++			return true
++		}
++
++		proxyResult, err := f.proxy(c, candidate, body, reason, forwardCtx)
++		if err == nil {
++			outcome := forwardOutcomeForStatus(proxyResult.StatusCode, fallbackFrom)
++			var eventErr error
++			if outcome == "success" || outcome == "fallback" {
++				if affinityErr := f.storeAffinity(c.Request.Context(), forwardCtx, candidate, reason, ""); affinityErr != nil {
++					log.Printf("[subsite-forwarder] store affinity failed: %v", affinityErr)
++				}
++			} else {
++				eventErr = fmt.Errorf("subsite returned %d", proxyResult.StatusCode)
++			}
++			if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, outcome, proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, eventErr); recordErr != nil {
++				log.Printf("[subsite-forwarder] record %s event failed: %v", outcome, recordErr)
++			}
++			return true
++		}
++		lastErr = err
++		if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, "failed", proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, err); recordErr != nil {
++			log.Printf("[subsite-forwarder] record failed event failed: %v", recordErr)
++		}
++		if c.Writer.Written() {
++			return true
++		}
++		forwardCtx.LeaseID = ""
++		forwardCtx.AccountID = 0
++		excluded[candidate.SubsiteID] = struct{}{}
++		fallbackFrom = candidate.SubsiteID
++	}
++	if lastErr == nil {
++		lastErr = errSubsiteForwardNoCandidate
++	}
++	writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_FAILED", lastErr.Error())
++	return true
++}
++
++func (f *SubsiteForwarder) selectSubsite(ctx context.Context, forwardCtx *subsiteForwardContext, excluded map[string]struct{}) (*service.Subsite, string, error) {
++	items, _, err := f.subsiteService.List(ctx, pagination.PaginationParams{Page: 1, PageSize: 1000}, service.ListSubsitesFilter{})
++	if err != nil {
++		return nil, "", err
++	}
++	breakers, err := f.subsiteService.ListActiveCircuitBreakers(ctx)
++	if err != nil {
++		log.Printf("[subsite-forwarder] list circuit breakers failed; routing without circuit filter: %v", err)
++	}
++	blockedSubsites, blockedAccounts, blockedLeases := activeCircuitMaps(breakers)
++	stats, _ := f.subsiteService.ForwardStats(ctx)
++	loadBySubsite := make(map[string]service.SubsiteForwardSiteStat)
++	if stats != nil {
++		for _, item := range stats.BySubsite {
++			loadBySubsite[item.SubsiteID] = item
++		}
++	}
++	now := time.Now()
++	active := make([]subsiteRouteCandidate, 0, len(items))
++	for _, item := range items {
++		if !isForwardableSubsite(item, now) {
++			continue
++		}
++		if _, skip := excluded[item.SubsiteID]; skip {
++			continue
++		}
++		if _, skip := blockedSubsites[item.SubsiteID]; skip {
++			continue
++		}
++		active = append(active, subsiteRouteCandidate{
++			subsite: item,
++			load:    loadBySubsite[item.SubsiteID],
++		})
++	}
++	if len(active) == 0 {
++		return nil, "", errSubsiteForwardNoCandidate
++	}
++	if persisted, err := f.subsiteService.GetForwardAffinity(ctx, forwardCtx.Key); err == nil && persisted != nil {
++		if persisted.AccountID > 0 {
++			if _, blocked := blockedAccounts[persisted.AccountID]; blocked {
++				persisted.AccountID = 0
++				persisted.LeaseID = ""
++			}
++		}
++		if strings.TrimSpace(persisted.LeaseID) != "" {
++			if _, blocked := blockedLeases[persisted.LeaseID]; blocked {
++				persisted.LeaseID = ""
++				persisted.AccountID = 0
++			}
++		}
++		for i := range active {
++			if active[i].subsite.SubsiteID == persisted.SubsiteID {
++				forwardCtx.AccountID = persisted.AccountID
++				forwardCtx.LeaseID = persisted.LeaseID
++				forwardCtx.Strict = persisted.Locked
++				return &active[i].subsite, "db_affinity", nil
++			}
++		}
++	}
++	if id, ok := f.affinity.Get(forwardCtx.Key); ok {
++		for i := range active {
++			if active[i].subsite.SubsiteID == id {
++				return &active[i].subsite, "memory_affinity", nil
++			}
++		}
++	}
++	sort.SliceStable(active, func(i, j int) bool {
++		if active[i].load.ActiveRequests != active[j].load.ActiveRequests {
++			return active[i].load.ActiveRequests < active[j].load.ActiveRequests
++		}
++		if active[i].load.QPS != active[j].load.QPS {
++			return active[i].load.QPS < active[j].load.QPS
++		}
++		if active[i].subsite.HealthScore != active[j].subsite.HealthScore {
++			return active[i].subsite.HealthScore > active[j].subsite.HealthScore
++		}
++		if active[i].subsite.LastHeartbeatAt == nil {
++			return false
++		}
++		if active[j].subsite.LastHeartbeatAt == nil {
++			return true
++		}
++		return active[i].subsite.LastHeartbeatAt.After(*active[j].subsite.LastHeartbeatAt)
++	})
++	bestScore := active[0].subsite.HealthScore
++	bestLoad := active[0].load.ActiveRequests
++	top := active[:0]
++	for _, item := range active {
++		if item.subsite.HealthScore == bestScore && item.load.ActiveRequests == bestLoad {
++			top = append(top, item)
++		}
++	}
++	selected := top[rand.Intn(len(top))]
++	return &selected.subsite, "least_load", nil
++}
++
++type subsiteProxyResult struct {
++	StatusCode    int
++	LatencyMS     int64
++	ResponseBytes int64
++}
++
++type subsiteHTTPStatusError struct {
++	statusCode int
++	body       string
++}
++
++func (e *subsiteHTTPStatusError) Error() string {
++	if e == nil {
++		return "subsite returned an error status"
++	}
++	if e.body != "" {
++		return fmt.Sprintf("subsite returned %d: %s", e.statusCode, e.body)
++	}
++	return fmt.Sprintf("subsite returned %d", e.statusCode)
++}
++
++func (f *SubsiteForwarder) proxy(c *gin.Context, subsite *service.Subsite, body []byte, reason string, forwardCtx *subsiteForwardContext) (subsiteProxyResult, error) {
++	targetURL, err := buildSubsiteForwardURL(subsite.PublicURL, c.Request.URL)
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, bytes.NewReader(body))
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	copyForwardHeaders(req.Header, c.Request.Header)
++	req.Header.Set(subsiteForwardHeader, "1")
++	req.Header.Set("X-Forwarded-Host", c.Request.Host)
++	req.Header.Set("X-Forwarded-Proto", forwardedProto(c))
++	req.Header.Set("X-Forwarded-For", c.ClientIP())
++	if forwardCtx.AccountID > 0 {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredAccountID, fmt.Sprint(forwardCtx.AccountID))
++	}
++	if forwardCtx.LeaseID != "" {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredLeaseID, forwardCtx.LeaseID)
++	}
++	if forwardCtx.Strict {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredStrict, "1")
++	}
++	if forwardCtx.AccountID > 0 || forwardCtx.LeaseID != "" {
++		timestamp := time.Now().UTC().Format(time.RFC3339)
++		nonce := requestShapeHash(c.Request.Method, c.Request.URL.RequestURI(), fmt.Sprintf("%s:%d", subsite.SubsiteID, time.Now().UnixNano()), forwardCtx.APIKeyID, forwardCtx.UserID, forwardCtx.GroupID)
++		signature, err := f.subsiteService.SignRouteHint(c.Request.Context(), subsite.SubsiteID, c.Request.Method, c.Request.URL.RequestURI(), timestamp, nonce, forwardCtx.LeaseID, forwardCtx.AccountID)
++		if err != nil {
++			return subsiteProxyResult{}, fmt.Errorf("sign subsite route hint: %w", err)
++		}
++		req.Header.Set(service.SubsiteRouteHeaderTimestamp, timestamp)
++		req.Header.Set(service.SubsiteRouteHeaderNonce, nonce)
++		req.Header.Set(service.SubsiteRouteHeaderSignature, signature)
++	}
++
++	started := time.Now()
++	resp, err := f.client.Do(req)
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	defer resp.Body.Close()
++
++	if leaseID := strings.TrimSpace(resp.Header.Get(subsiteForwardLeaseHeader)); leaseID != "" {
++		forwardCtx.LeaseID = leaseID
++	}
++	if accountID := parseForwardAccountID(resp.Header.Get(subsiteForwardAccountHeader)); accountID > 0 {
++		forwardCtx.AccountID = accountID
++	}
++	latencyMS := time.Since(started).Milliseconds()
++	if shouldFailoverSubsiteStatus(resp.StatusCode) {
++		payload, _ := io.ReadAll(http.MaxBytesReader(c.Writer, resp.Body, 1<<20))
++		return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: int64(len(payload))}, &subsiteHTTPStatusError{
++			statusCode: resp.StatusCode,
++			body:       strings.TrimSpace(string(payload)),
++		}
++	}
++	copyResponseHeaders(c.Writer.Header(), resp.Header)
++	c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
++	c.Header(subsiteForwardReasonHeader, reason)
++	if reason == "affinity" || reason == "memory_affinity" || reason == "db_affinity" {
++		c.Header(subsiteForwardAffinityHeader, "hit")
++	} else {
++		c.Header(subsiteForwardAffinityHeader, "miss")
++	}
++	c.Header("X-Sub2API-Forward-Latency-MS", fmt.Sprint(latencyMS))
++	c.Status(resp.StatusCode)
++	n, err := copySubsiteResponse(c, resp.Body, resp.Header.Get("Content-Type"))
++	return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n}, err
++}
++
++func (f *SubsiteForwarder) forwardContext(c *gin.Context, body []byte) *subsiteForwardContext {
++	apiKeyID := int64(0)
++	userID := int64(0)
++	groupID := int64(0)
++	if apiKey, ok := middleware.GetAPIKeyFromContext(c); ok && apiKey != nil {
++		apiKeyID = apiKey.ID
++		userID = apiKey.UserID
++		if apiKey.GroupID != nil {
++			groupID = *apiKey.GroupID
++		}
++	}
++	model := extractForwardModel(body)
++	session := extractForwardSession(body, c.Request.Header)
++	affinityType := "session"
++	if session == "" {
++		affinityType = "api_key"
++		session = stableModelAffinityScope(c.Request.Method, c.Request.URL.Path, model)
++	}
++	return &subsiteForwardContext{
++		Key:      fmt.Sprintf("%s:api:%d:user:%d:group:%d:model:%s:session:%s", affinityType, apiKeyID, userID, groupID, model, session),
++		Type:     affinityType,
++		Model:    model,
++		Session:  session,
++		APIKeyID: apiKeyID,
++		UserID:   userID,
++		GroupID:  groupID,
++	}
++}
++
++func (f *SubsiteForwarder) storeAffinity(ctx context.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, reason, lastError string) error {
++	if f == nil || f.subsiteService == nil || subsite == nil || forwardCtx.Key == "" {
++		return nil
++	}
++	f.affinity.Set(forwardCtx.Key, subsite.SubsiteID)
++	_, err := f.subsiteService.UpsertForwardAffinity(ctx, service.UpsertSubsiteForwardAffinityInput{
++		Key:        forwardCtx.Key,
++		Type:       forwardCtx.Type,
++		SubsiteID:  subsite.SubsiteID,
++		LeaseID:    forwardCtx.LeaseID,
++		AccountID:  forwardCtx.AccountID,
++		APIKeyID:   forwardCtx.APIKeyID,
++		UserID:     forwardCtx.UserID,
++		GroupID:    forwardCtx.GroupID,
++		Model:      forwardCtx.Model,
++		SessionID:  forwardCtx.Session,
++		Source:     "auto",
++		LastReason: reason,
++		LastError:  lastError,
++		ExpiresAt:  time.Now().Add(subsiteForwardAffinityTTL),
++	})
++	return err
++}
++
++func (f *SubsiteForwarder) recordForwardEvent(c *gin.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, fallbackFrom, reason, outcome string, statusCode int, latencyMS int64, requestBytes int, responseBytes int64, eventErr error) error {
++	if f == nil || f.subsiteService == nil || c == nil {
++		return nil
++	}
++	if forwardCtx == nil {
++		forwardCtx = &subsiteForwardContext{}
++	}
++	subsiteID := ""
++	if subsite != nil {
++		subsiteID = subsite.SubsiteID
++	}
++	errText := ""
++	if eventErr != nil {
++		errText = eventErr.Error()
++	}
++	return f.subsiteService.RecordForwardEvent(c.Request.Context(), &service.SubsiteForwardEvent{
++		RequestID:          c.GetHeader("X-Request-Id"),
++		AffinityKey:        forwardCtx.Key,
++		SubsiteID:          subsiteID,
++		AttemptedSubsiteID: subsiteID,
++		FallbackFrom:       fallbackFrom,
++		LeaseID:            forwardCtx.LeaseID,
++		AccountID:          forwardCtx.AccountID,
++		APIKeyID:           forwardCtx.APIKeyID,
++		UserID:             forwardCtx.UserID,
++		GroupID:            forwardCtx.GroupID,
++		Model:              forwardCtx.Model,
++		SessionID:          forwardCtx.Session,
++		Method:             c.Request.Method,
++		Path:               c.Request.URL.Path,
++		StatusCode:         statusCode,
++		LatencyMS:          latencyMS,
++		RequestBytes:       int64(requestBytes),
++		ResponseBytes:      responseBytes,
++		Reason:             reason,
++		Outcome:            outcome,
++		Error:              errText,
++		Metadata: map[string]any{
++			"query": c.Request.URL.RawQuery,
++		},
++	})
++}
++
++func isForwardableSubsite(subsite service.Subsite, now time.Time) bool {
++	if subsite.Status != service.SubsiteStatusActive {
++		return false
++	}
++	if strings.TrimSpace(subsite.PublicURL) == "" {
++		return false
++	}
++	if subsite.LastHeartbeatAt == nil {
++		return false
++	}
++	return now.Sub(*subsite.LastHeartbeatAt) <= subsiteForwardHealthyWindow
++}
++
++func activeCircuitMaps(breakers []service.SubsiteCircuitBreaker) (map[string]struct{}, map[int64]struct{}, map[string]struct{}) {
++	blockedSubsites := make(map[string]struct{})
++	blockedAccounts := make(map[int64]struct{})
++	blockedLeases := make(map[string]struct{})
++	for _, breaker := range breakers {
++		switch breaker.Scope {
++		case "subsite":
++			targetID := strings.TrimSpace(breaker.SubsiteID)
++			if targetID == "" {
++				targetID = strings.TrimSpace(breaker.TargetID)
++			}
++			if targetID != "" {
++				blockedSubsites[targetID] = struct{}{}
++			}
++		case "account":
++			if breaker.AccountID > 0 {
++				blockedAccounts[breaker.AccountID] = struct{}{}
++				continue
++			}
++			if id := parseForwardAccountID(breaker.TargetID); id > 0 {
++				blockedAccounts[id] = struct{}{}
++			}
++		case "lease":
++			targetID := strings.TrimSpace(breaker.LeaseID)
++			if targetID == "" {
++				targetID = strings.TrimSpace(breaker.TargetID)
++			}
++			if targetID != "" {
++				blockedLeases[targetID] = struct{}{}
++			}
++		}
++	}
++	return blockedSubsites, blockedAccounts, blockedLeases
++}
++
++func forwardOutcomeForStatus(statusCode int, fallbackFrom string) string {
++	if shouldFailoverSubsiteStatus(statusCode) {
++		return "failed"
++	}
++	if fallbackFrom != "" {
++		return "fallback"
++	}
++	return "success"
++}
++
++func shouldFailoverSubsiteStatus(statusCode int) bool {
++	return statusCode == http.StatusUnauthorized ||
++		statusCode == http.StatusForbidden ||
++		statusCode == http.StatusTooManyRequests ||
++		statusCode >= http.StatusInternalServerError
++}
++
++func readForwardBody(c *gin.Context) ([]byte, error) {
++	if c.Request.Body == nil {
++		return nil, nil
++	}
++	reader := http.MaxBytesReader(c.Writer, c.Request.Body, subsiteForwardMaxBodyBytes)
++	body, err := io.ReadAll(reader)
++	if err != nil {
++		return nil, err
++	}
++	return body, nil
++}
++
++func buildSubsiteForwardURL(base string, original *url.URL) (string, error) {
++	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(base), "/"))
++	if err != nil {
++		return "", err
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return "", fmt.Errorf("invalid subsite public url: %s", base)
++	}
++	parsed.Path = strings.TrimRight(parsed.Path, "/") + original.EscapedPath()
++	parsed.RawQuery = original.RawQuery
++	return parsed.String(), nil
++}
++
++func copyForwardHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipForwardHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copyResponseHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipResponseHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copySubsiteResponse(c *gin.Context, reader io.Reader, contentType string) (int64, error) {
++	if isForwardStreamingContent(contentType) {
++		header := c.Writer.Header()
++		header.Set("Cache-Control", "no-cache")
++		header.Set("X-Accel-Buffering", "no")
++		header.Del("Content-Length")
++		c.Writer.WriteHeaderNow()
++		c.Writer.Flush()
++		return copyWithFlush(c.Writer, reader)
++	}
++	return io.Copy(c.Writer, reader)
++}
++
++func copyWithFlush(writer gin.ResponseWriter, reader io.Reader) (int64, error) {
++	buf := make([]byte, 32*1024)
++	var written int64
++	for {
++		n, readErr := reader.Read(buf)
++		if n > 0 {
++			m, writeErr := writer.Write(buf[:n])
++			written += int64(m)
++			if writeErr != nil {
++				return written, writeErr
++			}
++			if m != n {
++				return written, io.ErrShortWrite
++			}
++			writer.Flush()
++		}
++		if readErr != nil {
++			if readErr == io.EOF {
++				return written, nil
++			}
++			return written, readErr
++		}
++	}
++}
++
++func isForwardStreamingContent(contentType string) bool {
++	return strings.Contains(strings.ToLower(contentType), "text/event-stream")
++}
++
++func shouldSkipForwardHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
++		"x-sub2api-preferred-account-id", "x-sub2api-preferred-lease-id", "x-sub2api-preferred-strict", "x-sub2api-route-signature", "x-sub2api-route-timestamp", "x-sub2api-route-nonce":
++		return true
++	default:
++		return false
++	}
++}
++
++func shouldSkipResponseHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length",
++		"x-sub2api-account-id", "x-sub2api-lease-id":
++		return true
++	default:
++		return false
++	}
++}
++
++func parseForwardAccountID(value string) int64 {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return 0
++	}
++	var id int64
++	if _, err := fmt.Sscan(value, &id); err != nil || id <= 0 {
++		return 0
++	}
++	return id
++}
++
++func forwardedProto(c *gin.Context) string {
++	if value := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); value != "" {
++		return value
++	}
++	if c.Request.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++func extractForwardModel(body []byte) string {
++	var payload map[string]any
++	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
++		return ""
++	}
++	if model, ok := payload["model"].(string); ok {
++		return strings.TrimSpace(model)
++	}
++	return ""
++}
++
++func extractForwardSession(body []byte, header http.Header) string {
++	keys := []string{
++		"previous_response_id",
++		"conversation_id",
++		"session_id",
++		"thread_id",
++		"response_id",
++		"parent_response_id",
++		"metadata.conversation_id",
++		"metadata.session_id",
++		"metadata.thread_id",
++	}
++	var payload map[string]any
++	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
++		for _, key := range keys {
++			if value := stringFromNestedMap(payload, strings.Split(key, ".")); value != "" {
++				return key + ":" + value
++			}
++		}
++	}
++	for _, key := range []string{
++		"session_id",
++		"conversation_id",
++		"thread_id",
++		"OpenAI-Session-ID",
++		"OpenAI-Conversation-ID",
++		"x-session-id",
++		"x-conversation-id",
++		"x-thread-id",
++	} {
++		if value := strings.TrimSpace(header.Get(key)); value != "" {
++			return key + ":" + value
++		}
++	}
++	return ""
++}
++
++func stringFromNestedMap(root map[string]any, path []string) string {
++	if len(path) == 0 {
++		return ""
++	}
++	var current any = root
++	for _, part := range path {
++		obj, ok := current.(map[string]any)
++		if !ok {
++			return ""
++		}
++		current = obj[part]
++	}
++	value, ok := current.(string)
++	if !ok {
++		return ""
++	}
++	return strings.TrimSpace(value)
++}
++
++func requestShapeHash(method, path, model string, apiKeyID, userID, groupID int64) string {
++	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d", method, path, model, apiKeyID, userID, groupID)))
++	return hex.EncodeToString(sum[:12])
++}
++
++func stableModelAffinityScope(method, path, model string) string {
++	normalizedPath := strings.TrimRight(strings.TrimSpace(path), "/")
++	if normalizedPath == "" {
++		normalizedPath = "/"
++	}
++	if model == "" {
++		model = "models"
++	}
++	return fmt.Sprintf("%s:%s:%s", strings.ToUpper(strings.TrimSpace(method)), normalizedPath, model)
++}
++
++func writeSubsiteForwardError(c *gin.Context, status int, code, message string) {
++	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
++}
++
++type subsiteAffinityStore struct {
++	mu      sync.RWMutex
++	ttl     time.Duration
++	entries map[string]subsiteAffinityEntry
++}
++
++type subsiteAffinityEntry struct {
++	subsiteID string
++	expiresAt time.Time
++}
++
++func newSubsiteAffinityStore(ttl time.Duration) *subsiteAffinityStore {
++	return &subsiteAffinityStore{ttl: ttl, entries: make(map[string]subsiteAffinityEntry)}
++}
++
++func (s *subsiteAffinityStore) Get(key string) (string, bool) {
++	s.mu.RLock()
++	entry, ok := s.entries[key]
++	s.mu.RUnlock()
++	if !ok || time.Now().After(entry.expiresAt) {
++		if ok {
++			s.mu.Lock()
++			delete(s.entries, key)
++			s.mu.Unlock()
++		}
++		return "", false
++	}
++	return entry.subsiteID, true
++}
++
++func (s *subsiteAffinityStore) Set(key, subsiteID string) {
++	if key == "" || subsiteID == "" {
++		return
++	}
++	s.mu.Lock()
++	s.entries[key] = subsiteAffinityEntry{subsiteID: subsiteID, expiresAt: time.Now().Add(s.ttl)}
++	s.mu.Unlock()
++}
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
-index 1738de6..068d85f 100644
+index 1738de6e37c38bb13c35653d649131efea233a7f..068d85f8653c303eff725479ed6adf6696080dae 100644
 --- a/backend/internal/handler/wire.go
 +++ b/backend/internal/handler/wire.go
 @@ -108,6 +108,7 @@ func ProvideHandlers(
@@ -262,7 +1039,7 @@ index 1738de6..068d85f 100644
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..75c07c7 100644
+index 782fff070e6f8a01ad9f9244ab8550e883b671e0..75c07c71dbb94841872435be876051cc3311c844 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -924,7 +1701,7 @@ index 782fff0..75c07c7 100644
  	if len(raw) == 0 {
  		return []string{}
 diff --git a/backend/internal/server/middleware/master_data_plane_guard.go b/backend/internal/server/middleware/master_data_plane_guard.go
-index 8725039..afef002 100644
+index 87250397d22b4f2e09556bfad972998446463bb8..afef002ce123ad7fcafddb2994171fa7a9be05c9 100644
 --- a/backend/internal/server/middleware/master_data_plane_guard.go
 +++ b/backend/internal/server/middleware/master_data_plane_guard.go
 @@ -2,6 +2,7 @@ package middleware
@@ -962,7 +1739,7 @@ index 8725039..afef002 100644
 +		strings.HasPrefix(normalized, "/v1beta/models/")
 +}
 diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
-index 0b4a98b..a2edc16 100644
+index 0b4a98be1d47935610eff657f381760d15e4c192..a2edc16b216c50bd5d036e555aae9d4c548f9465 100644
 --- a/backend/internal/server/routes/admin.go
 +++ b/backend/internal/server/routes/admin.go
 @@ -184,6 +184,12 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
@@ -979,7 +1756,7 @@ index 0b4a98b..a2edc16 100644
  		subsites.POST("", h.Admin.Subsite.Create)
  		subsites.PATCH("/:id", h.Admin.Subsite.Update)
 diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
-index 2302ae5..d3b4100 100644
+index 2302ae5b52af3737e534cfbd22953ec128e8f5f2..d3b410038c62e3536561679f84db2fec96386f1e 100644
 --- a/backend/internal/server/routes/gateway.go
 +++ b/backend/internal/server/routes/gateway.go
 @@ -2,6 +2,8 @@ package routes
@@ -1246,7 +2023,7 @@ index 2302ae5..d3b4100 100644
  func getGroupPlatform(c *gin.Context) string {
  	apiKey, ok := middleware.GetAPIKeyFromContext(c)
 diff --git a/backend/internal/service/domain_constants.go b/backend/internal/service/domain_constants.go
-index 0981342..9af4c8d 100644
+index 0981342cfd9d9eea27e5b3e5c9a3020fe59233d7..9af4c8d946cca179700c1972a17b552a242d8a99 100644
 --- a/backend/internal/service/domain_constants.go
 +++ b/backend/internal/service/domain_constants.go
 @@ -378,6 +378,9 @@ const (
@@ -1260,7 +2037,7 @@ index 0981342..9af4c8d 100644
  	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
  	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
 diff --git a/backend/internal/service/setting_service.go b/backend/internal/service/setting_service.go
-index 2a56a15..64e8ac9 100644
+index 2a56a15160b1177ef8ae44dd19f72971ccf9ff50..64e8ac9d3396f140866c0f2ba3f376410d29a0ba 100644
 --- a/backend/internal/service/setting_service.go
 +++ b/backend/internal/service/setting_service.go
 @@ -93,6 +93,18 @@ const masterDataPlaneCacheTTL = 60 * time.Second
@@ -1402,7 +2179,7 @@ index 2a56a15..64e8ac9 100644
  	result.TableDefaultPageSize, result.TablePageSizeOptions = parseTablePreferences(
  		settings[SettingKeyTableDefaultPageSize],
 diff --git a/backend/internal/service/settings_view.go b/backend/internal/service/settings_view.go
-index 46f5e7c..5f4c607 100644
+index 46f5e7c98bded4b66ab416af4fbe27f76c616eca..5f4c60760e2fd61af240652da271225f1fe69c21 100644
 --- a/backend/internal/service/settings_view.go
 +++ b/backend/internal/service/settings_view.go
 @@ -189,6 +189,9 @@ type SystemSettings struct {
@@ -1416,7 +2193,7 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..e75f81d 100644
+index 8cfa424c8f474c48b7f4a53751d3d5d6b14f41f3..e75f81d57659b6839772bbf1291d194ecd236c4c 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -48,7 +48,14 @@ const (
@@ -1972,7 +2749,7 @@ index 8cfa424..e75f81d 100644
  	if in == nil {
  		return map[string]any{}
 diff --git a/backend/internal/service/subsite_usage_ingest_test.go b/backend/internal/service/subsite_usage_ingest_test.go
-index 3774d55..4c1ba7c 100644
+index 3774d5517dc658df6ec75919ed239ca5474f935b..4c1ba7cf0d703fdb811e12b36371f4e2e4fd1828 100644
 --- a/backend/internal/service/subsite_usage_ingest_test.go
 +++ b/backend/internal/service/subsite_usage_ingest_test.go
 @@ -1139,6 +1139,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
@@ -2124,10 +2901,21 @@ index 3774d55..4c1ba7c 100644
  	now := time.Now()
  	apiKeyGroupID := int64(7)
 diff --git a/backend/internal/subsite/agent/proxy.go b/backend/internal/subsite/agent/proxy.go
-index aba49da..0f4f230 100644
+index aba49dab1780036e5d437460b27cdac4341c0c38..259325348d88287a64824f2c7443dbb4654db7b4 100644
 --- a/backend/internal/subsite/agent/proxy.go
 +++ b/backend/internal/subsite/agent/proxy.go
-@@ -150,6 +150,22 @@ func (s *Server) proxyOpenAIChatCompletionsViaResponses(c *gin.Context, authoriz
+@@ -87,6 +87,10 @@ func (s *Server) proxyAuthorizedRequest(c *gin.Context, authorization *service.A
+ 	}
+ 	usage := buildUsageIngestItem(c, authorization, body, responseBody, upstreamEndpoint, time.Since(start), metrics)
+ 	if err := s.queue.Enqueue(c.Request.Context(), usage); err != nil {
++		if wroteResponse && c.Writer.Written() {
++			fmt.Printf("subsite usage enqueue failed after stream response: %v\n", err)
++			return &proxyResult{UpstreamEndpoint: upstreamEndpoint}, nil
++		}
+ 		return nil, fmt.Errorf("enqueue usage before response: %w", err)
+ 	}
+ 	if !wroteResponse {
+@@ -150,6 +154,22 @@ func (s *Server) proxyOpenAIChatCompletionsViaResponses(c *gin.Context, authoriz
  	}
  	defer resp.Body.Close()
  
@@ -2150,7 +2938,7 @@ index aba49da..0f4f230 100644
  	responseBody, wroteResponse, metrics, err := streamOrBufferResponse(c, resp)
  	if err != nil {
  		return nil, err
-@@ -493,6 +509,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool,
+@@ -493,6 +513,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool,
  	}
  	c.Status(resp.StatusCode)
  	metrics := &responseCaptureMetrics{}
@@ -2164,7 +2952,7 @@ index aba49da..0f4f230 100644
  	body, err := readUpstreamBodyWithMetrics(resp.Body, contentType, metrics)
  	if err != nil {
  		return nil, false, nil, fmt.Errorf("read upstream response: %w", err)
-@@ -511,6 +534,133 @@ func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
+@@ -511,6 +538,133 @@ func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
  	c.Data(resp.StatusCode, contentType, body)
  }
  
@@ -2299,7 +3087,7 @@ index aba49da..0f4f230 100644
  	for key, values := range src {
  		lower := strings.ToLower(strings.TrimSpace(key))
 diff --git a/backend/internal/subsite/agent/proxy_test.go b/backend/internal/subsite/agent/proxy_test.go
-index de044c5..9589c05 100644
+index de044c58619e254c4ac94108903956f97e10debf..9589c05cddda1e638ac7bbd76f5948f79eec857f 100644
 --- a/backend/internal/subsite/agent/proxy_test.go
 +++ b/backend/internal/subsite/agent/proxy_test.go
 @@ -1,6 +1,7 @@
@@ -2420,7 +3208,7 @@ index de044c5..9589c05 100644
  	gin.SetMode(gin.TestMode)
  
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
-index fe0842b..f3b29ff 100644
+index fe0842bf522351c0d86966f7257b936ae7f6d0cc..f3b29ff9f8ba4feb0ead279fe886952fb738209d 100644
 --- a/backend/internal/subsite/agent/server.go
 +++ b/backend/internal/subsite/agent/server.go
 @@ -4,16 +4,18 @@ import (
@@ -2641,8 +3429,137 @@ index fe0842b..f3b29ff 100644
  }
  
  func hasUsagePayload(item service.UsageIngestItem) bool {
+diff --git a/backend/migrations/160_subsite_forwarding_observability.sql b/backend/migrations/160_subsite_forwarding_observability.sql
+new file mode 100644
+index 0000000000000000000000000000000000000000..a39e2739437fbccdc13e96611a232fbec9c41de2
+--- /dev/null
++++ b/backend/migrations/160_subsite_forwarding_observability.sql
+@@ -0,0 +1,123 @@
++-- Subsite forwarding observability and sticky routing tables.
++CREATE TABLE IF NOT EXISTS subsite_forward_affinities (
++    id                   BIGSERIAL PRIMARY KEY,
++    affinity_key         VARCHAR(256) NOT NULL UNIQUE,
++    affinity_type        VARCHAR(32) NOT NULL DEFAULT 'session',
++    subsite_id           VARCHAR(64) NOT NULL REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    lease_id             VARCHAR(80),
++    account_id           BIGINT,
++    api_key_id           BIGINT,
++    user_id              BIGINT,
++    group_id             BIGINT,
++    model                VARCHAR(160) NOT NULL DEFAULT '',
++    session_id           VARCHAR(256) NOT NULL DEFAULT '',
++    source               VARCHAR(32) NOT NULL DEFAULT 'auto',
++    locked               BOOLEAN NOT NULL DEFAULT FALSE,
++    hits                 BIGINT NOT NULL DEFAULT 0,
++    last_reason          VARCHAR(64) NOT NULL DEFAULT '',
++    last_error           TEXT NOT NULL DEFAULT '',
++    expires_at           TIMESTAMPTZ NOT NULL,
++    last_used_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    deleted_at           TIMESTAMPTZ,
++    CONSTRAINT subsite_forward_affinities_type_check CHECK (affinity_type IN ('session', 'api_key', 'account', 'manual')),
++    CONSTRAINT subsite_forward_affinities_source_check CHECK (source IN ('auto', 'manual', 'fallback', 'imported'))
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_subsite
++    ON subsite_forward_affinities (subsite_id, last_used_at DESC)
++    WHERE deleted_at IS NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_api_key
++    ON subsite_forward_affinities (api_key_id, last_used_at DESC)
++    WHERE deleted_at IS NULL AND api_key_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_account
++    ON subsite_forward_affinities (account_id, last_used_at DESC)
++    WHERE deleted_at IS NULL AND account_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_expires
++    ON subsite_forward_affinities (expires_at)
++    WHERE deleted_at IS NULL AND locked = FALSE;
++
++CREATE TABLE IF NOT EXISTS subsite_forward_events (
++    id                   BIGSERIAL PRIMARY KEY,
++    request_id           VARCHAR(128) NOT NULL DEFAULT '',
++    affinity_key         VARCHAR(256) NOT NULL DEFAULT '',
++    subsite_id           VARCHAR(64) REFERENCES subsites(subsite_id) ON DELETE SET NULL,
++    attempted_subsite_id VARCHAR(64) NOT NULL DEFAULT '',
++    fallback_from        VARCHAR(64) NOT NULL DEFAULT '',
++    lease_id             VARCHAR(80),
++    account_id           BIGINT,
++    api_key_id           BIGINT,
++    user_id              BIGINT,
++    group_id             BIGINT,
++    model                VARCHAR(160) NOT NULL DEFAULT '',
++    session_id           VARCHAR(256) NOT NULL DEFAULT '',
++    method               VARCHAR(16) NOT NULL DEFAULT '',
++    path                 TEXT NOT NULL DEFAULT '',
++    status_code          INT NOT NULL DEFAULT 0,
++    latency_ms           BIGINT NOT NULL DEFAULT 0,
++    request_bytes        BIGINT NOT NULL DEFAULT 0,
++    response_bytes       BIGINT NOT NULL DEFAULT 0,
++    reason               VARCHAR(64) NOT NULL DEFAULT '',
++    outcome              VARCHAR(32) NOT NULL DEFAULT '',
++    error                TEXT NOT NULL DEFAULT '',
++    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    CONSTRAINT subsite_forward_events_outcome_check CHECK (outcome IN ('success', 'failed', 'no_candidate', 'fallback'))
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_created
++    ON subsite_forward_events (created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_subsite_created
++    ON subsite_forward_events (subsite_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_affinity_created
++    ON subsite_forward_events (affinity_key, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS subsite_health_samples (
++    id                   BIGSERIAL PRIMARY KEY,
++    subsite_id           VARCHAR(64) NOT NULL REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    status               VARCHAR(32) NOT NULL DEFAULT '',
++    health_score         INT NOT NULL DEFAULT 0,
++    active_requests      INT NOT NULL DEFAULT 0,
++    queued_usage         INT NOT NULL DEFAULT 0,
++    qps                  DOUBLE PRECISION NOT NULL DEFAULT 0,
++    cpu_percent          DOUBLE PRECISION NOT NULL DEFAULT 0,
++    memory_bytes         BIGINT NOT NULL DEFAULT 0,
++    latency_ms           BIGINT NOT NULL DEFAULT 0,
++    error_rate           DOUBLE PRECISION NOT NULL DEFAULT 0,
++    version              VARCHAR(64) NOT NULL DEFAULT '',
++    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_health_samples_subsite_created
++    ON subsite_health_samples (subsite_id, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS subsite_circuit_breakers (
++    id                   BIGSERIAL PRIMARY KEY,
++    scope                VARCHAR(32) NOT NULL,
++    target_id            VARCHAR(128) NOT NULL,
++    subsite_id           VARCHAR(64) REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    account_id           BIGINT,
++    lease_id             VARCHAR(80),
++    reason               TEXT NOT NULL DEFAULT '',
++    failures             INT NOT NULL DEFAULT 0,
++    cooldown_until       TIMESTAMPTZ NOT NULL,
++    last_error           TEXT NOT NULL DEFAULT '',
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    deleted_at           TIMESTAMPTZ,
++    CONSTRAINT subsite_circuit_breakers_scope_check CHECK (scope IN ('subsite', 'account', 'lease')),
++    CONSTRAINT subsite_circuit_breakers_target_unique UNIQUE (scope, target_id)
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_circuit_breakers_active
++    ON subsite_circuit_breakers (cooldown_until DESC)
++    WHERE deleted_at IS NULL;
++
++-- Existing installs may not re-run Go default setting initialization, so make
++-- the new router mode explicit during migration. "forward" preserves model
++-- discovery on the master while routing model traffic to healthy subsites.
++INSERT INTO settings (key, value, updated_at)
++VALUES ('subsite_forward_mode', 'forward', NOW())
++ON CONFLICT (key) DO NOTHING;
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
-index 7ff95d3..bd6ed44 100644
+index 7ff95d3f84ae760161dadf81d41c903733164767..bd6ed44ae16cf0505c4cfc187403548c2c9d7a9d 100644
 --- a/frontend/src/api/admin/index.ts
 +++ b/frontend/src/api/admin/index.ts
 @@ -115,4 +115,4 @@ export type { BackupAgentHealth, DataManagementConfig } from './dataManagement'
@@ -2652,7 +3569,7 @@ index 7ff95d3..bd6ed44 100644
 -export type { Subsite, AccountLease, ResetSubsiteSecretResult } from './subsites'
 +export type { Subsite, AccountLease, ResetSubsiteSecretResult, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..35271e0 100644
+index 1faa4ebee2491cd8d4ec5c5d3af2fe9ca70bfe16..35271e059bba705819105980ac949c906afc771a 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
 @@ -43,6 +43,125 @@ export interface AccountLease {
@@ -2851,7 +3768,7 @@ index 1faa4eb..35271e0 100644
 +  listForwardEvents
  }
 diff --git a/frontend/src/components/layout/AppSidebar.vue b/frontend/src/components/layout/AppSidebar.vue
-index d6c7269..279e44f 100644
+index d6c72696b430a350d81b9420c352887b1557a533..279e44ff3c9ed9b0b0432bd51a26811bf0cfcece 100644
 --- a/frontend/src/components/layout/AppSidebar.vue
 +++ b/frontend/src/components/layout/AppSidebar.vue
 @@ -740,7 +740,7 @@ const adminNavItems = computed((): NavItem[] => {
@@ -2864,7 +3781,7 @@ index d6c7269..279e44f 100644
      { path: '/admin/proxies', label: t('nav.proxies'), icon: ServerIcon },
      { path: '/admin/risk-control', label: t('nav.riskControl'), icon: ShieldIcon, hideInSimpleMode: true, featureFlag: flagRiskControl },
 diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
-index 55c44e1..291d6b0 100644
+index 55c44e1536a2c5df9cf11bbcaae7da1cbc63c489..291d6b0eb550e3c67080e8b83cc0efe4652d9dea 100644
 --- a/frontend/src/i18n/locales/en.ts
 +++ b/frontend/src/i18n/locales/en.ts
 @@ -355,6 +355,7 @@ export default {
@@ -3042,7 +3959,7 @@ index 55c44e1..291d6b0 100644
      dashboard: {
        title: 'Admin Dashboard',
 diff --git a/frontend/src/i18n/locales/zh.ts b/frontend/src/i18n/locales/zh.ts
-index 4a23db1..73fd3f0 100644
+index 4a23db12b4893fded9f2730d79ba77dee6ec323b..73fd3f0f1e5f5736922475548542e7d23ca61cb0 100644
 --- a/frontend/src/i18n/locales/zh.ts
 +++ b/frontend/src/i18n/locales/zh.ts
 @@ -355,6 +355,7 @@ export default {
@@ -3220,7 +4137,7 @@ index 4a23db1..73fd3f0 100644
      dashboard: {
        title: '管理控制台',
 diff --git a/frontend/src/router/index.ts b/frontend/src/router/index.ts
-index f59b1e7..b9e73c6 100644
+index f59b1e7e4b62b2d49eab314fcdd2a5c7305ee66b..b9e73c6bf129b326f089a6e1cea6723899dde3ad 100644
 --- a/frontend/src/router/index.ts
 +++ b/frontend/src/router/index.ts
 @@ -496,7 +496,9 @@ const routes: RouteRecordRaw[] = [
@@ -3235,7 +4152,7 @@ index f59b1e7..b9e73c6 100644
    },
    {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..43351ae 100644
+index cb5d3f87f55ebce57e842ba0c19c7878b3a59ac5..43351ae6cb67f556889c987460b0704b06dd99f1 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
 @@ -1,19 +1,219 @@
