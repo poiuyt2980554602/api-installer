@@ -6,11 +6,11 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.15"
+        default: "1.0.20"
       pixel_source_version:
         description: Upstream Pixel source tag
         required: true
-        default: "1.0.12"
+        default: "1.0.20"
   push:
     tags:
       - "v*-pixel"
@@ -23,8 +23,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.15' }}
-      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.12' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.20' }}
+      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.20' }}
     steps:
       - name: Download installer repo
         run: |
@@ -39,7 +39,7 @@ jobs:
           version="${version%-forwarder-pixel}"
           version="${version%-pixel}"
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
-          echo "PIXEL_SOURCE_VERSION=1.0.12" >> "$GITHUB_ENV"
+          echo "PIXEL_SOURCE_VERSION=${version}" >> "$GITHUB_ENV"
 
       - name: Download Pixel source
         run: |
@@ -50,8 +50,13 @@ jobs:
       - name: Apply Pixel compatibility patches
         run: |
           set -euo pipefail
-          if [ "${PIXEL_SOURCE_VERSION}" = "1.0.12" ]; then
-            git apply --directory=pixel-src patches/pixel-1.0.12-subsite-forwarder.patch
+          patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
+          if [ -f "$patch_file" ]; then
+            git apply --directory=pixel-src "$patch_file"
+          else
+            echo "::error::Missing compatibility patch: ${patch_file}"
+            echo "Refusing to build an unpatched forwarder release."
+            exit 1
           fi
 
       - name: Setup Node.js
