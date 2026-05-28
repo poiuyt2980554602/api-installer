@@ -3065,7 +3065,7 @@ index 9cf0c56..7ea0b8c 100644
  	now := time.Now()
  	apiKeyGroupID := int64(7)
 diff --git a/backend/internal/subsite/agent/proxy.go b/backend/internal/subsite/agent/proxy.go
-index aba49da..e2f4786 100644
+index aba49da..00244e9 100644
 --- a/backend/internal/subsite/agent/proxy.go
 +++ b/backend/internal/subsite/agent/proxy.go
 @@ -87,6 +87,10 @@ func (s *Server) proxyAuthorizedRequest(c *gin.Context, authorization *service.A
@@ -3250,7 +3250,17 @@ index aba49da..e2f4786 100644
  func copyResponseHeaders(dst, src http.Header) {
  	for key, values := range src {
  		lower := strings.ToLower(strings.TrimSpace(key))
-@@ -1218,34 +1372,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
+@@ -1113,7 +1267,8 @@ func shouldProxyOpenAIChatCompletionsThroughResponses(inboundPath string, author
+ 		return false
+ 	}
+ 	return strings.Contains(inboundPath, "/chat/completions") &&
+-		strings.EqualFold(strings.TrimSpace(authorization.Platform), service.PlatformOpenAI)
++		strings.EqualFold(strings.TrimSpace(authorization.Platform), service.PlatformOpenAI) &&
++		strings.EqualFold(strings.TrimSpace(authorization.Credential.AccountType), service.AccountTypeOAuth)
+ }
+ 
+ func normalizeSubsiteOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, error) {
+@@ -1218,34 +1373,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
  }
  
  func convertResponsesSSEToChatCompletionsSSE(body []byte, originalModel string) ([]byte, error) {
@@ -3309,7 +3319,7 @@ index aba49da..e2f4786 100644
  		sse, err := apicompat.ChatChunkToSSE(chunk)
  		if err != nil {
 diff --git a/backend/internal/subsite/agent/proxy_test.go b/backend/internal/subsite/agent/proxy_test.go
-index de044c5..d472a87 100644
+index de044c5..c654f5e 100644
 --- a/backend/internal/subsite/agent/proxy_test.go
 +++ b/backend/internal/subsite/agent/proxy_test.go
 @@ -1,6 +1,7 @@
@@ -3320,11 +3330,67 @@ index de044c5..d472a87 100644
  	"context"
  	"crypto/sha256"
  	"crypto/tls"
-@@ -553,6 +554,122 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
+@@ -383,7 +384,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthResponsesUsesCodexUpstream(t *testing.T) {
+ 	require.Equal(t, "hello", gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "input.0.content").String())
+ }
+ 
+-func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
++func TestSubsiteAgentProxy_OpenAIAPIKeyChatCompletionsUsesChatCompletionsUpstream(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 
+ 	const secret = "subsite-secret"
+@@ -396,7 +397,7 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+ 		upstreamPath = r.URL.Path
+ 		require.NoError(t, json.NewDecoder(r.Body).Decode(&upstreamBody))
+ 		w.Header().Set("Content-Type", "application/json")
+-		_, _ = w.Write([]byte(`{"id":"resp_1","model":"gpt-5.4","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"hello back"}]}],"usage":{"input_tokens":8,"output_tokens":5}}`))
++		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"hello back"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":5,"total_tokens":13}}`))
+ 	}))
+ 	defer upstream.Close()
+ 
+@@ -454,9 +455,9 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+ 	server.engine.ServeHTTP(rec, req)
+ 
+ 	require.Equal(t, http.StatusOK, rec.Code)
+-	require.Equal(t, "/v1/responses", upstreamPath)
++	require.Equal(t, "/v1/chat/completions", upstreamPath)
+ 	require.Equal(t, "gpt-5.4", gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "model").String())
+-	require.True(t, gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "input").Exists())
++	require.True(t, gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "messages").Exists())
+ 	require.Contains(t, rec.Body.String(), `"chat.completion"`)
+ 	require.Contains(t, rec.Body.String(), `"hello back"`)
+ 
+@@ -467,20 +468,22 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+ 	require.Equal(t, requestFingerprint(http.MethodPost, "/v1/chat/completions", []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)), items[0].Payload.RequestFingerprint)
+ }
+ 
+-func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndReasoning(t *testing.T) {
++func TestSubsiteAgentProxy_OpenAIAPIKeyChatCompletionsStreamCapturesLatencyAndReasoning(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 
+ 	const secret = "subsite-secret"
+ 	groupID := int64(18)
+ 
+ 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, "/v1/chat/completions", r.URL.Path)
+ 		w.Header().Set("Content-Type", "text/event-stream")
+ 		flusher, ok := w.(http.Flusher)
+ 		require.True(t, ok)
+-		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
++		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"))
+ 		flusher.Flush()
+ 		time.Sleep(30 * time.Millisecond)
+-		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello back\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n"))
++		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\" back\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n"))
++		_, _ = w.Write([]byte("data: [DONE]\n\n"))
+ 		flusher.Flush()
+ 	}))
+ 	defer upstream.Close()
+@@ -553,6 +556,124 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
  	require.LessOrEqual(t, *item.FirstTokenMs, *item.DurationMs)
  }
  
-+func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesStreamsBeforeUpstreamCompletes(t *testing.T) {
++func TestSubsiteAgentProxy_OpenAIAPIKeyChatCompletionsStreamsBeforeUpstreamCompletes(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
 +
 +	const secret = "subsite-secret"
@@ -3332,14 +3398,16 @@ index de044c5..d472a87 100644
 +	allowComplete := make(chan struct{})
 +
 +	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		require.Equal(t, "/v1/chat/completions", r.URL.Path)
 +		w.Header().Set("Content-Type", "text/event-stream")
 +		flusher, ok := w.(http.Flusher)
 +		require.True(t, ok)
-+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
++		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.4\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"hello\"},\"finish_reason\":null}]}\n\n"))
 +		flusher.Flush()
 +		close(firstChunkSent)
 +		<-allowComplete
-+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"output\":[{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"hello\"}]}],\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n"))
++		_, _ = w.Write([]byte("data: {\"id\":\"chatcmpl_1\",\"object\":\"chat.completion.chunk\",\"model\":\"gpt-5.4\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":8,\"completion_tokens\":5,\"total_tokens\":13}}\n\n"))
++		_, _ = w.Write([]byte("data: [DONE]\n\n"))
 +		flusher.Flush()
 +	}))
 +	defer upstream.Close()
@@ -3422,7 +3490,7 @@ index de044c5..d472a87 100644
 +	case line := <-lineCh:
 +		require.Contains(t, line, "hello")
 +	case <-time.After(time.Second):
-+		t.Fatal("first converted SSE chunk was not flushed before upstream completion")
++		t.Fatal("first SSE chunk was not flushed before upstream completion")
 +	}
 +}
 +
@@ -3443,6 +3511,51 @@ index de044c5..d472a87 100644
  func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t *testing.T) {
  	gin.SetMode(gin.TestMode)
  
+@@ -577,7 +698,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t
+ 		upstreamConversationID = r.Header.Get("conversation_id")
+ 		require.NoError(t, json.NewDecoder(r.Body).Decode(&upstreamBody))
+ 		w.Header().Set("Content-Type", "application/json")
+-		_, _ = w.Write([]byte(`{"id":"resp_1","model":"gpt-5.4","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":8,"output_tokens":2}}`))
++		_, _ = w.Write([]byte(`{"id":"resp_1","object":"response","model":"gpt-5.4","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":8,"output_tokens":2,"total_tokens":10}}`))
+ 	}))
+ 	defer upstream.Close()
+ 
+@@ -681,7 +802,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
+ 			return
+ 		}
+ 		w.Header().Set("Content-Type", "application/json")
+-		_, _ = w.Write([]byte(`{"id":"resp_1","model":"gpt-5.4","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":8,"output_tokens":2}}`))
++		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}`))
+ 	}))
+ 	defer upstream.Close()
+ 
+@@ -774,7 +895,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
+ 	require.Equal(t, http.StatusOK, rec.Code)
+ 	require.Len(t, authorizeBodies, 2)
+ 	require.Equal(t, []string{"Bearer bad-token", "Bearer good-token"}, upstreamAuths)
+-	require.Equal(t, []string{"/v1/responses", "/v1/responses"}, upstreamPaths)
++	require.Equal(t, []string{"/v1/chat/completions", "/v1/chat/completions"}, upstreamPaths)
+ 	require.Contains(t, rec.Body.String(), `"ok"`)
+ 	require.Contains(t, rec.Body.String(), `"chat.completion"`)
+ 
+@@ -803,7 +924,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
+ 			return
+ 		}
+ 		w.Header().Set("Content-Type", "application/json")
+-		_, _ = w.Write([]byte(`{"id":"resp_1","model":"gpt-5.4","status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"ok"}]}],"usage":{"input_tokens":8,"output_tokens":2}}`))
++		_, _ = w.Write([]byte(`{"id":"chatcmpl_1","object":"chat.completion","model":"gpt-5.4","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":2,"total_tokens":10}}`))
+ 	}))
+ 	defer upstream.Close()
+ 
+@@ -888,7 +1009,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
+ 	require.Equal(t, http.StatusOK, rec.Code)
+ 	require.Len(t, authorizeBodies, 2)
+ 	require.Equal(t, []string{"Bearer bad-token", "Bearer good-token"}, upstreamAuths)
+-	require.Equal(t, []string{"/v1/responses", "/v1/responses"}, upstreamPaths)
++	require.Equal(t, []string{"/v1/chat/completions", "/v1/chat/completions"}, upstreamPaths)
+ 	require.Contains(t, rec.Body.String(), `"ok"`)
+ 	require.Contains(t, rec.Body.String(), `"chat.completion"`)
+ }
 diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
 index fe0842b..f3b29ff 100644
 --- a/backend/internal/subsite/agent/server.go
