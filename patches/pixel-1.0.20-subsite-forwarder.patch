@@ -3065,7 +3065,7 @@ index 9cf0c56..7ea0b8c 100644
  	now := time.Now()
  	apiKeyGroupID := int64(7)
 diff --git a/backend/internal/subsite/agent/proxy.go b/backend/internal/subsite/agent/proxy.go
-index aba49da..00244e9 100644
+index aba49da..e74c8c1 100644
 --- a/backend/internal/subsite/agent/proxy.go
 +++ b/backend/internal/subsite/agent/proxy.go
 @@ -87,6 +87,10 @@ func (s *Server) proxyAuthorizedRequest(c *gin.Context, authorization *service.A
@@ -3102,7 +3102,21 @@ index aba49da..00244e9 100644
  	responseBody, wroteResponse, metrics, err := streamOrBufferResponse(c, resp)
  	if err != nil {
  		return nil, err
-@@ -493,6 +513,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool,
+@@ -280,6 +300,13 @@ func buildUpstreamRequestBodyAndPath(c *gin.Context, authorization *service.Auth
+ 		}
+ 		body = normalizedBody
+ 	}
++	if account != nil && account.Platform == service.PlatformOpenAI && account.Type == service.AccountTypeAPIKey && strings.Contains(upstreamPath, "/chat/completions") {
++		var err error
++		body, err = ensureChatCompletionsStreamUsage(body)
++		if err != nil {
++			return nil, "", "", err
++		}
++	}
+ 	if strings.TrimSpace(authorization.MappedModel) == "" || strings.TrimSpace(authorization.MappedModel) == strings.TrimSpace(authorization.RequestedModel) {
+ 		return body, upstreamPath, "", nil
+ 	}
+@@ -493,6 +520,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool,
  	}
  	c.Status(resp.StatusCode)
  	metrics := &responseCaptureMetrics{}
@@ -3116,7 +3130,7 @@ index aba49da..00244e9 100644
  	body, err := readUpstreamBodyWithMetrics(resp.Body, contentType, metrics)
  	if err != nil {
  		return nil, false, nil, fmt.Errorf("read upstream response: %w", err)
-@@ -511,6 +538,133 @@ func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
+@@ -511,6 +545,133 @@ func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
  	c.Data(resp.StatusCode, contentType, body)
  }
  
@@ -3250,7 +3264,37 @@ index aba49da..00244e9 100644
  func copyResponseHeaders(dst, src http.Header) {
  	for key, values := range src {
  		lower := strings.ToLower(strings.TrimSpace(key))
-@@ -1113,7 +1267,8 @@ func shouldProxyOpenAIChatCompletionsThroughResponses(inboundPath string, author
+@@ -632,6 +793,11 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
+ 	input := int(usage.Get("input_tokens").Int())
+ 	output := int(usage.Get("output_tokens").Int())
+ 	cached := int(usage.Get("input_tokens_details.cached_tokens").Int())
++	if input == 0 && output == 0 {
++		input = int(usage.Get("prompt_tokens").Int())
++		output = int(usage.Get("completion_tokens").Int())
++		cached = int(usage.Get("prompt_tokens_details.cached_tokens").Int())
++	}
+ 	imageOutput := int(usage.Get("output_tokens_details.image_tokens").Int())
+ 	return parsedUsage{
+ 		inputTokens:       input - cached,
+@@ -641,6 +807,17 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
+ 	}
+ }
+ 
++func ensureChatCompletionsStreamUsage(body []byte) ([]byte, error) {
++	if len(body) == 0 || !gjson.ValidBytes(body) || !gjson.GetBytes(body, "stream").Bool() {
++		return body, nil
++	}
++	updated, err := sjson.SetBytes(body, "stream_options.include_usage", true)
++	if err != nil {
++		return nil, fmt.Errorf("enable chat completions stream usage: %w", err)
++	}
++	return updated, nil
++}
++
+ func parseClaudeUsage(body []byte) parsedUsage {
+ 	if isLikelySSE(body) {
+ 		return parseClaudeSSEUsage(string(body))
+@@ -1113,7 +1290,8 @@ func shouldProxyOpenAIChatCompletionsThroughResponses(inboundPath string, author
  		return false
  	}
  	return strings.Contains(inboundPath, "/chat/completions") &&
@@ -3260,7 +3304,7 @@ index aba49da..00244e9 100644
  }
  
  func normalizeSubsiteOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, error) {
-@@ -1218,34 +1373,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
+@@ -1218,34 +1396,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
  }
  
  func convertResponsesSSEToChatCompletionsSSE(body []byte, originalModel string) ([]byte, error) {
@@ -3319,7 +3363,7 @@ index aba49da..00244e9 100644
  		sse, err := apicompat.ChatChunkToSSE(chunk)
  		if err != nil {
 diff --git a/backend/internal/subsite/agent/proxy_test.go b/backend/internal/subsite/agent/proxy_test.go
-index de044c5..c654f5e 100644
+index de044c5..97f703a 100644
 --- a/backend/internal/subsite/agent/proxy_test.go
 +++ b/backend/internal/subsite/agent/proxy_test.go
 @@ -1,6 +1,7 @@
@@ -3330,7 +3374,22 @@ index de044c5..c654f5e 100644
  	"context"
  	"crypto/sha256"
  	"crypto/tls"
-@@ -383,7 +384,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthResponsesUsesCodexUpstream(t *testing.T) {
+@@ -127,6 +128,14 @@ func TestSubsiteAgentProxy_AuthorizesForwardsAndQueuesUsage(t *testing.T) {
+ 	require.Nil(t, item.FirstTokenMs)
+ }
+ 
++func TestParseOpenAIUsageSupportsChatCompletionsUsageShape(t *testing.T) {
++	usage := parseOpenAIUsage([]byte(`{"usage":{"prompt_tokens":12,"completion_tokens":5,"total_tokens":17,"prompt_tokens_details":{"cached_tokens":3}}}`))
++
++	require.Equal(t, 9, usage.inputTokens)
++	require.Equal(t, 5, usage.outputTokens)
++	require.Equal(t, 3, usage.cacheReadTokens)
++}
++
+ func TestSubsiteAgentProxy_WebSocketQueuesEachCompletedTurn(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 
+@@ -383,7 +392,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthResponsesUsesCodexUpstream(t *testing.T) {
  	require.Equal(t, "hello", gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "input.0.content").String())
  }
  
@@ -3339,7 +3398,7 @@ index de044c5..c654f5e 100644
  	gin.SetMode(gin.TestMode)
  
  	const secret = "subsite-secret"
-@@ -396,7 +397,7 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+@@ -396,7 +405,7 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
  		upstreamPath = r.URL.Path
  		require.NoError(t, json.NewDecoder(r.Body).Decode(&upstreamBody))
  		w.Header().Set("Content-Type", "application/json")
@@ -3348,7 +3407,7 @@ index de044c5..c654f5e 100644
  	}))
  	defer upstream.Close()
  
-@@ -454,9 +455,9 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+@@ -454,9 +463,9 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
  	server.engine.ServeHTTP(rec, req)
  
  	require.Equal(t, http.StatusOK, rec.Code)
@@ -3360,8 +3419,12 @@ index de044c5..c654f5e 100644
  	require.Contains(t, rec.Body.String(), `"chat.completion"`)
  	require.Contains(t, rec.Body.String(), `"hello back"`)
  
-@@ -467,20 +468,22 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+@@ -465,22 +474,28 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
+ 	require.Len(t, items, 1)
+ 	require.Equal(t, authorizeBody.RequestFingerprint, items[0].Payload.RequestFingerprint)
  	require.Equal(t, requestFingerprint(http.MethodPost, "/v1/chat/completions", []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"hi"}]}`)), items[0].Payload.RequestFingerprint)
++	require.Equal(t, 8, items[0].Payload.InputTokens)
++	require.Equal(t, 5, items[0].Payload.OutputTokens)
  }
  
 -func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndReasoning(t *testing.T) {
@@ -3371,8 +3434,10 @@ index de044c5..c654f5e 100644
  	const secret = "subsite-secret"
  	groupID := int64(18)
  
++	var upstreamBody map[string]any
  	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 +		require.Equal(t, "/v1/chat/completions", r.URL.Path)
++		require.NoError(t, json.NewDecoder(r.Body).Decode(&upstreamBody))
  		w.Header().Set("Content-Type", "text/event-stream")
  		flusher, ok := w.(http.Flusher)
  		require.True(t, ok)
@@ -3386,10 +3451,31 @@ index de044c5..c654f5e 100644
  		flusher.Flush()
  	}))
  	defer upstream.Close()
-@@ -553,6 +556,124 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
- 	require.LessOrEqual(t, *item.FirstTokenMs, *item.DurationMs)
- }
+@@ -530,7 +545,7 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
+ 		Queue:      QueueConfig{Path: filepath.Join(t.TempDir(), "unused.db")},
+ 	}, masterclient.NewMasterClient(master.URL, "site_1", secret), usageQueue)
  
+-	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`))
++	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","stream":true,"reasoning_effort":"high","messages":[{"role":"user","content":"hi"}]}`))
+ 	req.Header.Set("Authorization", "Bearer client-key")
+ 	req.Header.Set("Content-Type", "application/json")
+ 	rec := httptest.NewRecorder()
+@@ -538,6 +553,7 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
+ 	server.engine.ServeHTTP(rec, req)
+ 
+ 	require.Equal(t, http.StatusOK, rec.Code)
++	require.True(t, gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "stream_options.include_usage").Bool())
+ 	require.Contains(t, rec.Body.String(), `"chat.completion.chunk"`)
+ 
+ 	items, err := usageQueue.DequeueBatch(context.Background(), 10)
+@@ -551,6 +567,126 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
+ 	require.GreaterOrEqual(t, *item.DurationMs, 20)
+ 	require.GreaterOrEqual(t, *item.FirstTokenMs, 0)
+ 	require.LessOrEqual(t, *item.FirstTokenMs, *item.DurationMs)
++	require.Equal(t, 8, item.InputTokens)
++	require.Equal(t, 5, item.OutputTokens)
++}
++
 +func TestSubsiteAgentProxy_OpenAIAPIKeyChatCompletionsStreamsBeforeUpstreamCompletes(t *testing.T) {
 +	gin.SetMode(gin.TestMode)
 +
@@ -3506,12 +3592,10 @@ index de044c5..c654f5e 100644
 +	require.Contains(t, string(converted), `"chat.completion.chunk"`)
 +	require.Contains(t, string(converted), "story story")
 +	require.Contains(t, string(converted), "data: [DONE]")
-+}
-+
- func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t *testing.T) {
- 	gin.SetMode(gin.TestMode)
+ }
  
-@@ -577,7 +698,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t
+ func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t *testing.T) {
+@@ -577,7 +713,7 @@ func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t
  		upstreamConversationID = r.Header.Get("conversation_id")
  		require.NoError(t, json.NewDecoder(r.Body).Decode(&upstreamBody))
  		w.Header().Set("Content-Type", "application/json")
@@ -3520,7 +3604,7 @@ index de044c5..c654f5e 100644
  	}))
  	defer upstream.Close()
  
-@@ -681,7 +802,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
+@@ -681,7 +817,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
  			return
  		}
  		w.Header().Set("Content-Type", "application/json")
@@ -3529,7 +3613,7 @@ index de044c5..c654f5e 100644
  	}))
  	defer upstream.Close()
  
-@@ -774,7 +895,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
+@@ -774,7 +910,7 @@ func TestSubsiteAgentProxy_FailoverOnOpenAIResponsesScopeError(t *testing.T) {
  	require.Equal(t, http.StatusOK, rec.Code)
  	require.Len(t, authorizeBodies, 2)
  	require.Equal(t, []string{"Bearer bad-token", "Bearer good-token"}, upstreamAuths)
@@ -3538,7 +3622,7 @@ index de044c5..c654f5e 100644
  	require.Contains(t, rec.Body.String(), `"ok"`)
  	require.Contains(t, rec.Body.String(), `"chat.completion"`)
  
-@@ -803,7 +924,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
+@@ -803,7 +939,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
  			return
  		}
  		w.Header().Set("Content-Type", "application/json")
@@ -3547,7 +3631,7 @@ index de044c5..c654f5e 100644
  	}))
  	defer upstream.Close()
  
-@@ -888,7 +1009,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
+@@ -888,7 +1024,7 @@ func TestSubsiteAgentProxy_FailoverOnUpstreamServerError(t *testing.T) {
  	require.Equal(t, http.StatusOK, rec.Code)
  	require.Len(t, authorizeBodies, 2)
  	require.Equal(t, []string{"Bearer bad-token", "Bearer good-token"}, upstreamAuths)
