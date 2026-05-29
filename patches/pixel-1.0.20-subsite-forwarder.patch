@@ -2064,7 +2064,7 @@ index 782fff0..891bda8 100644
  func (r *accountLeaseRepository) Release(ctx context.Context, leaseID string) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
-@@ -521,6 +1139,66 @@ func (r *accountLeaseRepository) ReleaseForSubsite(ctx context.Context, subsiteI
+@@ -521,6 +1139,71 @@ func (r *accountLeaseRepository) ReleaseForSubsite(ctx context.Context, subsiteI
  	`, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
  }
  
@@ -2075,15 +2075,12 @@ index 782fff0..891bda8 100644
 +	}
 +	var released int64
 +	err := r.db.QueryRowContext(ctx, `
-+		WITH released AS (
-+			UPDATE account_leases al
-+			SET status = 'released',
-+				released_at = COALESCE(released_at, NOW()),
-+				updated_at = NOW()
-+			FROM accounts a
++		WITH invalid_leases AS (
++			SELECT al.lease_id, al.account_id
++			FROM account_leases al
++			JOIN accounts a ON a.id = al.account_id
 +			LEFT JOIN groups g ON g.id = al.group_id AND g.deleted_at IS NULL
-+			WHERE al.account_id = a.id
-+			  AND al.deleted_at IS NULL
++			WHERE al.deleted_at IS NULL
 +			  AND al.status IN ('active', 'renewing', 'draining')
 +			  AND (
 +				  a.deleted_at IS NOT NULL
@@ -2105,6 +2102,14 @@ index 782fff0..891bda8 100644
 +					  )
 +				  )
 +			  )
++		),
++		released AS (
++			UPDATE account_leases al
++			SET status = 'released',
++				released_at = COALESCE(released_at, NOW()),
++				updated_at = NOW()
++			FROM invalid_leases il
++			WHERE al.lease_id = il.lease_id
 +			RETURNING al.lease_id, al.account_id
 +		),
 +		cleared_affinities AS (
