@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.20.2"
+        default: "1.0.20.3"
       pixel_source_version:
         description: Upstream Pixel source tag
         required: true
@@ -23,7 +23,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.20.2' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.20.3' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.20' }}
     steps:
       - name: Download installer repo

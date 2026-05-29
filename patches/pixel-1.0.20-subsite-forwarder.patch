@@ -1,3 +1,10 @@
+diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
+index c787b21..8bc7aa7 100644
+--- a/backend/cmd/server/VERSION
++++ b/backend/cmd/server/VERSION
+@@ -1 +1 @@
+-1.0.22
++1.0.20.3
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index a9ac9bd..02bc7ae 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -27,6 +34,41 @@ index a9ac9bd..02bc7ae 100644
  	jwtAuthMiddleware := middleware.NewJWTAuthMiddleware(authService, userService)
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
+diff --git a/backend/internal/domain/constants.go b/backend/internal/domain/constants.go
+index 7ee3353..27431f2 100644
+--- a/backend/internal/domain/constants.go
++++ b/backend/internal/domain/constants.go
+@@ -103,12 +103,10 @@ var DefaultAntigravityModelMapping = map[string]string{
+ 	"claude-haiku-4-5":          "claude-sonnet-4-6",
+ 	"claude-haiku-4-5-20251001": "claude-sonnet-4-6",
+ 	// Gemini 2.5 白名单
+-	"gemini-2.5-flash":               "gemini-2.5-flash",
+-	"gemini-2.5-flash-image":         "gemini-2.5-flash-image",
+-	"gemini-2.5-flash-image-preview": "gemini-2.5-flash-image",
+-	"gemini-2.5-flash-lite":          "gemini-2.5-flash-lite",
+-	"gemini-2.5-flash-thinking":      "gemini-2.5-flash-thinking",
+-	"gemini-2.5-pro":                 "gemini-2.5-pro",
++	"gemini-2.5-flash":          "gemini-2.5-flash",
++	"gemini-2.5-flash-lite":     "gemini-2.5-flash-lite",
++	"gemini-2.5-flash-thinking": "gemini-2.5-flash-thinking",
++	"gemini-2.5-pro":            "gemini-2.5-pro",
+ 	// Gemini 3 白名单
+ 	"gemini-3-flash":    "gemini-3-flash",
+ 	"gemini-3-pro-high": "gemini-3-pro-high",
+@@ -121,13 +119,6 @@ var DefaultAntigravityModelMapping = map[string]string{
+ 	"gemini-3.1-pro-low":  "gemini-3.1-pro-low",
+ 	// Gemini 3.1 preview 映射
+ 	"gemini-3.1-pro-preview": "gemini-3.1-pro-high",
+-	// Gemini 3.1 image 白名单
+-	"gemini-3.1-flash-image": "gemini-3.1-flash-image",
+-	// Gemini 3.1 image preview 映射
+-	"gemini-3.1-flash-image-preview": "gemini-3.1-flash-image",
+-	// Gemini 3 image 兼容映射（向 3.1 image 迁移）
+-	"gemini-3-pro-image":         "gemini-3.1-flash-image",
+-	"gemini-3-pro-image-preview": "gemini-3.1-flash-image",
+ 	// 其他官方模型
+ 	"gpt-oss-120b-medium":    "gpt-oss-120b-medium",
+ 	"tab_flash_lite_preview": "tab_flash_lite_preview",
 diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
 index f83507c..1f23a9e 100644
 --- a/backend/internal/handler/admin/subsite_handler.go
@@ -1388,8 +1430,43 @@ index 1738de6..068d85f 100644
 +func ProvideSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService, settingService *service.SettingService) *admin.SubsiteHandler {
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
+diff --git a/backend/internal/pkg/gemini/models.go b/backend/internal/pkg/gemini/models.go
+index fac79d1..f2c4641 100644
+--- a/backend/internal/pkg/gemini/models.go
++++ b/backend/internal/pkg/gemini/models.go
+@@ -20,13 +20,11 @@ func DefaultModels() []Model {
+ 	return []Model{
+ 		{Name: "models/gemini-2.0-flash", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-2.5-flash", SupportedGenerationMethods: methods},
+-		{Name: "models/gemini-2.5-flash-image", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-2.5-pro", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-3-flash-preview", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-3-pro-preview", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-3.1-pro-preview", SupportedGenerationMethods: methods},
+ 		{Name: "models/gemini-3.1-pro-preview-customtools", SupportedGenerationMethods: methods},
+-		{Name: "models/gemini-3.1-flash-image", SupportedGenerationMethods: methods},
+ 	}
+ }
+ 
+diff --git a/backend/internal/pkg/geminicli/models.go b/backend/internal/pkg/geminicli/models.go
+index 195fb06..1fc4d98 100644
+--- a/backend/internal/pkg/geminicli/models.go
++++ b/backend/internal/pkg/geminicli/models.go
+@@ -13,12 +13,10 @@ type Model struct {
+ var DefaultModels = []Model{
+ 	{ID: "gemini-2.0-flash", Type: "model", DisplayName: "Gemini 2.0 Flash", CreatedAt: ""},
+ 	{ID: "gemini-2.5-flash", Type: "model", DisplayName: "Gemini 2.5 Flash", CreatedAt: ""},
+-	{ID: "gemini-2.5-flash-image", Type: "model", DisplayName: "Gemini 2.5 Flash Image", CreatedAt: ""},
+ 	{ID: "gemini-2.5-pro", Type: "model", DisplayName: "Gemini 2.5 Pro", CreatedAt: ""},
+ 	{ID: "gemini-3-flash-preview", Type: "model", DisplayName: "Gemini 3 Flash Preview", CreatedAt: ""},
+ 	{ID: "gemini-3-pro-preview", Type: "model", DisplayName: "Gemini 3 Pro Preview", CreatedAt: ""},
+ 	{ID: "gemini-3.1-pro-preview", Type: "model", DisplayName: "Gemini 3.1 Pro Preview", CreatedAt: ""},
+-	{ID: "gemini-3.1-flash-image", Type: "model", DisplayName: "Gemini 3.1 Flash Image", CreatedAt: ""},
+ }
+ 
+ // DefaultTestModel is the default model to preselect in test flows.
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..891bda8 100644
+index 782fff0..070e3d5 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -1438,7 +1515,7 @@ index 782fff0..891bda8 100644
  }
  
  func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error) {
-@@ -300,6 +328,554 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
+@@ -300,6 +328,594 @@ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before ti
  	return res.RowsAffected()
  }
  
@@ -1683,7 +1760,12 @@ index 782fff0..891bda8 100644
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome IN ('failed', 'no_candidate')),
 +			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome = 'fallback'),
 +			(SELECT COUNT(*) FROM subsite_circuit_breakers WHERE deleted_at IS NULL AND cooldown_until > NOW()),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL),
 +			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes'),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes' AND health_score < 80),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND (status IN ('unhealthy', 'pending') OR (status = 'active' AND (last_heartbeat_at IS NULL OR last_heartbeat_at < NOW() - INTERVAL '3 minutes')))),
++			(SELECT COUNT(*) FROM account_leases WHERE deleted_at IS NULL AND status IN ('active', 'renewing')),
++			(SELECT COUNT(*) FROM account_leases WHERE deleted_at IS NULL AND status IN ('active', 'renewing') AND expires_at > NOW() AND expires_at <= NOW() + INTERVAL '24 hours'),
 +			COALESCE((SELECT AVG(latency_ms)::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
 +			COALESCE((SELECT (percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms))::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
 +			COALESCE((SELECT (percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms))::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
@@ -1701,7 +1783,12 @@ index 782fff0..891bda8 100644
 +		&stats.Failures24h,
 +		&stats.Failovers24h,
 +		&stats.CircuitOpen,
++		&stats.TotalSubsites,
 +		&stats.OnlineSubsites,
++		&stats.DegradedSubsites,
++		&stats.OfflineSubsites,
++		&stats.ActiveLeases,
++		&stats.ExpiringLeases24h,
 +		&stats.AvgLatencyMS24h,
 +		&stats.P95LatencyMS24h,
 +		&stats.P99LatencyMS24h,
@@ -1765,10 +1852,19 @@ index 782fff0..891bda8 100644
 +			  AND cooldown_until > NOW()
 +			  AND scope = 'subsite'
 +			ORDER BY subsite_id, updated_at DESC
++		),
++		lease_stats AS (
++			SELECT subsite_id,
++				COUNT(*) FILTER (WHERE status IN ('active', 'renewing')) AS active_leases,
++				COUNT(*) FILTER (WHERE status IN ('active', 'renewing') AND expires_at > NOW() AND expires_at <= NOW() + INTERVAL '24 hours') AS expiring_leases_24h
++			FROM account_leases
++			WHERE deleted_at IS NULL
++			GROUP BY subsite_id
 +		)
 +		SELECT s.subsite_id, s.name, s.status, s.health_score, s.last_heartbeat_at,
 +			COALESCE(h.active_requests, 0), COALESCE(h.queued_usage, 0),
 +			COALESCE(h.qps, 0), COALESCE(h.cpu_percent, 0), COALESCE(h.memory_bytes, 0),
++			COALESCE(ls.active_leases, 0), COALESCE(ls.expiring_leases_24h, 0),
 +			COALESCE(es.events_24h, 0), COALESCE(es.failures_24h, 0), COALESCE(es.avg_latency_ms, 0),
 +			COALESCE(es.p95_latency_ms, 0), COALESCE(es.p99_latency_ms, 0),
 +			COALESCE(us.forwarded_tokens, 0), COALESCE(us.forwarded_cost, 0),
@@ -1782,6 +1878,7 @@ index 782fff0..891bda8 100644
 +		LEFT JOIN usage_stats us ON us.subsite_id = s.subsite_id
 +		LEFT JOIN affinity_stats afs ON afs.subsite_id = s.subsite_id
 +		LEFT JOIN circuit_stats cs ON cs.subsite_id = s.subsite_id
++		LEFT JOIN lease_stats ls ON ls.subsite_id = s.subsite_id
 +		WHERE s.deleted_at IS NULL
 +		ORDER BY s.status = 'active' DESC, s.health_score DESC, s.name ASC
 +	`)
@@ -1803,6 +1900,8 @@ index 782fff0..891bda8 100644
 +			&item.QPS,
 +			&item.CPUPercent,
 +			&item.MemoryBytes,
++			&item.ActiveLeases,
++			&item.ExpiringLeases24h,
 +			&item.Events24h,
 +			&item.Failures24h,
 +			&item.AvgLatencyMS24h,
@@ -1827,6 +1926,8 @@ index 782fff0..891bda8 100644
 +		if cacheableInputTokens > 0 {
 +			item.CacheHitRatio24h = float64(item.CacheReadTokens24h) / float64(cacheableInputTokens)
 +		}
++		item.EffectiveStatus = service.SubsiteEffectiveStatusForStats(item, time.Now())
++		item.LoadLevel = service.SubsiteLoadLevelForStats(item)
 +		stats.BySubsite = append(stats.BySubsite, item)
 +	}
 +	if err := rows.Err(); err != nil {
@@ -1847,12 +1948,23 @@ index 782fff0..891bda8 100644
 +				subsite_id, active_requests, queued_usage, qps, cpu_percent, memory_bytes
 +			FROM subsite_heartbeats
 +			ORDER BY subsite_id, created_at DESC
++		),
++		circuit_stats AS (
++			SELECT DISTINCT ON (subsite_id)
++				subsite_id, reason, cooldown_until
++			FROM subsite_circuit_breakers
++			WHERE deleted_at IS NULL
++			  AND cooldown_until > NOW()
++			  AND scope = 'subsite'
++			ORDER BY subsite_id, updated_at DESC
 +		)
 +		SELECT s.subsite_id, s.name, s.status, s.health_score, s.last_heartbeat_at,
 +			COALESCE(h.active_requests, 0), COALESCE(h.queued_usage, 0),
-+			COALESCE(h.qps, 0), COALESCE(h.cpu_percent, 0), COALESCE(h.memory_bytes, 0)
++			COALESCE(h.qps, 0), COALESCE(h.cpu_percent, 0), COALESCE(h.memory_bytes, 0),
++			cs.subsite_id IS NOT NULL, COALESCE(cs.reason, ''), cs.cooldown_until
 +		FROM subsites s
 +		LEFT JOIN latest_hb h ON h.subsite_id = s.subsite_id
++		LEFT JOIN circuit_stats cs ON cs.subsite_id = s.subsite_id
 +		WHERE s.deleted_at IS NULL
 +	`)
 +	if err != nil {
@@ -1873,9 +1985,14 @@ index 782fff0..891bda8 100644
 +			&item.QPS,
 +			&item.CPUPercent,
 +			&item.MemoryBytes,
++			&item.CircuitOpen,
++			&item.CircuitReason,
++			&item.CooldownUntil,
 +		); err != nil {
 +			return nil, err
 +		}
++		item.EffectiveStatus = service.SubsiteEffectiveStatusForStats(item, time.Now())
++		item.LoadLevel = service.SubsiteLoadLevelForStats(item)
 +		items = append(items, item)
 +	}
 +	if err := rows.Err(); err != nil {
@@ -1993,7 +2110,7 @@ index 782fff0..891bda8 100644
  type accountLeaseRepository struct {
  	db *sql.DB
  }
-@@ -475,6 +1051,33 @@ func (r *accountLeaseRepository) ListActiveAccountIDsBySubsite(ctx context.Conte
+@@ -475,6 +1091,33 @@ func (r *accountLeaseRepository) ListActiveAccountIDsBySubsite(ctx context.Conte
  	return accountIDs, nil
  }
  
@@ -2027,7 +2144,7 @@ index 782fff0..891bda8 100644
  func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
-@@ -492,7 +1095,7 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
+@@ -492,7 +1135,7 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
  func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
@@ -2036,7 +2153,7 @@ index 782fff0..891bda8 100644
  		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing')
  	`, expiresAt, strings.TrimSpace(leaseID))
  }
-@@ -500,11 +1103,26 @@ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expi
+@@ -500,11 +1143,26 @@ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expi
  func (r *accountLeaseRepository) RenewForSubsite(ctx context.Context, subsiteID, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
@@ -2064,7 +2181,7 @@ index 782fff0..891bda8 100644
  func (r *accountLeaseRepository) Release(ctx context.Context, leaseID string) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
-@@ -521,6 +1139,71 @@ func (r *accountLeaseRepository) ReleaseForSubsite(ctx context.Context, subsiteI
+@@ -521,6 +1179,68 @@ func (r *accountLeaseRepository) ReleaseForSubsite(ctx context.Context, subsiteI
  	`, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
  }
  
@@ -2087,9 +2204,6 @@ index 782fff0..891bda8 100644
 +				  OR a.status <> 'active'
 +				  OR a.schedulable = FALSE
 +				  OR (a.auto_pause_on_expired = TRUE AND a.expires_at IS NOT NULL AND a.expires_at <= NOW())
-+				  OR (a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > NOW())
-+				  OR (a.overload_until IS NOT NULL AND a.overload_until > NOW())
-+				  OR (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > NOW())
 +				  OR g.id IS NULL
 +				  OR g.status <> 'active'
 +				  OR (g.platform <> '' AND a.platform <> '' AND g.platform <> a.platform)
@@ -2136,7 +2250,7 @@ index 782fff0..891bda8 100644
  func (r *accountLeaseRepository) Drain(ctx context.Context, leaseID string) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
-@@ -546,14 +1224,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+@@ -546,14 +1266,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
  
  	lease, err := scanAccountLease(tx.QueryRowContext(ctx, `
  		SELECT al.id, al.lease_id, al.subsite_id, al.account_id, al.group_id,
@@ -2153,7 +2267,7 @@ index 782fff0..891bda8 100644
  		WHERE al.lease_id = $1
  		  AND al.subsite_id = $2
  		  AND al.deleted_at IS NULL
-@@ -1070,6 +1746,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
+@@ -1070,6 +1788,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
  	return reservation, nil
  }
  
@@ -2698,6 +2812,247 @@ index 2302ae5..d3b4100 100644
  // getGroupPlatform extracts the group platform from the API Key stored in context.
  func getGroupPlatform(c *gin.Context) string {
  	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+diff --git a/backend/internal/service/account.go b/backend/internal/service/account.go
+index 74c3f22..1207b5c 100644
+--- a/backend/internal/service/account.go
++++ b/backend/internal/service/account.go
+@@ -349,25 +349,61 @@ func (a *Account) IsSchedulable() bool {
+ }
+ 
+ func (a *Account) IsSchedulableAt(now time.Time) bool {
+-	if !a.IsActive() || !a.Schedulable {
+-		return false
++	return a.RuntimeSchedulingStateAt(now).Schedulable
++}
++
++const (
++	AccountSchedulingStateSchedulable       = "schedulable"
++	AccountSchedulingStateInactive          = "inactive"
++	AccountSchedulingStateManuallyDisabled  = "manually_disabled"
++	AccountSchedulingStateExpired           = "expired"
++	AccountSchedulingStateRateLimited       = "rate_limited"
++	AccountSchedulingStateOverloaded        = "overloaded"
++	AccountSchedulingStateTempUnschedulable = "temp_unschedulable"
++	AccountSchedulingStateQuotaExhausted    = "quota_exhausted"
++)
++
++type AccountRuntimeSchedulingState struct {
++	Schedulable  bool       `json:"schedulable"`
++	State        string     `json:"state"`
++	Reason       string     `json:"reason,omitempty"`
++	LimitedUntil *time.Time `json:"limited_until,omitempty"`
++}
++
++func (a *Account) RuntimeSchedulingState() AccountRuntimeSchedulingState {
++	return a.RuntimeSchedulingStateAt(time.Now())
++}
++
++func (a *Account) RuntimeSchedulingStateAt(now time.Time) AccountRuntimeSchedulingState {
++	if a == nil {
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateInactive, Reason: "account is nil"}
++	}
++	if !a.IsActive() {
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateInactive, Reason: "account status is " + strings.TrimSpace(a.Status)}
++	}
++	if !a.Schedulable {
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateManuallyDisabled, Reason: "account scheduling is disabled"}
+ 	}
+ 	if a.AutoPauseOnExpired && a.ExpiresAt != nil && !now.Before(*a.ExpiresAt) {
+-		return false
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateExpired, Reason: "account expired", LimitedUntil: cloneTimePtr(a.ExpiresAt)}
+ 	}
+ 	if a.OverloadUntil != nil && now.Before(*a.OverloadUntil) {
+-		return false
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateOverloaded, Reason: "account overloaded", LimitedUntil: cloneTimePtr(a.OverloadUntil)}
+ 	}
+ 	if a.RateLimitResetAt != nil && now.Before(*a.RateLimitResetAt) {
+-		return false
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateRateLimited, Reason: "account rate limited", LimitedUntil: cloneTimePtr(a.RateLimitResetAt)}
+ 	}
+ 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
+-		return false
++		reason := strings.TrimSpace(a.TempUnschedulableReason)
++		if reason == "" {
++			reason = "account temporarily unschedulable"
++		}
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateTempUnschedulable, Reason: reason, LimitedUntil: cloneTimePtr(a.TempUnschedulableUntil)}
+ 	}
+-	if a.IsAPIKeyOrBedrock() && a.IsQuotaExceededAt(now) {
+-		return false
++	if exhausted, reason, limitedUntil := a.quotaExhaustedSchedulingStateAt(now); exhausted {
++		return AccountRuntimeSchedulingState{State: AccountSchedulingStateQuotaExhausted, Reason: reason, LimitedUntil: limitedUntil}
+ 	}
+-	return true
++	return AccountRuntimeSchedulingState{Schedulable: true, State: AccountSchedulingStateSchedulable}
+ }
+ 
+ func (a *Account) IsRateLimited() bool {
+@@ -1817,6 +1853,22 @@ func (a *Account) GetQuotaWeeklyUsed() float64 {
+ 	return a.getExtraFloat64("quota_weekly_used")
+ }
+ 
++func (a *Account) GetCodex5hUsedPercent() float64 {
++	return a.getExtraFloat64("codex_5h_used_percent")
++}
++
++func (a *Account) GetCodex7dUsedPercent() float64 {
++	return a.getExtraFloat64("codex_7d_used_percent")
++}
++
++func (a *Account) GetCodex5hResetAt() time.Time {
++	return a.getExtraTime("codex_5h_reset_at")
++}
++
++func (a *Account) GetCodex7dResetAt() time.Time {
++	return a.getExtraTime("codex_7d_reset_at")
++}
++
+ // getExtraFloat64 从 Extra 中读取指定 key 的 float64 值
+ func (a *Account) getExtraFloat64(key string) float64 {
+ 	if a.Extra == nil {
+@@ -2214,37 +2266,8 @@ func (a *Account) IsQuotaExceeded() bool {
+ }
+ 
+ func (a *Account) IsQuotaExceededAt(now time.Time) bool {
+-	// 总额度
+-	if limit := a.GetQuotaLimit(); limit > 0 && a.GetQuotaUsed() >= limit {
+-		return true
+-	}
+-	// 日额度（周期过期视为未超限，下次 increment 会重置）
+-	if limit := a.GetQuotaDailyLimit(); limit > 0 {
+-		start := a.getExtraTime("quota_daily_start")
+-		var expired bool
+-		if a.GetQuotaDailyResetMode() == "fixed" {
+-			expired = a.isFixedDailyPeriodExpiredAt(start, now)
+-		} else {
+-			expired = isPeriodExpiredAt(start, 24*time.Hour, now)
+-		}
+-		if !expired && a.GetQuotaDailyUsed() >= limit {
+-			return true
+-		}
+-	}
+-	// 周额度
+-	if limit := a.GetQuotaWeeklyLimit(); limit > 0 {
+-		start := a.getExtraTime("quota_weekly_start")
+-		var expired bool
+-		if a.GetQuotaWeeklyResetMode() == "fixed" {
+-			expired = a.isFixedWeeklyPeriodExpiredAt(start, now)
+-		} else {
+-			expired = isPeriodExpiredAt(start, 7*24*time.Hour, now)
+-		}
+-		if !expired && a.GetQuotaWeeklyUsed() >= limit {
+-			return true
+-		}
+-	}
+-	return false
++	exceeded, _, _ := a.apiKeyQuotaExhaustedSchedulingStateAt(now)
++	return exceeded
+ }
+ 
+ // GetWindowCostLimit 获取 5h 窗口费用阈值（美元）
+@@ -2422,6 +2445,102 @@ func (a *Account) CheckWindowCostSchedulability(currentWindowCost float64) Windo
+ 	return WindowCostNotSchedulable
+ }
+ 
++func (a *Account) quotaExhaustedSchedulingStateAt(now time.Time) (bool, string, *time.Time) {
++	if a == nil {
++		return false, "", nil
++	}
++	if a.IsAPIKeyOrBedrock() {
++		if exhausted, reason, until := a.apiKeyQuotaExhaustedSchedulingStateAt(now); exhausted {
++			return true, reason, until
++		}
++	}
++	if a.Platform == PlatformOpenAI && a.IsOAuth() {
++		if exhausted, reason, until := a.codexQuotaExhaustedSchedulingStateAt(now); exhausted {
++			return true, reason, until
++		}
++	}
++	return false, "", nil
++}
++
++func (a *Account) apiKeyQuotaExhaustedSchedulingStateAt(now time.Time) (bool, string, *time.Time) {
++	if limit := a.GetQuotaLimit(); limit > 0 && a.GetQuotaUsed() >= limit {
++		return true, "total account quota exhausted", nil
++	}
++	if limit := a.GetQuotaDailyLimit(); limit > 0 {
++		start := a.getExtraTime("quota_daily_start")
++		if !a.IsDailyQuotaPeriodExpiredAt(now) && a.GetQuotaDailyUsed() >= limit {
++			return true, "daily account quota exhausted", ptrIfFuture(a.nextDailyQuotaResetAt(start, now), now)
++		}
++	}
++	if limit := a.GetQuotaWeeklyLimit(); limit > 0 {
++		start := a.getExtraTime("quota_weekly_start")
++		if !a.IsWeeklyQuotaPeriodExpiredAt(now) && a.GetQuotaWeeklyUsed() >= limit {
++			return true, "weekly account quota exhausted", ptrIfFuture(a.nextWeeklyQuotaResetAt(start, now), now)
++		}
++	}
++	return false, "", nil
++}
++
++func (a *Account) codexQuotaExhaustedSchedulingStateAt(now time.Time) (bool, string, *time.Time) {
++	if a.GetCodex5hUsedPercent() >= 100 {
++		resetAt := a.GetCodex5hResetAt()
++		if resetAt.IsZero() || now.Before(resetAt) {
++			return true, "codex 5h quota exhausted", ptrIfFuture(resetAt, now)
++		}
++	}
++	if a.GetCodex7dUsedPercent() >= 100 {
++		resetAt := a.GetCodex7dResetAt()
++		if resetAt.IsZero() || now.Before(resetAt) {
++			return true, "codex 7d quota exhausted", ptrIfFuture(resetAt, now)
++		}
++	}
++	return false, "", nil
++}
++
++func (a *Account) nextDailyQuotaResetAt(start time.Time, now time.Time) time.Time {
++	if a.GetQuotaDailyResetMode() == "fixed" {
++		tz, err := time.LoadLocation(a.GetQuotaResetTimezone())
++		if err != nil {
++			tz = time.UTC
++		}
++		return nextFixedDailyReset(a.GetQuotaDailyResetHour(), tz, now)
++	}
++	if start.IsZero() {
++		return time.Time{}
++	}
++	return start.Add(24 * time.Hour)
++}
++
++func (a *Account) nextWeeklyQuotaResetAt(start time.Time, now time.Time) time.Time {
++	if a.GetQuotaWeeklyResetMode() == "fixed" {
++		tz, err := time.LoadLocation(a.GetQuotaResetTimezone())
++		if err != nil {
++			tz = time.UTC
++		}
++		return nextFixedWeeklyReset(a.GetQuotaWeeklyResetDay(), a.GetQuotaWeeklyResetHour(), tz, now)
++	}
++	if start.IsZero() {
++		return time.Time{}
++	}
++	return start.Add(7 * 24 * time.Hour)
++}
++
++func cloneTimePtr(in *time.Time) *time.Time {
++	if in == nil {
++		return nil
++	}
++	out := *in
++	return &out
++}
++
++func ptrIfFuture(value time.Time, now time.Time) *time.Time {
++	if value.IsZero() || !now.Before(value) {
++		return nil
++	}
++	out := value
++	return &out
++}
++
+ // GetCurrentWindowStartTime 获取当前有效的窗口开始时间
+ // 逻辑：
+ // 1. 如果窗口未过期（SessionWindowEnd 存在且在当前时间之后），使用记录的 SessionWindowStart
 diff --git a/backend/internal/service/domain_constants.go b/backend/internal/service/domain_constants.go
 index 92cbd62..dbbfc03 100644
 --- a/backend/internal/service/domain_constants.go
@@ -2869,7 +3224,7 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..b62516a 100644
+index 8cfa424..7f09ded 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -12,6 +12,7 @@ import (
@@ -2896,7 +3251,7 @@ index 8cfa424..b62516a 100644
  	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
  	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
  	DefaultSubsiteReservationExpiryGrace = 24 * time.Hour
-@@ -222,9 +230,60 @@ type CreateAccountLeaseInput struct {
+@@ -222,9 +230,63 @@ type CreateAccountLeaseInput struct {
  }
  
  type RenewAccountLeaseInput struct {
@@ -2943,6 +3298,7 @@ index 8cfa424..b62516a 100644
 +	Assigned       int64   `json:"assigned"`
 +	ActiveLeases   int64   `json:"active_leases"`
 +	LoadScore      float64 `json:"load_score"`
++	LoadLevel      string  `json:"load_level"`
 +	HealthScore    int     `json:"health_score"`
 +	ActiveRequests int     `json:"active_requests"`
 +	QueuedUsage    int     `json:"queued_usage"`
@@ -2950,17 +3306,19 @@ index 8cfa424..b62516a 100644
 +}
 +
 +type AutoDistributeAccountLeaseResult struct {
-+	AccountID int64  `json:"account_id"`
-+	GroupID   int64  `json:"group_id,omitempty"`
-+	Platform  string `json:"platform"`
-+	SubsiteID string `json:"subsite_id,omitempty"`
-+	LeaseID   string `json:"lease_id,omitempty"`
-+	Status    string `json:"status"`
-+	Error     string `json:"error,omitempty"`
++	AccountID    int64      `json:"account_id"`
++	GroupID      int64      `json:"group_id,omitempty"`
++	Platform     string     `json:"platform"`
++	SubsiteID    string     `json:"subsite_id,omitempty"`
++	LeaseID      string     `json:"lease_id,omitempty"`
++	Status       string     `json:"status"`
++	Reason       string     `json:"reason,omitempty"`
++	LimitedUntil *time.Time `json:"limited_until,omitempty"`
++	Error        string     `json:"error,omitempty"`
  }
  
  type SubsiteHeartbeatInput struct {
-@@ -265,6 +324,7 @@ type AuthorizeSubsiteRequestInput struct {
+@@ -265,6 +327,7 @@ type AuthorizeSubsiteRequestInput struct {
  	InboundEndpoint                string   `json:"inbound_endpoint"`
  	PreferredLeaseID               string   `json:"preferred_lease_id,omitempty"`
  	PreferredAccountID             int64    `json:"preferred_account_id,omitempty"`
@@ -2968,7 +3326,7 @@ index 8cfa424..b62516a 100644
  	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
  	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
  }
-@@ -380,10 +440,162 @@ type SubsiteMaintenanceResult struct {
+@@ -380,10 +443,171 @@ type SubsiteMaintenanceResult struct {
  	ExpiredLeases              int64 `json:"expired_leases"`
  	ExpiredReservations        int64 `json:"expired_reservations"`
  	UnhealthySubsites          int64 `json:"unhealthy_subsites"`
@@ -3037,7 +3395,12 @@ index 8cfa424..b62516a 100644
 +	Failures24h        int64                    `json:"failures_24h"`
 +	Failovers24h       int64                    `json:"failovers_24h"`
 +	CircuitOpen        int64                    `json:"circuit_open"`
++	TotalSubsites      int64                    `json:"total_subsites"`
 +	OnlineSubsites     int64                    `json:"online_subsites"`
++	DegradedSubsites   int64                    `json:"degraded_subsites"`
++	OfflineSubsites    int64                    `json:"offline_subsites"`
++	ActiveLeases       int64                    `json:"active_leases"`
++	ExpiringLeases24h  int64                    `json:"expiring_leases_24h"`
 +	AvgLatencyMS24h    float64                  `json:"avg_latency_ms_24h"`
 +	P95LatencyMS24h    float64                  `json:"p95_latency_ms_24h"`
 +	P99LatencyMS24h    float64                  `json:"p99_latency_ms_24h"`
@@ -3056,6 +3419,8 @@ index 8cfa424..b62516a 100644
 +	SubsiteID          string     `json:"subsite_id"`
 +	Name               string     `json:"name"`
 +	Status             string     `json:"status"`
++	EffectiveStatus    string     `json:"effective_status"`
++	LoadLevel          string     `json:"load_level"`
 +	HealthScore        int        `json:"health_score"`
 +	LastHeartbeatAt    *time.Time `json:"last_heartbeat_at,omitempty"`
 +	ActiveRequests     int        `json:"active_requests"`
@@ -3063,6 +3428,8 @@ index 8cfa424..b62516a 100644
 +	QPS                float64    `json:"qps"`
 +	CPUPercent         float64    `json:"cpu_percent"`
 +	MemoryBytes        int64      `json:"memory_bytes"`
++	ActiveLeases       int64      `json:"active_leases"`
++	ExpiringLeases24h  int64      `json:"expiring_leases_24h"`
 +	Events24h          int64      `json:"events_24h"`
 +	Failures24h        int64      `json:"failures_24h"`
 +	AvgLatencyMS24h    float64    `json:"avg_latency_ms_24h"`
@@ -3131,7 +3498,7 @@ index 8cfa424..b62516a 100644
  type SubsiteRepository interface {
  	Create(ctx context.Context, subsite *Subsite) error
  	GetBySubsiteID(ctx context.Context, subsiteID string) (*Subsite, error)
-@@ -395,6 +607,18 @@ type SubsiteRepository interface {
+@@ -395,6 +619,18 @@ type SubsiteRepository interface {
  	MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error)
  }
  
@@ -3150,7 +3517,7 @@ index 8cfa424..b62516a 100644
  type AccountLeaseRepository interface {
  	Create(ctx context.Context, lease *AccountLease) error
  	GetByLeaseID(ctx context.Context, leaseID string) (*AccountLease, error)
-@@ -402,11 +626,14 @@ type AccountLeaseRepository interface {
+@@ -402,11 +638,14 @@ type AccountLeaseRepository interface {
  	ListBySubsitePaginated(ctx context.Context, subsiteID string, params pagination.PaginationParams) ([]AccountLease, *pagination.PaginationResult, error)
  	ListActiveBySubsite(ctx context.Context, subsiteID string) ([]AccountLease, error)
  	ListActiveAccountIDsBySubsite(ctx context.Context, subsiteID string) ([]int64, error)
@@ -3165,7 +3532,7 @@ index 8cfa424..b62516a 100644
  	Drain(ctx context.Context, leaseID string) (*AccountLease, error)
  	DrainForSubsite(ctx context.Context, subsiteID, leaseID string) (*AccountLease, error)
  	DeleteForSubsite(ctx context.Context, subsiteID, leaseID string) (*AccountLease, error)
-@@ -436,12 +663,17 @@ type SubsiteNonceStore interface {
+@@ -436,12 +675,17 @@ type SubsiteNonceStore interface {
  }
  
  type SubsiteService struct {
@@ -3186,7 +3553,7 @@ index 8cfa424..b62516a 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -580,11 +812,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -580,11 +824,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	if strings.TrimSpace(input.SubsiteID) == "" {
  		return nil, ErrSubsiteInvalidInput
  	}
@@ -3204,7 +3571,7 @@ index 8cfa424..b62516a 100644
  	}
  	hb := &SubsiteHeartbeat{
  		SubsiteID:      strings.TrimSpace(input.SubsiteID),
-@@ -596,7 +829,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -596,7 +841,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  		CPUPercent:     math.Max(0, input.CPUPercent),
  		MemoryBytes:    int64(math.Max(0, float64(input.MemoryBytes))),
  		Metadata:       normalizeSubsiteMap(input.Metadata),
@@ -3213,7 +3580,7 @@ index 8cfa424..b62516a 100644
  		RemoteIP:       strings.TrimSpace(input.RemoteIP),
  	}
  	if err := s.repo.RecordHeartbeat(ctx, hb); err != nil {
-@@ -605,6 +838,124 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -605,6 +850,124 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	return s.repo.GetBySubsiteID(ctx, hb.SubsiteID)
  }
  
@@ -3338,7 +3705,7 @@ index 8cfa424..b62516a 100644
  func (s *SubsiteService) decryptSecret(ctx context.Context, subsiteID string) (string, error) {
  	subsite, err := s.repo.GetBySubsiteID(ctx, strings.TrimSpace(subsiteID))
  	if err != nil {
-@@ -671,6 +1022,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
+@@ -671,6 +1034,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
  	return nil
  }
  
@@ -3372,7 +3739,7 @@ index 8cfa424..b62516a 100644
  type SubsiteSignedRequest struct {
  	SubsiteID  string
  	Method     string
-@@ -705,6 +1083,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+@@ -705,6 +1095,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
  	return hex.EncodeToString(mac.Sum(nil))
  }
  
@@ -3393,7 +3760,7 @@ index 8cfa424..b62516a 100644
  type AccountLeaseService struct {
  	leaseRepo   AccountLeaseRepository
  	subsiteRepo SubsiteRepository
-@@ -787,6 +1179,216 @@ func (s *AccountLeaseService) ListActiveAccountIDsBySubsite(ctx context.Context,
+@@ -787,6 +1191,239 @@ func (s *AccountLeaseService) ListActiveAccountIDsBySubsite(ctx context.Context,
  	return s.leaseRepo.ListActiveAccountIDsBySubsite(ctx, strings.TrimSpace(subsiteID))
  }
  
@@ -3430,6 +3797,7 @@ index 8cfa424..b62516a 100644
 +			Name:           target.Stat.Name,
 +			ActiveLeases:   int64(target.ActiveLeases),
 +			LoadScore:      target.LoadScore,
++			LoadLevel:      target.Stat.LoadLevel,
 +			HealthScore:    target.Stat.HealthScore,
 +			ActiveRequests: target.Stat.ActiveRequests,
 +			QueuedUsage:    target.Stat.QueuedUsage,
@@ -3461,8 +3829,17 @@ index 8cfa424..b62516a 100644
 +			break
 +		}
 +		account := &accounts[i]
-+		if account == nil || !account.IsSchedulable() {
++		schedulingState := account.RuntimeSchedulingState()
++		if !schedulingState.Schedulable {
 +			result.Skipped++
++			result.Items = appendAutoDistributeItem(result.Items, AutoDistributeAccountLeaseResult{
++				AccountID:    account.ID,
++				Platform:     account.Platform,
++				Status:       "skipped",
++				Reason:       schedulingState.State,
++				LimitedUntil: schedulingState.LimitedUntil,
++				Error:        schedulingState.Reason,
++			})
 +			continue
 +		}
 +		if !isAutoDistributeAccountCandidate(account) {
@@ -3471,12 +3848,20 @@ index 8cfa424..b62516a 100644
 +				AccountID: account.ID,
 +				Platform:  account.Platform,
 +				Status:    "skipped",
++				Reason:    "not_public_pool",
 +				Error:     "account is not in the public auto-distribution pool",
 +			})
 +			continue
 +		}
 +		if _, exists := effective[account.ID]; exists {
 +			result.Skipped++
++			result.Items = appendAutoDistributeItem(result.Items, AutoDistributeAccountLeaseResult{
++				AccountID: account.ID,
++				Platform:  account.Platform,
++				Status:    "skipped",
++				Reason:    "already_leased",
++				Error:     "account already has active lease",
++			})
 +			continue
 +		}
 +		groupID, ok := pickAutoDistributeGroupID(account, input.GroupID, input.Platform)
@@ -3486,6 +3871,7 @@ index 8cfa424..b62516a 100644
 +				AccountID: account.ID,
 +				Platform:  account.Platform,
 +				Status:    "skipped",
++				Reason:    "no_matching_group",
 +				Error:     "no active matching group",
 +			})
 +			continue
@@ -3527,10 +3913,12 @@ index 8cfa424..b62516a 100644
 +				result.Skipped++
 +				effective[account.ID] = struct{}{}
 +				item.Status = "skipped"
++				item.Reason = "already_leased"
 +				item.Error = "account already has active lease"
 +			} else {
 +				result.Failed++
 +				item.Status = "failed"
++				item.Reason = "create_failed"
 +				item.Error = err.Error()
 +			}
 +			result.Items = appendAutoDistributeItem(result.Items, item)
@@ -3573,6 +3961,8 @@ index 8cfa424..b62516a 100644
 +		if !isAutoDistributeSubsiteHealthy(stat, input.IncludeUnhealthy) {
 +			continue
 +		}
++		stat.EffectiveStatus = subsiteEffectiveStatus(stat, time.Now())
++		stat.LoadLevel = subsiteLoadLevel(stat)
 +		activeLeases, err := s.leaseRepo.ListActiveBySubsite(ctx, stat.SubsiteID)
 +		if err != nil {
 +			return nil, err
@@ -3610,7 +4000,7 @@ index 8cfa424..b62516a 100644
  func (s *AccountLeaseService) UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*AccountLease, error) {
  	subsiteID = strings.TrimSpace(subsiteID)
  	leaseID = strings.TrimSpace(leaseID)
-@@ -797,13 +1399,28 @@ func (s *AccountLeaseService) UpdateLimitsForSubsite(ctx context.Context, subsit
+@@ -797,13 +1434,28 @@ func (s *AccountLeaseService) UpdateLimitsForSubsite(ctx context.Context, subsit
  }
  
  func (s *AccountLeaseService) Renew(ctx context.Context, input RenewAccountLeaseInput) (*AccountLease, error) {
@@ -3618,10 +4008,8 @@ index 8cfa424..b62516a 100644
 +	leaseID := strings.TrimSpace(input.LeaseID)
 +	subsiteID := strings.TrimSpace(input.SubsiteID)
 +	if leaseID == "" {
- 		return nil, ErrSubsiteInvalidInput
- 	}
--	if subsiteID := strings.TrimSpace(input.SubsiteID); subsiteID != "" {
--		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
++		return nil, ErrSubsiteInvalidInput
++	}
 +	extendBy := input.ExtendBy
 +	if extendBy <= 0 && input.ExtendSeconds > 0 {
 +		extendBy = time.Duration(input.ExtendSeconds) * time.Second
@@ -3633,17 +4021,19 @@ index 8cfa424..b62516a 100644
 +		return s.leaseRepo.ExtendForSubsite(ctx, subsiteID, leaseID, extendBy)
 +	}
 +	if !input.ExpiresAt.After(time.Now()) {
-+		return nil, ErrSubsiteInvalidInput
+ 		return nil, ErrSubsiteInvalidInput
  	}
--	return s.leaseRepo.Renew(ctx, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
+-	if subsiteID := strings.TrimSpace(input.SubsiteID); subsiteID != "" {
+-		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
 +	if subsiteID != "" {
 +		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, leaseID, input.ExpiresAt)
-+	}
+ 	}
+-	return s.leaseRepo.Renew(ctx, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
 +	return s.leaseRepo.Renew(ctx, leaseID, input.ExpiresAt)
  }
  
  func (s *AccountLeaseService) Release(ctx context.Context, leaseID string) (*AccountLease, error) {
-@@ -817,6 +1434,13 @@ func (s *AccountLeaseService) ReleaseForSubsite(ctx context.Context, subsiteID,
+@@ -817,6 +1469,13 @@ func (s *AccountLeaseService) ReleaseForSubsite(ctx context.Context, subsiteID,
  	return s.leaseRepo.ReleaseForSubsite(ctx, strings.TrimSpace(subsiteID), strings.TrimSpace(leaseID))
  }
  
@@ -3657,7 +4047,7 @@ index 8cfa424..b62516a 100644
  func (s *AccountLeaseService) Drain(ctx context.Context, leaseID string) (*AccountLease, error) {
  	return s.leaseRepo.Drain(ctx, strings.TrimSpace(leaseID))
  }
-@@ -1170,52 +1794,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1170,52 +1829,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  		return nil, nil, err
  	}
  	now := time.Now()
@@ -3669,15 +4059,15 @@ index 8cfa424..b62516a 100644
 -		}
 -		if !lease.ExpiresAt.After(now) {
 -			continue
--		}
--		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
--			continue
 +	preferredRequested := input.PreferredLeaseID != "" || input.PreferredAccountID > 0
 +	for pass := 0; pass < 2; pass++ {
 +		enforcePreferred := preferredRequested && pass == 0
 +		if pass == 1 && (!preferredRequested || input.PreferredStrict) {
 +			break
  		}
+-		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
+-			continue
+-		}
 -		if lease.MaxTokens > 0 && lease.UsedTokens >= lease.MaxTokens {
 -			continue
 -		}
@@ -3759,7 +4149,7 @@ index 8cfa424..b62516a 100644
  		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
  		if err != nil {
  			return nil, nil, err
-@@ -1224,7 +1854,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1224,7 +1889,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return lease, account, nil
  		}
  	}
@@ -3768,7 +4158,7 @@ index 8cfa424..b62516a 100644
  		return nil, nil, ErrSubsiteAuthorizeNoLease
  	}
  	return nil, nil, ErrSubsiteAuthorizeNoLease
-@@ -1289,7 +1919,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1289,7 +1954,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  			ExpiresAt:          expiresAt,
  		}
  		if err := s.reservationRepo.Create(ctx, reservation); err != nil {
@@ -3777,7 +4167,7 @@ index 8cfa424..b62516a 100644
  				if _, seen := triedLeaseIDs[lease.LeaseID]; !seen {
  					triedLeaseIDs[lease.LeaseID] = struct{}{}
  					currentInput.ExcludedLeaseIDs = append(currentInput.ExcludedLeaseIDs, lease.LeaseID)
-@@ -1298,6 +1928,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1298,6 +1963,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  					triedAccountIDs[account.ID] = struct{}{}
  					currentInput.ExcludedAccountIDs = append(currentInput.ExcludedAccountIDs, account.ID)
  				}
@@ -3786,7 +4176,7 @@ index 8cfa424..b62516a 100644
  				continue
  			}
  			return nil, nil, nil, err
-@@ -1367,6 +1999,172 @@ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, accoun
+@@ -1367,6 +2034,210 @@ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, accoun
  	return true
  }
  
@@ -3874,6 +4264,44 @@ index 8cfa424..b62516a 100644
 +	return score
 +}
 +
++func subsiteLoadLevel(stat SubsiteForwardSiteStat) string {
++	if stat.CircuitOpen || stat.HealthScore < 50 {
++		return "blocked"
++	}
++	if stat.CPUPercent >= 90 || stat.QueuedUsage >= 20 || stat.ActiveRequests >= 50 {
++		return "critical"
++	}
++	if stat.CPUPercent >= 75 || stat.QueuedUsage >= 10 || stat.ActiveRequests >= 20 {
++		return "busy"
++	}
++	if stat.CPUPercent >= 50 || stat.QueuedUsage >= 3 || stat.ActiveRequests >= 8 || stat.QPS >= 5 {
++		return "warm"
++	}
++	return "idle"
++}
++
++func SubsiteLoadLevelForStats(stat SubsiteForwardSiteStat) string {
++	return subsiteLoadLevel(stat)
++}
++
++func subsiteEffectiveStatus(stat SubsiteForwardSiteStat, now time.Time) string {
++	switch stat.Status {
++	case SubsiteStatusDisabled, SubsiteStatusMaintenance:
++		return stat.Status
++	}
++	if stat.LastHeartbeatAt == nil || now.Sub(*stat.LastHeartbeatAt) > 3*time.Minute {
++		return SubsiteStatusUnhealthy
++	}
++	if stat.CircuitOpen || stat.HealthScore < 50 {
++		return SubsiteStatusUnhealthy
++	}
++	return SubsiteStatusActive
++}
++
++func SubsiteEffectiveStatusForStats(stat SubsiteForwardSiteStat, now time.Time) string {
++	return subsiteEffectiveStatus(stat, now)
++}
++
 +func pickLeastLoadedSubsite(targets []*autoDistributeTarget) *autoDistributeTarget {
 +	var selected *autoDistributeTarget
 +	selectedScore := math.MaxFloat64
@@ -3959,7 +4387,46 @@ index 8cfa424..b62516a 100644
  func containsStringTrimmed(values []string, target string) bool {
  	target = strings.TrimSpace(target)
  	if target == "" {
-@@ -1724,10 +2522,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
+@@ -1493,6 +2364,7 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
+ 		item.GroupID = reservation.GroupID
+ 		item.SubscriptionID = reservation.SubscriptionID
+ 		item.BillingType = reservation.BillingType
++		item = applyUsageIngestReservationFallback(item, reservation)
+ 	}
+ 	if s == nil || s.billingService == nil || s.apiKeyService == nil || s.accountRepo == nil {
+ 		return item, ErrQuotaReservationCostRequired
+@@ -1592,6 +2464,30 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
+ 	return item, nil
+ }
+ 
++func applyUsageIngestReservationFallback(item UsageIngestItem, reservation *QuotaReservation) UsageIngestItem {
++	if reservation == nil || usageIngestItemLeaseTokenCount(item) > 0 {
++		return item
++	}
++	if isUsageIngestImage(item) {
++		return item
++	}
++	reserved := int(reservation.ReservedTokens)
++	if reserved <= 0 {
++		return item
++	}
++	item.InputTokens = minInt(reserved, DefaultSubsiteEstimatedInputTokens)
++	item.OutputTokens = maxInt(0, reserved-item.InputTokens)
++	return item
++}
++
++func isUsageIngestImage(item UsageIngestItem) bool {
++	if item.ImageCount > 0 || item.ImageOutputTokens > 0 {
++		return true
++	}
++	endpoint := strings.ToLower(strings.TrimSpace(item.InboundEndpoint + " " + item.UpstreamEndpoint))
++	return strings.Contains(endpoint, "/images/")
++}
++
+ func (s *UsageIngestService) calculatePrivateGroupCommissionCost(ctx context.Context, apiKey *APIKey, cost *CostBreakdown, billingType int8) float64 {
+ 	if s == nil || s.settingService == nil || apiKey == nil || apiKey.Group == nil || cost == nil {
+ 		return 0
+@@ -1724,10 +2620,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
  	}
  	if result.ExpiredLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
  		log.Printf(
@@ -3972,7 +4439,7 @@ index 8cfa424..b62516a 100644
  		)
  	}
  }
-@@ -1756,6 +2555,10 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1756,6 +2653,10 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -3983,7 +4450,7 @@ index 8cfa424..b62516a 100644
  	unhealthySubsites, err := s.subsiteRepo.MarkHeartbeatTimeouts(ctx, now.Add(-heartbeatTimeout))
  	if err != nil {
  		return nil, err
-@@ -1764,6 +2567,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1764,6 +2665,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  		ExpiredLeases:              expiredLeases,
  		ExpiredReservations:        expiredReservations,
  		UnhealthySubsites:          unhealthySubsites,
@@ -3991,7 +4458,7 @@ index 8cfa424..b62516a 100644
  		HeartbeatTimeoutSecs:       int64(heartbeatTimeout.Seconds()),
  		ReservationExpiryGraceSecs: int64(reservationExpiryGrace.Seconds()),
  	}, nil
-@@ -1977,6 +2781,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
+@@ -1977,6 +2879,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
  	return copySubsiteMap(in)
  }
  
@@ -4009,6 +4476,20 @@ index 8cfa424..b62516a 100644
  func copySubsiteMap(in map[string]any) map[string]any {
  	if in == nil {
  		return map[string]any{}
+@@ -2002,6 +2915,13 @@ func maxInt(a, b int) int {
+ 	return b
+ }
+ 
++func minInt(a, b int) int {
++	if a < b {
++		return a
++	}
++	return b
++}
++
+ func maxInt64(a, b int64) int64 {
+ 	if a > b {
+ 		return a
 diff --git a/backend/internal/service/subsite_auto_distribution_test.go b/backend/internal/service/subsite_auto_distribution_test.go
 new file mode 100644
 index 0000000..f9db6d1
@@ -4707,8 +5188,102 @@ index 9cf0c56..8acbab8 100644
  func TestRequestAuthorize_RejectsLeaseGroupMismatch(t *testing.T) {
  	now := time.Now()
  	apiKeyGroupID := int64(7)
+diff --git a/backend/internal/service/usage_cleanup_service.go b/backend/internal/service/usage_cleanup_service.go
+index 939b8f9..6cfffd4 100644
+--- a/backend/internal/service/usage_cleanup_service.go
++++ b/backend/internal/service/usage_cleanup_service.go
+@@ -636,7 +636,7 @@ func (s *UsageCleanupService) effectiveAutoRetentionConfig(ctx context.Context)
+ 	defer cancel()
+ 	raw, err := s.settingRepo.GetValue(dbCtx, settingKeyUsageRetention)
+ 	if err != nil || strings.TrimSpace(raw) == "" {
+-		if err != nil {
++		if err != nil && !errors.Is(err, ErrSettingNotFound) {
+ 			logger.LegacyPrintf("service.usage_cleanup", "[UsageCleanup] load dynamic auto retention config failed, using config file defaults: %v", err)
+ 		}
+ 		return cfg
+diff --git a/backend/internal/service/usage_cleanup_service_test.go b/backend/internal/service/usage_cleanup_service_test.go
+index c0bcd4d..9344ba7 100644
+--- a/backend/internal/service/usage_cleanup_service_test.go
++++ b/backend/internal/service/usage_cleanup_service_test.go
+@@ -87,6 +87,45 @@ type cleanupBackupCall struct {
+ 	data       string
+ }
+ 
++type cleanupSettingRepoStub struct {
++	values map[string]string
++	err    error
++}
++
++func (s *cleanupSettingRepoStub) Get(ctx context.Context, key string) (*Setting, error) {
++	panic("unexpected Get call")
++}
++
++func (s *cleanupSettingRepoStub) GetValue(ctx context.Context, key string) (string, error) {
++	if s.err != nil {
++		return "", s.err
++	}
++	if value, ok := s.values[key]; ok {
++		return value, nil
++	}
++	return "", ErrSettingNotFound
++}
++
++func (s *cleanupSettingRepoStub) Set(ctx context.Context, key, value string) error {
++	panic("unexpected Set call")
++}
++
++func (s *cleanupSettingRepoStub) GetMultiple(ctx context.Context, keys []string) (map[string]string, error) {
++	panic("unexpected GetMultiple call")
++}
++
++func (s *cleanupSettingRepoStub) SetMultiple(ctx context.Context, settings map[string]string) error {
++	panic("unexpected SetMultiple call")
++}
++
++func (s *cleanupSettingRepoStub) GetAll(ctx context.Context) (map[string]string, error) {
++	panic("unexpected GetAll call")
++}
++
++func (s *cleanupSettingRepoStub) Delete(ctx context.Context, key string) error {
++	panic("unexpected Delete call")
++}
++
+ func (s *dashboardRepoStub) AggregateRange(ctx context.Context, start, end time.Time) error {
+ 	return nil
+ }
+@@ -1026,6 +1065,30 @@ func TestUsageCleanupServiceDefaultsAndLifecycle(t *testing.T) {
+ 	svcMissingDeps.Start()
+ }
+ 
++func TestUsageCleanupServiceAutoRetentionMissingSettingUsesDefaults(t *testing.T) {
++	cfg := &config.Config{UsageCleanup: config.UsageCleanupConfig{
++		AutoRetention: config.UsageCleanupAutoRetentionConfig{
++			Enabled:          true,
++			RetainDays:       9,
++			RunIntervalHours: 6,
++			WindowDays:       2,
++			BackupExpireDays: 30,
++		},
++	}}
++	svc := NewUsageCleanupServiceWithBackup(
++		&cleanupRepoStub{},
++		nil,
++		nil,
++		nil,
++		&cleanupSettingRepoStub{},
++		cfg,
++	)
++
++	got := svc.effectiveAutoRetentionConfig(context.Background())
++
++	require.Equal(t, cfg.UsageCleanup.AutoRetention, got)
++}
++
+ func TestSanitizeUsageCleanupFiltersModelEmpty(t *testing.T) {
+ 	model := "   "
+ 	apiKeyID := int64(-5)
 diff --git a/backend/internal/subsite/agent/proxy.go b/backend/internal/subsite/agent/proxy.go
-index aba49da..e74c8c1 100644
+index aba49da..ef0c55b 100644
 --- a/backend/internal/subsite/agent/proxy.go
 +++ b/backend/internal/subsite/agent/proxy.go
 @@ -87,6 +87,10 @@ func (s *Server) proxyAuthorizedRequest(c *gin.Context, authorization *service.A
@@ -4907,7 +5482,71 @@ index aba49da..e74c8c1 100644
  func copyResponseHeaders(dst, src http.Header) {
  	for key, values := range src {
  		lower := strings.ToLower(strings.TrimSpace(key))
-@@ -632,6 +793,11 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
+@@ -525,6 +686,9 @@ func copyResponseHeaders(dst, src http.Header) {
+ 
+ func buildUsageIngestItem(c *gin.Context, authorization *service.AuthorizeSubsiteResponse, requestBody, responseBody []byte, upstreamEndpoint string, duration time.Duration, metrics *responseCaptureMetrics) service.UsageIngestItem {
+ 	usage := parseUsageForPath(c.Request.URL.Path, responseBody)
++	if usage.totalTokens() == 0 {
++		usage = estimateUsageFromRequest(c, requestBody)
++	}
+ 	requestType := service.RequestTypeSync
+ 	if isStreamRequest(c, requestBody) || isSSEContentType(c.Writer.Header().Get("Content-Type")) {
+ 		requestType = service.RequestTypeStream
+@@ -583,6 +747,53 @@ type parsedUsage struct {
+ 	mediaType             string
+ }
+ 
++func (u parsedUsage) totalTokens() int {
++	return u.inputTokens +
++		u.outputTokens +
++		u.cacheCreationTokens +
++		u.cacheCreation5mTokens +
++		u.cacheCreation1hTokens +
++		u.cacheReadTokens +
++		u.imageOutputTokens
++}
++
++func estimateUsageFromRequest(c *gin.Context, body []byte) parsedUsage {
++	if c == nil || c.Request == nil || isImageEndpoint(c.Request.URL.Path) {
++		return parsedUsage{}
++	}
++	input := estimateRequestInputTokens(body)
++	output := int(gjson.GetBytes(body, "max_output_tokens").Int())
++	if output <= 0 {
++		output = int(gjson.GetBytes(body, "max_tokens").Int())
++	}
++	if output <= 0 {
++		output = int(gjson.GetBytes(body, "max_completion_tokens").Int())
++	}
++	if output <= 0 {
++		output = service.DefaultSubsiteEstimatedOutputTokens
++		if strings.Contains(strings.ToLower(c.Request.URL.Path), "/responses") {
++			output = service.DefaultSubsiteEstimatedUnboundedOutputTokens
++		}
++	}
++	return parsedUsage{
++		inputTokens:  input,
++		outputTokens: output,
++	}
++}
++
++func estimateRequestInputTokens(body []byte) int {
++	trimmed := bytes.TrimSpace(body)
++	if len(trimmed) == 0 {
++		return service.DefaultSubsiteEstimatedInputTokens
++	}
++	chars := len([]rune(string(trimmed)))
++	estimated := chars / 4
++	if estimated < service.DefaultSubsiteEstimatedInputTokens {
++		return service.DefaultSubsiteEstimatedInputTokens
++	}
++	return estimated
++}
++
+ func parseUsageForPath(inboundPath string, responseBody []byte) parsedUsage {
+ 	switch {
+ 	case strings.HasPrefix(inboundPath, "/v1beta/"):
+@@ -632,6 +843,11 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
  	input := int(usage.Get("input_tokens").Int())
  	output := int(usage.Get("output_tokens").Int())
  	cached := int(usage.Get("input_tokens_details.cached_tokens").Int())
@@ -4919,7 +5558,7 @@ index aba49da..e74c8c1 100644
  	imageOutput := int(usage.Get("output_tokens_details.image_tokens").Int())
  	return parsedUsage{
  		inputTokens:       input - cached,
-@@ -641,6 +807,17 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
+@@ -641,6 +857,17 @@ func openAIUsageFromResult(usage gjson.Result) parsedUsage {
  	}
  }
  
@@ -4937,7 +5576,7 @@ index aba49da..e74c8c1 100644
  func parseClaudeUsage(body []byte) parsedUsage {
  	if isLikelySSE(body) {
  		return parseClaudeSSEUsage(string(body))
-@@ -1113,7 +1290,8 @@ func shouldProxyOpenAIChatCompletionsThroughResponses(inboundPath string, author
+@@ -1113,7 +1340,8 @@ func shouldProxyOpenAIChatCompletionsThroughResponses(inboundPath string, author
  		return false
  	}
  	return strings.Contains(inboundPath, "/chat/completions") &&
@@ -4947,7 +5586,7 @@ index aba49da..e74c8c1 100644
  }
  
  func normalizeSubsiteOpenAIPassthroughOAuthBody(body []byte, compact bool) ([]byte, error) {
-@@ -1218,34 +1396,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
+@@ -1218,34 +1446,36 @@ func convertResponsesBodyToChatCompletions(c *gin.Context, responseBody []byte,
  }
  
  func convertResponsesSSEToChatCompletionsSSE(body []byte, originalModel string) ([]byte, error) {
@@ -5648,10 +6287,10 @@ index 7ff95d3..3670b5d 100644
 -export type { Subsite, AccountLease, ResetSubsiteSecretResult } from './subsites'
 +export type { Subsite, AccountLease, ResetSubsiteSecretResult, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats, AutoDistributeLeasesResult } from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..fdfb79a 100644
+index 1faa4eb..46018ff 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
-@@ -43,6 +43,141 @@ export interface AccountLease {
+@@ -43,6 +43,150 @@ export interface AccountLease {
    updated_at: string
  }
  
@@ -5659,6 +6298,8 @@ index 1faa4eb..fdfb79a 100644
 +  subsite_id: string
 +  name: string
 +  status: string
++  effective_status: string
++  load_level: string
 +  health_score: number
 +  last_heartbeat_at?: string
 +  active_requests: number
@@ -5666,6 +6307,8 @@ index 1faa4eb..fdfb79a 100644
 +  qps: number
 +  cpu_percent: number
 +  memory_bytes: number
++  active_leases: number
++  expiring_leases_24h: number
 +  events_24h: number
 +  failures_24h: number
 +  avg_latency_ms_24h: number
@@ -5708,7 +6351,12 @@ index 1faa4eb..fdfb79a 100644
 +  failures_24h: number
 +  failovers_24h: number
 +  circuit_open: number
++  total_subsites: number
 +  online_subsites: number
++  degraded_subsites: number
++  offline_subsites: number
++  active_leases: number
++  expiring_leases_24h: number
 +  avg_latency_ms_24h: number
 +  p95_latency_ms_24h: number
 +  p99_latency_ms_24h: number
@@ -5793,7 +6441,7 @@ index 1faa4eb..fdfb79a 100644
  export interface CreateSubsiteRequest {
    subsite_id?: string
    name: string
-@@ -85,7 +220,9 @@ export interface CreateLeaseRequest {
+@@ -85,7 +229,9 @@ export interface CreateLeaseRequest {
  }
  
  export interface RenewLeaseRequest {
@@ -5804,7 +6452,7 @@ index 1faa4eb..fdfb79a 100644
  }
  
  export interface UpdateLeaseRequest {
-@@ -94,6 +231,55 @@ export interface UpdateLeaseRequest {
+@@ -94,6 +240,58 @@ export interface UpdateLeaseRequest {
    max_tokens?: number
  }
  
@@ -5828,6 +6476,7 @@ index 1faa4eb..fdfb79a 100644
 +  assigned: number
 +  active_leases: number
 +  load_score: number
++  load_level: string
 +  health_score: number
 +  active_requests: number
 +  queued_usage: number
@@ -5841,6 +6490,8 @@ index 1faa4eb..fdfb79a 100644
 +  subsite_id?: string
 +  lease_id?: string
 +  status: string
++  reason?: string
++  limited_until?: string
 +  error?: string
 +}
 +
@@ -5860,7 +6511,7 @@ index 1faa4eb..fdfb79a 100644
  export async function list(
    page = 1,
    pageSize = 20,
-@@ -187,6 +373,65 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+@@ -187,6 +385,65 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
    await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
  }
  
@@ -5926,7 +6577,7 @@ index 1faa4eb..fdfb79a 100644
  export default {
    list,
    create,
-@@ -202,5 +447,13 @@ export default {
+@@ -202,5 +459,13 @@ export default {
    releaseLease,
    renewLease,
    updateLease,
@@ -5954,8 +6605,58 @@ index d6c7269..279e44f 100644
      { path: '/admin/announcements', label: t('nav.announcements'), icon: BellIcon },
      { path: '/admin/proxies', label: t('nav.proxies'), icon: ServerIcon },
      { path: '/admin/risk-control', label: t('nav.riskControl'), icon: ShieldIcon, hideInSimpleMode: true, featureFlag: flagRiskControl },
+diff --git a/frontend/src/composables/useModelWhitelist.ts b/frontend/src/composables/useModelWhitelist.ts
+index b5f2346..b7cfb4f 100644
+--- a/frontend/src/composables/useModelWhitelist.ts
++++ b/frontend/src/composables/useModelWhitelist.ts
+@@ -36,8 +36,6 @@ export const claudeModels = [
+ const geminiModels = [
+   // Keep in sync with backend curated Gemini lists.
+   // This list is intentionally conservative (models commonly available across OAuth/API key).
+-  'gemini-3.1-flash-image',
+-  'gemini-2.5-flash-image',
+   'gemini-2.0-flash',
+   'gemini-2.5-flash',
+   'gemini-2.5-pro',
+@@ -57,8 +55,6 @@ const antigravityModels = [
+   'claude-sonnet-4-5',
+   'claude-sonnet-4-5-thinking',
+   // Gemini 2.5 系列
+-  'gemini-3.1-flash-image',
+-  'gemini-2.5-flash-image',
+   'gemini-2.5-flash',
+   'gemini-2.5-flash-lite',
+   'gemini-2.5-flash-thinking',
+@@ -70,7 +66,6 @@ const antigravityModels = [
+   // Gemini 3.1 系列
+   'gemini-3.1-pro-high',
+   'gemini-3.1-pro-low',
+-  'gemini-3-pro-image',
+   // 其他
+   'gpt-oss-120b-medium',
+   'tab_flash_lite_preview'
+@@ -260,9 +255,7 @@ const openaiPresetMappings = [
+ const geminiPresetMappings = [
+   { label: 'Flash 2.0', from: 'gemini-2.0-flash', to: 'gemini-2.0-flash', color: 'bg-blue-100 text-blue-700 hover:bg-blue-200 dark:bg-blue-900/30 dark:text-blue-400' },
+   { label: '2.5 Flash', from: 'gemini-2.5-flash', to: 'gemini-2.5-flash', color: 'bg-indigo-100 text-indigo-700 hover:bg-indigo-200 dark:bg-indigo-900/30 dark:text-indigo-400' },
+-  { label: '2.5 Image', from: 'gemini-2.5-flash-image', to: 'gemini-2.5-flash-image', color: 'bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-400' },
+   { label: '2.5 Pro', from: 'gemini-2.5-pro', to: 'gemini-2.5-pro', color: 'bg-purple-100 text-purple-700 hover:bg-purple-200 dark:bg-purple-900/30 dark:text-purple-400' },
+-  { label: '3.1 Image', from: 'gemini-3.1-flash-image', to: 'gemini-3.1-flash-image', color: 'bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-400' }
+ ]
+ 
+ // Antigravity 预设映射（支持通配符）
+@@ -285,9 +278,6 @@ const antigravityPresetMappings = [
+   // Gemini 通配符映射
+   { label: 'Gemini 3→Flash', from: 'gemini-3*', to: 'gemini-3-flash', color: 'bg-yellow-100 text-yellow-700 hover:bg-yellow-200 dark:bg-yellow-900/30 dark:text-yellow-400' },
+   { label: 'Gemini 2.5→Flash', from: 'gemini-2.5*', to: 'gemini-2.5-flash', color: 'bg-orange-100 text-orange-700 hover:bg-orange-200 dark:bg-orange-900/30 dark:text-orange-400' },
+-  { label: '2.5-Flash-Image透传', from: 'gemini-2.5-flash-image', to: 'gemini-2.5-flash-image', color: 'bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-400' },
+-  { label: '3.1-Flash-Image透传', from: 'gemini-3.1-flash-image', to: 'gemini-3.1-flash-image', color: 'bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-400' },
+-  { label: '3-Pro-Image→3.1', from: 'gemini-3-pro-image', to: 'gemini-3.1-flash-image', color: 'bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-400' },
+   { label: '3-Flash透传', from: 'gemini-3-flash', to: 'gemini-3-flash', color: 'bg-lime-100 text-lime-700 hover:bg-lime-200 dark:bg-lime-900/30 dark:text-lime-400' },
+   { label: '2.5-Flash-Lite透传', from: 'gemini-2.5-flash-lite', to: 'gemini-2.5-flash-lite', color: 'bg-green-100 text-green-700 hover:bg-green-200 dark:bg-green-900/30 dark:text-green-400' },
+   // 精确映射
 diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
-index 070fb35..8055898 100644
+index 070fb35..4774888 100644
 --- a/frontend/src/i18n/locales/en.ts
 +++ b/frontend/src/i18n/locales/en.ts
 @@ -356,6 +356,7 @@ export default {
@@ -5966,7 +6667,7 @@ index 070fb35..8055898 100644
      proxies: 'Proxies',
      redeemCodes: 'Redeem Codes',
      ops: 'Ops',
-@@ -1718,6 +1719,191 @@ export default {
+@@ -1718,6 +1719,236 @@ export default {
          file: 'File',
        },
      },
@@ -6034,6 +6735,32 @@ index 070fb35..8055898 100644
 +        releaseInvalid: 'Release invalid leases',
 +        summary: 'Candidates {candidates}; assigned {assigned}, skipped {skipped}, failed {failed}; released invalid {released}, expired {expired}.',
 +        releaseSummary: 'Released {count} invalid leases.',
++        targetLoad: 'Distribution target load',
++        targetSubsites: '{count} target subsites',
++        assignedCount: 'assigned {count}',
++        recentItems: 'Recent account results',
++        maxItemsHint: 'Shows up to 100 items',
++        limitedUntil: 'Limited until {value}',
++        noItems: 'No item details yet.',
++        status: {
++          assigned: 'Assigned',
++          skipped: 'Skipped',
++          failed: 'Failed',
++        },
++        reasons: {
++          rateLimited: 'Rate-limit cooldown',
++          quotaExhausted: 'Quota cooldown',
++          overloaded: 'Overload cooldown',
++          tempUnschedulable: 'Temporarily unschedulable',
++          expired: 'Account expired',
++          inactive: 'Account unavailable',
++          manuallyDisabled: 'Scheduling disabled manually',
++          notPublic: 'Not an approved public account',
++          noGroup: 'No distributable public group',
++          alreadyLeased: 'Already has an effective lease',
++          dryRun: 'Preview only',
++          createFailed: 'Lease creation failed',
++        },
 +      },
 +      forward: {
 +        requests24h: '24h Requests',
@@ -6047,6 +6774,17 @@ index 070fb35..8055898 100644
 +        forwardedCost: 'cost {value}',
 +        failures24h: '24h Failures',
 +        failuresHint: 'Includes no-candidate, proxy failures, and subsite 429/5xx responses.',
++        totalSubsites: 'Total Subsites',
++        onlineCount: '{count} online',
++        onlineSubsites: 'Online Subsites',
++        degradedSubsites: 'Degraded Subsites',
++        offlineSubsites: 'Offline Subsites',
++        readyForRouting: 'Ready for routing',
++        needsAttention: 'Check load or health score',
++        notReceivingHeartbeat: 'No recent heartbeat',
++        activeLeases: 'Active Leases',
++        activeLeasesShort: '{count} leases',
++        expiringLeases: '{count} expiring within 24h',
 +        stickySessions: 'Sticky Sessions',
 +        lockedCount: '{count} locked',
 +        mode: 'Forward Mode',
@@ -6067,6 +6805,7 @@ index 070fb35..8055898 100644
 +        health: 'Health',
 +        activeQueue: 'active {active} / queue {queue}',
 +        qpsCpu: 'qps {qps} / cpu {cpu}%',
++        qpsShort: 'qps {qps}',
 +        reqCount: '{count} req',
 +        failCount: '{count} fail',
 +        p95Latency: 'p95 {ms} ms',
@@ -6096,6 +6835,13 @@ index 070fb35..8055898 100644
 +        routeEvents: 'Route Events',
 +        noEvents: 'No route events yet.',
 +        deleteStickyConfirm: 'Delete this sticky session?',
++        loadLevels: {
++          idle: 'Idle',
++          warm: 'Normal',
++          busy: 'Busy',
++          critical: 'Critical',
++          blocked: 'Blocked',
++        },
 +      },
 +      leases: {
 +        titleWithName: 'Leases - {name}',
@@ -6159,7 +6905,7 @@ index 070fb35..8055898 100644
      dashboard: {
        title: 'Admin Dashboard',
 diff --git a/frontend/src/i18n/locales/zh.ts b/frontend/src/i18n/locales/zh.ts
-index 4d928d7..f925c39 100644
+index 4d928d7..319a1fa 100644
 --- a/frontend/src/i18n/locales/zh.ts
 +++ b/frontend/src/i18n/locales/zh.ts
 @@ -356,6 +356,7 @@ export default {
@@ -6170,7 +6916,7 @@ index 4d928d7..f925c39 100644
      proxies: 'IP管理',
      redeemCodes: '兑换码',
      ops: '运维监控',
-@@ -1722,6 +1723,191 @@ export default {
+@@ -1722,6 +1723,236 @@ export default {
          file: '文件',
        },
      },
@@ -6238,6 +6984,32 @@ index 4d928d7..f925c39 100644
 +        releaseInvalid: '释放异常租约',
 +        summary: '候选 {candidates} 个；下发 {assigned} 个，跳过 {skipped} 个，失败 {failed} 个；释放异常 {released} 个，过期 {expired} 个。',
 +        releaseSummary: '已释放 {count} 个异常租约。',
++        targetLoad: '分发目标负载',
++        targetSubsites: '{count} 个目标子站',
++        assignedCount: '下发 {count}',
++        recentItems: '最近处理账号',
++        maxItemsHint: '最多显示 100 条',
++        limitedUntil: '限制恢复：{value}',
++        noItems: '暂无处理明细。',
++        status: {
++          assigned: '已下发',
++          skipped: '已跳过',
++          failed: '失败',
++        },
++        reasons: {
++          rateLimited: '限流冷却中',
++          quotaExhausted: '额度冷却中',
++          overloaded: '过载冷却中',
++          tempUnschedulable: '临时不可调度',
++          expired: '账号已过期',
++          inactive: '账号不可用',
++          manuallyDisabled: '已手动停调度',
++          notPublic: '非公共共享账号',
++          noGroup: '无可下发公共分组',
++          alreadyLeased: '已存在有效租约',
++          dryRun: '预览模式',
++          createFailed: '创建租约失败',
++        },
 +      },
 +      forward: {
 +        requests24h: '24 小时请求',
@@ -6251,6 +7023,17 @@ index 4d928d7..f925c39 100644
 +        forwardedCost: '成本 {value}',
 +        failures24h: '24 小时失败',
 +        failuresHint: '包含无可用子站、代理失败和子站 429/5xx。',
++        totalSubsites: '子站总数',
++        onlineCount: '{count} 个在线',
++        onlineSubsites: '在线子站',
++        degradedSubsites: '降级子站',
++        offlineSubsites: '离线子站',
++        readyForRouting: '可参与转发调度',
++        needsAttention: '需要检查负载或健康分',
++        notReceivingHeartbeat: '未收到有效心跳',
++        activeLeases: '有效租约',
++        activeLeasesShort: '租约 {count}',
++        expiringLeases: '24 小时内到期 {count}',
 +        stickySessions: '粘性会话',
 +        lockedCount: '{count} 个锁定',
 +        mode: '转发模式',
@@ -6271,6 +7054,7 @@ index 4d928d7..f925c39 100644
 +        health: '健康',
 +        activeQueue: '活动 {active} / 队列 {queue}',
 +        qpsCpu: 'QPS {qps} / CPU {cpu}%',
++        qpsShort: 'QPS {qps}',
 +        reqCount: '{count} 次请求',
 +        failCount: '{count} 次失败',
 +        p95Latency: 'P95 {ms} ms',
@@ -6300,6 +7084,13 @@ index 4d928d7..f925c39 100644
 +        routeEvents: '路由记录',
 +        noEvents: '暂无路由记录。',
 +        deleteStickyConfirm: '确定删除这个粘性会话吗？',
++        loadLevels: {
++          idle: '空闲',
++          warm: '正常',
++          busy: '繁忙',
++          critical: '高压',
++          blocked: '阻断',
++        },
 +      },
 +      leases: {
 +        titleWithName: '租约 - {name}',
@@ -6378,10 +7169,10 @@ index f59b1e7..b9e73c6 100644
    },
    {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..b6458eb 100644
+index cb5d3f8..765a4f5 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,19 +1,280 @@
+@@ -1,19 +1,356 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -6428,6 +7219,34 @@ index cb5d3f8..b6458eb 100644
 +        </div>
 +      </div>
 +
++      <div class="grid gap-3 md:grid-cols-2 xl:grid-cols-5">
++        <div class="rounded-2xl border border-slate-200 bg-slate-50 p-4 dark:border-slate-700 dark:bg-slate-900/40">
++          <p class="text-xs font-medium uppercase tracking-wide text-slate-500">{{ t('admin.subsites.forward.totalSubsites') }}</p>
++          <p class="mt-2 text-2xl font-semibold text-slate-950 dark:text-white">{{ formatCompact(forwardStats?.total_subsites || 0) }}</p>
++          <p class="mt-1 text-xs text-slate-500">{{ t('admin.subsites.forward.onlineCount', { count: forwardStats?.online_subsites || 0 }) }}</p>
++        </div>
++        <div class="rounded-2xl border border-emerald-200 bg-emerald-50 p-4 dark:border-emerald-900/50 dark:bg-emerald-950/30">
++          <p class="text-xs font-medium uppercase tracking-wide text-emerald-700 dark:text-emerald-300">{{ t('admin.subsites.forward.onlineSubsites') }}</p>
++          <p class="mt-2 text-2xl font-semibold text-emerald-700 dark:text-emerald-200">{{ formatCompact(forwardStats?.online_subsites || 0) }}</p>
++          <p class="mt-1 text-xs text-emerald-700 dark:text-emerald-300">{{ t('admin.subsites.forward.readyForRouting') }}</p>
++        </div>
++        <div class="rounded-2xl border border-amber-200 bg-amber-50 p-4 dark:border-amber-900/50 dark:bg-amber-950/30">
++          <p class="text-xs font-medium uppercase tracking-wide text-amber-700 dark:text-amber-300">{{ t('admin.subsites.forward.degradedSubsites') }}</p>
++          <p class="mt-2 text-2xl font-semibold text-amber-700 dark:text-amber-200">{{ formatCompact(forwardStats?.degraded_subsites || 0) }}</p>
++          <p class="mt-1 text-xs text-amber-700 dark:text-amber-300">{{ t('admin.subsites.forward.needsAttention') }}</p>
++        </div>
++        <div class="rounded-2xl border border-red-200 bg-red-50 p-4 dark:border-red-900/50 dark:bg-red-950/30">
++          <p class="text-xs font-medium uppercase tracking-wide text-red-700 dark:text-red-300">{{ t('admin.subsites.forward.offlineSubsites') }}</p>
++          <p class="mt-2 text-2xl font-semibold text-red-700 dark:text-red-200">{{ formatCompact(forwardStats?.offline_subsites || 0) }}</p>
++          <p class="mt-1 text-xs text-red-700 dark:text-red-300">{{ t('admin.subsites.forward.notReceivingHeartbeat') }}</p>
++        </div>
++        <div class="rounded-2xl border border-blue-200 bg-blue-50 p-4 dark:border-blue-900/50 dark:bg-blue-950/30">
++          <p class="text-xs font-medium uppercase tracking-wide text-blue-700 dark:text-blue-300">{{ t('admin.subsites.forward.activeLeases') }}</p>
++          <p class="mt-2 text-2xl font-semibold text-blue-700 dark:text-blue-200">{{ formatCompact(forwardStats?.active_leases || 0) }}</p>
++          <p class="mt-1 text-xs text-blue-700 dark:text-blue-300">{{ t('admin.subsites.forward.expiringLeases', { count: forwardStats?.expiring_leases_24h || 0 }) }}</p>
++        </div>
++      </div>
++
 +      <div class="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 shadow-sm dark:border-emerald-900/40 dark:bg-emerald-950/20">
 +        <div class="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
 +          <div class="max-w-2xl">
@@ -6467,6 +7286,52 @@ index cb5d3f8..b6458eb 100644
 +            {{ t('admin.subsites.distribution.releaseInvalid') }}
 +          </button>
 +        </div>
++        <div v-if="lastDistributionResult" class="mt-4 grid gap-3 xl:grid-cols-[minmax(0,1fr)_minmax(18rem,24rem)]">
++          <div class="rounded-xl border border-emerald-200 bg-white/80 p-3 dark:border-emerald-900/40 dark:bg-dark-800">
++            <div class="mb-2 flex items-center justify-between gap-2">
++              <h3 class="text-sm font-semibold text-emerald-950 dark:text-emerald-100">{{ t('admin.subsites.distribution.targetLoad') }}</h3>
++              <span class="text-xs text-emerald-700 dark:text-emerald-300">{{ t('admin.subsites.distribution.targetSubsites', { count: lastDistributionResult.target_subsites || 0 }) }}</span>
++            </div>
++            <div class="grid gap-2 md:grid-cols-2 xl:grid-cols-3">
++              <div v-for="site in lastDistributionResult.by_subsite" :key="site.subsite_id" class="rounded-lg border border-emerald-100 bg-emerald-50/60 p-3 text-xs dark:border-emerald-900/30 dark:bg-emerald-950/20">
++                <div class="flex items-start justify-between gap-2">
++                  <div class="min-w-0">
++                    <div class="truncate font-medium text-gray-900 dark:text-white">{{ site.name || site.subsite_id }}</div>
++                    <code class="text-[11px] text-gray-500">{{ site.subsite_id }}</code>
++                  </div>
++                  <span :class="['badge', loadLevelClass(site.load_level)]">{{ loadLevelLabel(site.load_level) }}</span>
++                </div>
++                <div class="mt-2 grid grid-cols-2 gap-1 text-gray-600 dark:text-gray-300">
++                  <span>{{ t('admin.subsites.distribution.assignedCount', { count: site.assigned || 0 }) }}</span>
++                  <span>{{ t('admin.subsites.forward.activeLeasesShort', { count: site.active_leases || 0 }) }}</span>
++                  <span>{{ t('admin.subsites.forward.activeQueue', { active: site.active_requests || 0, queue: site.queued_usage || 0 }) }}</span>
++                  <span>{{ t('admin.subsites.forward.qpsShort', { qps: (site.qps || 0).toFixed(2) }) }}</span>
++                </div>
++              </div>
++            </div>
++          </div>
++          <div class="rounded-xl border border-emerald-200 bg-white/80 p-3 dark:border-emerald-900/40 dark:bg-dark-800">
++            <div class="mb-2 flex items-center justify-between gap-2">
++              <h3 class="text-sm font-semibold text-emerald-950 dark:text-emerald-100">{{ t('admin.subsites.distribution.recentItems') }}</h3>
++              <span class="text-xs text-gray-500">{{ t('admin.subsites.distribution.maxItemsHint') }}</span>
++            </div>
++            <div class="max-h-56 space-y-2 overflow-y-auto pr-1">
++              <div v-for="item in lastDistributionResult.items || []" :key="`${item.account_id}-${item.subsite_id || item.status}-${item.reason || ''}`" class="rounded-lg border border-gray-100 p-2 text-xs dark:border-dark-700">
++                <div class="flex items-start justify-between gap-2">
++                  <span class="font-medium text-gray-900 dark:text-white">#{{ item.account_id }} / {{ item.platform || '-' }}</span>
++                  <span :class="['badge', distributionItemClass(item.status)]">{{ distributionStatusLabel(item.status) }}</span>
++                </div>
++                <div class="mt-1 text-gray-600 dark:text-gray-300">
++                  {{ item.subsite_id || '-' }}
++                  <span v-if="item.reason"> / {{ distributionReasonLabel(item.reason) }}</span>
++                </div>
++                <div v-if="item.limited_until" class="mt-1 text-amber-600 dark:text-amber-300">{{ t('admin.subsites.distribution.limitedUntil', { value: formatDate(item.limited_until) }) }}</div>
++                <div v-if="item.error" class="mt-1 break-all text-red-600 dark:text-red-300">{{ item.error }}</div>
++              </div>
++              <p v-if="!(lastDistributionResult.items || []).length" class="text-xs text-gray-500">{{ t('admin.subsites.distribution.noItems') }}</p>
++            </div>
++          </div>
++        </div>
 +      </div>
 +
 +      <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_28rem]">
@@ -6500,6 +7365,7 @@ index cb5d3f8..b6458eb 100644
 +                    <code class="text-xs text-gray-500">{{ site.subsite_id }}</code>
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    <span :class="['badge', loadLevelClass(site.load_level)]">{{ loadLevelLabel(site.load_level) }}</span><br />
 +                    {{ t('admin.subsites.forward.activeQueue', { active: site.active_requests, queue: site.queued_usage }) }}<br />
 +                    {{ t('admin.subsites.forward.qpsCpu', { qps: site.qps.toFixed(2), cpu: site.cpu_percent.toFixed(1) }) }}
 +                  </td>
@@ -6517,7 +7383,8 @@ index cb5d3f8..b6458eb 100644
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
 +                    {{ t('admin.subsites.forward.totalCount', { count: site.affinities }) }}<br />
-+                    {{ t('admin.subsites.forward.lockedCount', { count: site.locked_affinities }) }}
++                    {{ t('admin.subsites.forward.lockedCount', { count: site.locked_affinities }) }}<br />
++                    {{ t('admin.subsites.forward.activeLeasesShort', { count: site.active_leases || 0 }) }}
 +                  </td>
 +                  <td class="py-3">
 +                    <span :class="['badge', statusClass(effectiveSubsiteStatus(site))]">{{ site.health_score }}%</span>
@@ -6669,7 +7536,7 @@ index cb5d3f8..b6458eb 100644
            </select>
            <div class="ml-auto flex flex-wrap gap-2">
              <button class="btn btn-secondary" :disabled="loading" @click="reload">
-@@ -21,7 +282,7 @@
+@@ -21,7 +358,7 @@
              </button>
              <button class="btn btn-primary" @click="openCreate">
                <Icon name="plus" size="md" class="mr-2" />
@@ -6678,7 +7545,7 @@ index cb5d3f8..b6458eb 100644
              </button>
            </div>
          </div>
-@@ -36,8 +297,11 @@
+@@ -36,8 +373,11 @@
              </div>
            </template>
  
@@ -6692,7 +7559,7 @@ index cb5d3f8..b6458eb 100644
            </template>
  
            <template #cell-public_url="{ value }">
-@@ -46,7 +310,7 @@
+@@ -46,7 +386,7 @@
                  {{ value }}
                </a>
                <span v-else class="text-sm text-gray-400">-</span>
@@ -6701,7 +7568,7 @@ index cb5d3f8..b6458eb 100644
                  <Icon name="copy" size="sm" />
                </button>
              </div>
-@@ -54,26 +318,26 @@
+@@ -54,26 +394,26 @@
  
            <template #cell-health_score="{ row }">
              <div class="flex flex-col gap-1">
@@ -6737,7 +7604,7 @@ index cb5d3f8..b6458eb 100644
              </div>
            </template>
          </DataTable>
-@@ -91,88 +355,88 @@
+@@ -91,88 +431,88 @@
        </template>
      </TablePageLayout>
  
@@ -6849,7 +7716,7 @@ index cb5d3f8..b6458eb 100644
        <div class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_24rem]">
          <div class="min-w-0">
            <DataTable :columns="leaseColumns" :data="leases" :loading="leasesLoading">
-@@ -210,7 +474,7 @@
+@@ -210,7 +550,7 @@
              </template>
              <template #cell-usage="{ row }">
                <div class="text-sm text-gray-700 dark:text-gray-200">
@@ -6858,7 +7725,7 @@ index cb5d3f8..b6458eb 100644
                  <br />
                  Token {{ row.used_tokens }} / {{ row.max_tokens || '-' }}
                </div>
-@@ -220,10 +484,10 @@
+@@ -220,10 +560,10 @@
              </template>
              <template #cell-actions="{ row }">
                <div class="flex flex-wrap justify-end gap-1.5">
@@ -6873,7 +7740,7 @@ index cb5d3f8..b6458eb 100644
                </div>
              </template>
            </DataTable>
-@@ -241,26 +505,26 @@
+@@ -241,26 +581,26 @@
          <div class="space-y-4">
          <form class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-dark-500" @submit.prevent="createLease">
            <div>
@@ -6907,7 +7774,7 @@ index cb5d3f8..b6458eb 100644
                <option v-for="account in filteredAccountOptions" :key="account.id" :value="account.id">{{ account.label }}</option>
              </select>
              <div v-else class="rounded border border-dashed border-gray-300 px-3 py-2 text-sm text-gray-500 dark:border-dark-500 dark:text-gray-400">
-@@ -269,19 +533,19 @@
+@@ -269,19 +609,19 @@
              <p v-if="leaseBulkSummary" class="text-xs text-gray-500 dark:text-gray-400">{{ leaseBulkSummary }}</p>
            </label>
            <label class="form-field">
@@ -6931,7 +7798,7 @@ index cb5d3f8..b6458eb 100644
              <input
                v-model.number="leaseRandomCount"
                type="number"
-@@ -293,7 +557,7 @@
+@@ -293,7 +633,7 @@
            </label>
            <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
              <button type="submit" class="btn btn-primary w-full" :disabled="leaseSaving || leaseBulkSaving || leaseForm.account_id <= 0">
@@ -6940,7 +7807,7 @@ index cb5d3f8..b6458eb 100644
              </button>
              <button
                type="button"
-@@ -301,7 +565,7 @@
+@@ -301,7 +641,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createAllVisibleLeases"
              >
@@ -6949,7 +7816,7 @@ index cb5d3f8..b6458eb 100644
              </button>
              <button
                type="button"
-@@ -309,7 +573,7 @@
+@@ -309,7 +649,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(10)"
              >
@@ -6958,7 +7825,7 @@ index cb5d3f8..b6458eb 100644
              </button>
              <button
                type="button"
-@@ -317,7 +581,7 @@
+@@ -317,7 +657,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(20)"
              >
@@ -6967,7 +7834,7 @@ index cb5d3f8..b6458eb 100644
              </button>
              <button
                type="button"
-@@ -325,39 +589,39 @@
+@@ -325,39 +665,39 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0 || normalizedLeaseRandomCount <= 0"
                @click="createRandomLeases(normalizedLeaseRandomCount)"
              >
@@ -7017,7 +7884,7 @@ index cb5d3f8..b6458eb 100644
              </button>
            </div>
          </form>
-@@ -368,9 +632,9 @@
+@@ -368,9 +708,9 @@
  </template>
  
  <script setup lang="ts">
@@ -7029,7 +7896,7 @@ index cb5d3f8..b6458eb 100644
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -380,8 +644,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
+@@ -380,8 +720,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
  import Icon from '@/components/icons/Icon.vue'
  import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
@@ -7042,7 +7909,7 @@ index cb5d3f8..b6458eb 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,12 +662,19 @@ const leaseBulkSaving = ref(false)
+@@ -394,12 +738,20 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
@@ -7056,13 +7923,14 @@ index cb5d3f8..b6458eb 100644
  const leaseAccountSearch = ref('')
  const leaseBulkSummary = ref('')
 +const distributionSummary = ref('')
++const lastDistributionResult = ref<AutoDistributeLeasesResult | null>(null)
  const leaseRandomCount = ref(10)
  const searchTimer = ref<number | undefined>()
 +const forwardRefreshTimer = ref<number | undefined>()
  const showForm = ref(false)
  const editing = ref<Subsite | null>(null)
  const createdSecret = ref('')
-@@ -408,6 +683,7 @@ const resetTarget = ref<Subsite | null>(null)
+@@ -408,6 +760,7 @@ const resetTarget = ref<Subsite | null>(null)
  const resetSecretResult = ref<ResetSubsiteSecretResult | null>(null)
  const capabilitiesText = ref('openai,claude,gemini,images,websocket')
  const { copyToClipboard } = useClipboard()
@@ -7070,7 +7938,7 @@ index cb5d3f8..b6458eb 100644
  
  const resetEnvText = computed(() => {
    if (!resetTarget.value || !resetSecretResult.value) return ''
-@@ -442,7 +718,24 @@ const leaseBulkEditForm = reactive({
+@@ -442,7 +795,24 @@ const leaseBulkEditForm = reactive({
    max_requests: 0,
    max_tokens: 0
  })
@@ -7095,7 +7963,7 @@ index cb5d3f8..b6458eb 100644
  
  const leaseGroupOptions = computed(() => leaseGroups.value
    .filter((group) => group.status === 'active')
-@@ -485,30 +778,30 @@ const leaseBulkProgress = reactive({
+@@ -485,30 +855,30 @@ const leaseBulkProgress = reactive({
  })
  
  const leaseAccountEmptyText = computed(() => {
@@ -7143,7 +8011,7 @@ index cb5d3f8..b6458eb 100644
  ])
  
  async function reload(): Promise<void> {
-@@ -520,11 +813,133 @@ async function reload(): Promise<void> {
+@@ -520,11 +890,136 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -7235,6 +8103,7 @@ index cb5d3f8..b6458eb 100644
 +async function autoDistributeLeases(): Promise<void> {
 +  distributionSaving.value = true
 +  distributionSummary.value = ''
++  lastDistributionResult.value = null
 +  try {
 +    const result = await adminAPI.subsites.autoDistributeLeases({
 +      group_id: distributionForm.group_id > 0 ? distributionForm.group_id : undefined,
@@ -7244,6 +8113,7 @@ index cb5d3f8..b6458eb 100644
 +      dry_run: distributionForm.dry_run,
 +      skip_release_invalid: distributionForm.skip_release_invalid
 +    })
++    lastDistributionResult.value = result
 +    distributionSummary.value = distributionResultSummary(result)
 +    await Promise.all([loadForwardConsole(), leaseSubsite.value ? loadLeases() : Promise.resolve()])
 +  } finally {
@@ -7254,6 +8124,7 @@ index cb5d3f8..b6458eb 100644
 +async function releaseInvalidLeases(): Promise<void> {
 +  distributionSaving.value = true
 +  distributionSummary.value = ''
++  lastDistributionResult.value = null
 +  try {
 +    const result = await adminAPI.subsites.releaseInvalidLeases()
 +    distributionSummary.value = t('admin.subsites.distribution.releaseSummary', { count: result.released_invalid_leases || 0 })
@@ -7277,7 +8148,7 @@ index cb5d3f8..b6458eb 100644
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -708,6 +1123,7 @@ async function loadLeaseAccounts(): Promise<void> {
+@@ -708,6 +1203,7 @@ async function loadLeaseAccounts(): Promise<void> {
  }
  
  async function loadLeaseGroups(): Promise<void> {
@@ -7285,7 +8156,7 @@ index cb5d3f8..b6458eb 100644
    leaseGroups.value = await adminAPI.groups.getAll(undefined, 'public')
  }
  
-@@ -776,7 +1192,7 @@ async function createLease(): Promise<void> {
+@@ -776,7 +1272,7 @@ async function createLease(): Promise<void> {
  async function updateSelectedLeaseLimits(): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -7294,7 +8165,7 @@ index cb5d3f8..b6458eb 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -800,7 +1216,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -800,7 +1296,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
          leaseBulkProgress.done += 1
        }
      }
@@ -7303,7 +8174,7 @@ index cb5d3f8..b6458eb 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -809,21 +1225,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -809,21 +1305,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
  }
  
  async function renewSelectedLeases(): Promise<void> {
@@ -7329,7 +8200,7 @@ index cb5d3f8..b6458eb 100644
      if (!leaseSubsite.value) return
      await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, leaseID)
    })
-@@ -832,7 +1248,7 @@ async function deleteSelectedLeases(): Promise<void> {
+@@ -832,7 +1328,7 @@ async function deleteSelectedLeases(): Promise<void> {
  async function runSelectedLeaseAction(label: string, action: (leaseID: string) => Promise<void>): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -7338,7 +8209,7 @@ index cb5d3f8..b6458eb 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -852,7 +1268,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -852,7 +1348,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
          leaseBulkProgress.done += 1
        }
      }
@@ -7347,7 +8218,7 @@ index cb5d3f8..b6458eb 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -863,7 +1279,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -863,7 +1359,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
  async function createAllVisibleLeases(): Promise<void> {
    if (!leaseSubsite.value || bulkLeaseAccounts.value.length === 0) return
    const accounts = [...bulkLeaseAccounts.value]
@@ -7356,7 +8227,7 @@ index cb5d3f8..b6458eb 100644
  }
  
  async function createRandomLeases(count: number): Promise<void> {
-@@ -871,7 +1287,7 @@ async function createRandomLeases(count: number): Promise<void> {
+@@ -871,7 +1367,7 @@ async function createRandomLeases(count: number): Promise<void> {
    const normalizedCount = Math.min(Math.max(Math.floor(count), 0), bulkLeaseAccounts.value.length)
    if (normalizedCount <= 0) return
    const accounts = shuffleAccounts(bulkLeaseAccounts.value).slice(0, normalizedCount)
@@ -7365,7 +8236,7 @@ index cb5d3f8..b6458eb 100644
  }
  
  async function createBulkLeases(accounts: Account[], confirmMessage: string): Promise<void> {
-@@ -896,7 +1312,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
+@@ -896,7 +1392,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
          leaseBulkProgress.done += 1
        }
      }
@@ -7374,7 +8245,7 @@ index cb5d3f8..b6458eb 100644
      leaseForm.account_id = 0
      leasePagination.page = 1
      await loadLeases()
-@@ -934,7 +1350,7 @@ function normalizeNonNegativeNumber(value: number): number {
+@@ -934,7 +1430,7 @@ function normalizeNonNegativeNumber(value: number): number {
  function accountOptionLabel(account: Account): string {
    const parts = [`#${account.id}`, account.name || account.platform || 'account']
    if (account.account_level && account.account_level !== 'unknown') parts.push(account.account_level)
@@ -7383,7 +8254,7 @@ index cb5d3f8..b6458eb 100644
    return parts.join(' · ')
  }
  
-@@ -951,7 +1367,7 @@ function accountSearchText(account: Account): string {
+@@ -951,7 +1447,7 @@ function accountSearchText(account: Account): string {
  
  async function renewLease(row: AccountLease): Promise<void> {
    if (!leaseSubsite.value) return
@@ -7392,7 +8263,7 @@ index cb5d3f8..b6458eb 100644
    await loadLeases()
  }
  
-@@ -970,7 +1386,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
+@@ -970,7 +1466,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
  
  async function deleteLease(row: AccountLease): Promise<void> {
    if (!leaseSubsite.value) return
@@ -7401,7 +8272,7 @@ index cb5d3f8..b6458eb 100644
    if (!confirmed) return
    await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, row.lease_id)
    selectedLeaseIDs.value = new Set([...selectedLeaseIDs.value].filter((leaseID) => leaseID !== row.lease_id))
-@@ -995,15 +1411,46 @@ async function copyClientConfig(row: Subsite): Promise<void> {
+@@ -995,15 +1491,100 @@ async function copyClientConfig(row: Subsite): Promise<void> {
  }
  
  function statusLabel(value: string): string {
@@ -7419,6 +8290,59 @@ index cb5d3f8..b6458eb 100644
    return ({ active: 'badge-success', pending: 'badge-warning', maintenance: 'badge-warning', unhealthy: 'badge-danger', disabled: 'badge-gray' } as Record<string, string>)[value] || 'badge-gray'
  }
  
++function loadLevelLabel(value?: string): string {
++  return ({
++    idle: t('admin.subsites.forward.loadLevels.idle'),
++    warm: t('admin.subsites.forward.loadLevels.warm'),
++    busy: t('admin.subsites.forward.loadLevels.busy'),
++    critical: t('admin.subsites.forward.loadLevels.critical'),
++    blocked: t('admin.subsites.forward.loadLevels.blocked')
++  } as Record<string, string>)[value || ''] || (value || '-')
++}
++
++function loadLevelClass(value?: string): string {
++  return ({
++    idle: 'badge-success',
++    warm: 'badge-primary',
++    busy: 'badge-warning',
++    critical: 'badge-danger',
++    blocked: 'badge-danger'
++  } as Record<string, string>)[value || ''] || 'badge-gray'
++}
++
++function distributionStatusLabel(value?: string): string {
++  return ({
++    assigned: t('admin.subsites.distribution.status.assigned'),
++    skipped: t('admin.subsites.distribution.status.skipped'),
++    failed: t('admin.subsites.distribution.status.failed')
++  } as Record<string, string>)[value || ''] || (value || '-')
++}
++
++function distributionItemClass(value?: string): string {
++  return ({
++    assigned: 'badge-success',
++    skipped: 'badge-warning',
++    failed: 'badge-danger'
++  } as Record<string, string>)[value || ''] || 'badge-gray'
++}
++
++function distributionReasonLabel(value?: string): string {
++  return ({
++    rate_limited: t('admin.subsites.distribution.reasons.rateLimited'),
++    quota_exhausted: t('admin.subsites.distribution.reasons.quotaExhausted'),
++    overloaded: t('admin.subsites.distribution.reasons.overloaded'),
++    temp_unschedulable: t('admin.subsites.distribution.reasons.tempUnschedulable'),
++    expired: t('admin.subsites.distribution.reasons.expired'),
++    inactive: t('admin.subsites.distribution.reasons.inactive'),
++    manually_disabled: t('admin.subsites.distribution.reasons.manuallyDisabled'),
++    not_public: t('admin.subsites.distribution.reasons.notPublic'),
++    no_group: t('admin.subsites.distribution.reasons.noGroup'),
++    already_leased: t('admin.subsites.distribution.reasons.alreadyLeased'),
++    dry_run: t('admin.subsites.distribution.reasons.dryRun'),
++    create_failed: t('admin.subsites.distribution.reasons.createFailed')
++  } as Record<string, string>)[value || ''] || (value || '-')
++}
++
 +function isRecentHeartbeat(value?: string): boolean {
 +  if (!value) return false
 +  const timestamp = new Date(value).getTime()
@@ -7427,6 +8351,7 @@ index cb5d3f8..b6458eb 100644
 +}
 +
 +function effectiveSubsiteStatus(row: Pick<Subsite, 'status' | 'last_heartbeat_at'> | { status: string; last_heartbeat_at?: string }): string {
++  if ('effective_status' in row && typeof row.effective_status === 'string' && row.effective_status) return row.effective_status
 +  if (row.status === 'maintenance' || row.status === 'disabled') return row.status
 +  if (isRecentHeartbeat(row.last_heartbeat_at)) return 'active'
 +  return row.status || 'unhealthy'
@@ -7450,7 +8375,7 @@ index cb5d3f8..b6458eb 100644
  }
  
  function leaseStatusClass(value: string): string {
-@@ -1015,7 +1462,7 @@ function leaseGroupLabel(row: AccountLease): string {
+@@ -1015,7 +1596,7 @@ function leaseGroupLabel(row: AccountLease): string {
  }
  
  function leaseGroupMeta(row: AccountLease): string {
@@ -7459,7 +8384,7 @@ index cb5d3f8..b6458eb 100644
  }
  
  function leaseAccountLabel(row: AccountLease): string {
-@@ -1027,7 +1474,30 @@ function formatDate(value?: string): string {
+@@ -1027,7 +1608,30 @@ function formatDate(value?: string): string {
    return new Date(value).toLocaleString()
  }
  
