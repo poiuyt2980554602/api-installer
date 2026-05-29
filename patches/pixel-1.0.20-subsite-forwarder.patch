@@ -28,7 +28,7 @@ index a9ac9bd..02bc7ae 100644
  	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
  	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
 diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
-index f83507c..d733e4d 100644
+index f83507c..1f23a9e 100644
 --- a/backend/internal/handler/admin/subsite_handler.go
 +++ b/backend/internal/handler/admin/subsite_handler.go
 @@ -1,6 +1,9 @@
@@ -206,6 +206,74 @@ index f83507c..d733e4d 100644
  func (h *SubsiteHandler) Create(c *gin.Context) {
  	var input service.CreateSubsiteInput
  	if err := c.ShouldBindJSON(&input); err != nil {
+@@ -119,6 +267,27 @@ func (h *SubsiteHandler) ListLeaseActiveAccountIDs(c *gin.Context) {
+ 	response.Success(c, gin.H{"account_ids": accountIDs})
+ }
+ 
++func (h *SubsiteHandler) AutoDistributeLeases(c *gin.Context) {
++	var input service.AutoDistributeAccountLeasesInput
++	if err := c.ShouldBindJSON(&input); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	result, err := h.leaseService.AutoDistribute(c.Request.Context(), input)
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.Success(c, result)
++}
++
++func (h *SubsiteHandler) ReleaseInvalidLeases(c *gin.Context) {
++	result, err := h.leaseService.ReleaseInvalid(c.Request.Context(), "account unavailable for scheduling")
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.Success(c, gin.H{"released_invalid_leases": result})
++}
++
+ func (h *SubsiteHandler) CreateLease(c *gin.Context) {
+ 	var input struct {
+ 		GroupID        int64      `json:"group_id" binding:"required"`
+@@ -171,26 +340,30 @@ func (h *SubsiteHandler) ReleaseLease(c *gin.Context) {
+ 
+ func (h *SubsiteHandler) RenewLease(c *gin.Context) {
+ 	var input struct {
+-		ExpiresAt  *time.Time `json:"expires_at"`
+-		TTLSeconds int        `json:"ttl_seconds"`
++		ExpiresAt     *time.Time `json:"expires_at"`
++		TTLSeconds    int        `json:"ttl_seconds"`
++		ExtendSeconds int        `json:"extend_seconds"`
+ 	}
+ 	if err := c.ShouldBindJSON(&input); err != nil {
+ 		response.BadRequest(c, err.Error())
+ 		return
+ 	}
+ 	var expiresAt time.Time
++	extendSeconds := input.ExtendSeconds
++	if extendSeconds <= 0 {
++		extendSeconds = input.TTLSeconds
++	}
+ 	if input.ExpiresAt != nil {
+ 		expiresAt = *input.ExpiresAt
+-	} else if input.TTLSeconds > 0 {
+-		expiresAt = time.Now().Add(time.Duration(input.TTLSeconds) * time.Second)
+-	} else {
+-		response.BadRequest(c, "expires_at or ttl_seconds is required")
++	} else if extendSeconds <= 0 {
++		response.BadRequest(c, "expires_at, extend_seconds or ttl_seconds is required")
+ 		return
+ 	}
+ 	lease, err := h.leaseService.Renew(c.Request.Context(), service.RenewAccountLeaseInput{
+-		SubsiteID: c.Param("id"),
+-		LeaseID:   c.Param("lease_id"),
+-		ExpiresAt: expiresAt,
++		SubsiteID:     c.Param("id"),
++		LeaseID:       c.Param("lease_id"),
++		ExpiresAt:     expiresAt,
++		ExtendSeconds: extendSeconds,
+ 	})
+ 	if response.ErrorFrom(c, err) {
+ 		return
 diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
 index b723365..0c77fd2 100644
 --- a/backend/internal/handler/handler.go
@@ -1225,6 +1293,58 @@ index 0000000..ba38ee0
 +	require.Same(t, first, got)
 +	require.Equal(t, int32(2), loads.Load())
 +}
+diff --git a/backend/internal/handler/subsite_internal_handler.go b/backend/internal/handler/subsite_internal_handler.go
+index 9d9c943..38bc023 100644
+--- a/backend/internal/handler/subsite_internal_handler.go
++++ b/backend/internal/handler/subsite_internal_handler.go
+@@ -155,22 +155,25 @@ func (h *SubsiteInternalHandler) RenewLease(c *gin.Context) {
+ 		return
+ 	}
+ 	var input struct {
+-		SubsiteID  string     `json:"subsite_id"`
+-		LeaseID    string     `json:"lease_id" binding:"required"`
+-		ExpiresAt  *time.Time `json:"expires_at"`
+-		TTLSeconds int        `json:"ttl_seconds"`
++		SubsiteID     string     `json:"subsite_id"`
++		LeaseID       string     `json:"lease_id" binding:"required"`
++		ExpiresAt     *time.Time `json:"expires_at"`
++		TTLSeconds    int        `json:"ttl_seconds"`
++		ExtendSeconds int        `json:"extend_seconds"`
+ 	}
+ 	if err := c.ShouldBindJSON(&input); err != nil {
+ 		response.BadRequest(c, err.Error())
+ 		return
+ 	}
+ 	var expiresAt time.Time
++	extendSeconds := input.ExtendSeconds
++	if extendSeconds <= 0 {
++		extendSeconds = input.TTLSeconds
++	}
+ 	if input.ExpiresAt != nil {
+ 		expiresAt = *input.ExpiresAt
+-	} else if input.TTLSeconds > 0 {
+-		expiresAt = time.Now().Add(time.Duration(input.TTLSeconds) * time.Second)
+-	} else {
+-		response.BadRequest(c, "expires_at or ttl_seconds is required")
++	} else if extendSeconds <= 0 {
++		response.BadRequest(c, "expires_at, extend_seconds or ttl_seconds is required")
+ 		return
+ 	}
+ 	if strings.TrimSpace(input.SubsiteID) != "" && strings.TrimSpace(input.SubsiteID) != subsiteID {
+@@ -178,9 +181,10 @@ func (h *SubsiteInternalHandler) RenewLease(c *gin.Context) {
+ 		return
+ 	}
+ 	lease, err := h.leaseService.Renew(c.Request.Context(), service.RenewAccountLeaseInput{
+-		SubsiteID: subsiteID,
+-		LeaseID:   input.LeaseID,
+-		ExpiresAt: expiresAt,
++		SubsiteID:     subsiteID,
++		LeaseID:       input.LeaseID,
++		ExpiresAt:     expiresAt,
++		ExtendSeconds: extendSeconds,
+ 	})
+ 	if response.ErrorFrom(c, err) {
+ 		return
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
 index 1738de6..068d85f 100644
 --- a/backend/internal/handler/wire.go
@@ -1269,7 +1389,7 @@ index 1738de6..068d85f 100644
 +	return admin.NewSubsiteHandler(subsiteService, leaseService, settingService)
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..8802c08 100644
+index 782fff0..891bda8 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -1873,7 +1993,145 @@ index 782fff0..8802c08 100644
  type accountLeaseRepository struct {
  	db *sql.DB
  }
-@@ -546,14 +1122,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+@@ -475,6 +1051,33 @@ func (r *accountLeaseRepository) ListActiveAccountIDsBySubsite(ctx context.Conte
+ 	return accountIDs, nil
+ }
+ 
++func (r *accountLeaseRepository) ListEffectiveAccountIDs(ctx context.Context) ([]int64, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		SELECT DISTINCT al.account_id
++		FROM account_leases al
++		WHERE al.deleted_at IS NULL
++		  AND al.status IN ('active', 'renewing', 'draining')
++		  AND al.expires_at > NOW()
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list effective lease account ids: %w", err)
++	}
++	defer rows.Close()
++
++	accountIDs := make([]int64, 0)
++	for rows.Next() {
++		var accountID int64
++		if err := rows.Scan(&accountID); err != nil {
++			return nil, err
++		}
++		accountIDs = append(accountIDs, accountID)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, err
++	}
++	return accountIDs, nil
++}
++
+ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+@@ -492,7 +1095,7 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
+ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+-		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
++		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+ 		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing')
+ 	`, expiresAt, strings.TrimSpace(leaseID))
+ }
+@@ -500,11 +1103,26 @@ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expi
+ func (r *accountLeaseRepository) RenewForSubsite(ctx context.Context, subsiteID, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+-		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
++		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+ 		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
+ 	`, expiresAt, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
+ }
+ 
++func (r *accountLeaseRepository) ExtendForSubsite(ctx context.Context, subsiteID, leaseID string, extendBy time.Duration) (*service.AccountLease, error) {
++	seconds := int64(extendBy.Seconds())
++	if seconds <= 0 {
++		return nil, service.ErrSubsiteInvalidInput
++	}
++	return r.updateLease(ctx, `
++		UPDATE account_leases
++		SET status = 'active',
++			expires_at = GREATEST(expires_at, NOW()) + ($1::bigint * INTERVAL '1 second'),
++			renewed_at = NOW(),
++			updated_at = NOW()
++		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
++	`, seconds, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
++}
++
+ func (r *accountLeaseRepository) Release(ctx context.Context, leaseID string) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+@@ -521,6 +1139,66 @@ func (r *accountLeaseRepository) ReleaseForSubsite(ctx context.Context, subsiteI
+ 	`, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
+ }
+ 
++func (r *accountLeaseRepository) ReleaseInvalid(ctx context.Context, reason string) (int64, error) {
++	reason = strings.TrimSpace(reason)
++	if reason == "" {
++		reason = "account unavailable for scheduling"
++	}
++	var released int64
++	err := r.db.QueryRowContext(ctx, `
++		WITH released AS (
++			UPDATE account_leases al
++			SET status = 'released',
++				released_at = COALESCE(released_at, NOW()),
++				updated_at = NOW()
++			FROM accounts a
++			LEFT JOIN groups g ON g.id = al.group_id AND g.deleted_at IS NULL
++			WHERE al.account_id = a.id
++			  AND al.deleted_at IS NULL
++			  AND al.status IN ('active', 'renewing', 'draining')
++			  AND (
++				  a.deleted_at IS NOT NULL
++				  OR a.status <> 'active'
++				  OR a.schedulable = FALSE
++				  OR (a.auto_pause_on_expired = TRUE AND a.expires_at IS NOT NULL AND a.expires_at <= NOW())
++				  OR (a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > NOW())
++				  OR (a.overload_until IS NOT NULL AND a.overload_until > NOW())
++				  OR (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > NOW())
++				  OR g.id IS NULL
++				  OR g.status <> 'active'
++				  OR (g.platform <> '' AND a.platform <> '' AND g.platform <> a.platform)
++				  OR (
++					  COALESCE(g.scope, 'public') = 'public'
++					  AND a.owner_user_id IS NOT NULL
++					  AND (
++						  COALESCE(a.share_mode, 'private') <> 'public'
++						  OR COALESCE(a.share_status, 'approved') <> 'approved'
++					  )
++				  )
++			  )
++			RETURNING al.lease_id, al.account_id
++		),
++		cleared_affinities AS (
++			UPDATE subsite_forward_affinities fa
++			SET deleted_at = NOW(),
++				updated_at = NOW(),
++				last_error = $1
++			FROM released r
++			WHERE fa.deleted_at IS NULL
++			  AND (
++				  fa.lease_id = r.lease_id
++				  OR fa.account_id = r.account_id
++			  )
++			RETURNING fa.id
++		)
++		SELECT COUNT(*) FROM released
++	`, reason).Scan(&released)
++	if err != nil {
++		return 0, fmt.Errorf("release invalid account leases: %w", err)
++	}
++	return released, nil
++}
++
+ func (r *accountLeaseRepository) Drain(ctx context.Context, leaseID string) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+@@ -546,14 +1224,12 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
  
  	lease, err := scanAccountLease(tx.QueryRowContext(ctx, `
  		SELECT al.id, al.lease_id, al.subsite_id, al.account_id, al.group_id,
@@ -1890,7 +2148,7 @@ index 782fff0..8802c08 100644
  		WHERE al.lease_id = $1
  		  AND al.subsite_id = $2
  		  AND al.deleted_at IS NULL
-@@ -1070,6 +1644,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
+@@ -1070,6 +1746,140 @@ func scanQuotaReservation(row subsiteRowScanner) (*service.QuotaReservation, err
  	return reservation, nil
  }
  
@@ -2150,10 +2408,10 @@ index 8725039..afef002 100644
 +		strings.HasPrefix(normalized, "/v1beta/models/")
 +}
 diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
-index 4abf6cc..3862055 100644
+index 4abf6cc..e6aee92 100644
 --- a/backend/internal/server/routes/admin.go
 +++ b/backend/internal/server/routes/admin.go
-@@ -185,6 +185,12 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+@@ -185,6 +185,14 @@ func registerAdminAPIKeyRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
  func registerSubsiteRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
  	subsites := admin.Group("/subsites")
  	{
@@ -2163,6 +2421,8 @@ index 4abf6cc..3862055 100644
 +		subsites.POST("/forward-affinities", h.Admin.Subsite.UpsertForwardAffinity)
 +		subsites.DELETE("/forward-affinities/:affinity_id", h.Admin.Subsite.DeleteForwardAffinity)
 +		subsites.GET("/forward-events", h.Admin.Subsite.ListForwardEvents)
++		subsites.POST("/leases/auto-distribute", h.Admin.Subsite.AutoDistributeLeases)
++		subsites.POST("/leases/release-invalid", h.Admin.Subsite.ReleaseInvalidLeases)
  		subsites.GET("", h.Admin.Subsite.List)
  		subsites.POST("", h.Admin.Subsite.Create)
  		subsites.PATCH("/:id", h.Admin.Subsite.Update)
@@ -2604,10 +2864,18 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..86d573d 100644
+index 8cfa424..b62516a 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
-@@ -48,7 +48,14 @@ const (
+@@ -12,6 +12,7 @@ import (
+ 	"fmt"
+ 	"log"
+ 	"math"
++	"sort"
+ 	"strings"
+ 	"sync"
+ 	"time"
+@@ -48,7 +49,14 @@ const (
  	SubsiteAuthHeaderBodySHA   = "X-Subsite-Body-SHA256"
  	SubsiteAuthHeaderSignature = "X-Subsite-Signature"
  
@@ -2623,7 +2891,71 @@ index 8cfa424..86d573d 100644
  	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
  	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
  	DefaultSubsiteReservationExpiryGrace = 24 * time.Hour
-@@ -265,6 +272,7 @@ type AuthorizeSubsiteRequestInput struct {
+@@ -222,9 +230,60 @@ type CreateAccountLeaseInput struct {
+ }
+ 
+ type RenewAccountLeaseInput struct {
+-	SubsiteID string    `json:"subsite_id,omitempty"`
+-	LeaseID   string    `json:"lease_id"`
+-	ExpiresAt time.Time `json:"expires_at"`
++	SubsiteID     string        `json:"subsite_id,omitempty"`
++	LeaseID       string        `json:"lease_id"`
++	ExpiresAt     time.Time     `json:"expires_at"`
++	ExtendSeconds int           `json:"extend_seconds,omitempty"`
++	ExtendBy      time.Duration `json:"-"`
++}
++
++type AutoDistributeAccountLeasesInput struct {
++	SubsiteIDs         []string `json:"subsite_ids,omitempty"`
++	GroupID            int64    `json:"group_id,omitempty"`
++	Platform           string   `json:"platform,omitempty"`
++	Limit              int      `json:"limit,omitempty"`
++	TTLSeconds         int      `json:"ttl_seconds,omitempty"`
++	MaxConcurrency     int      `json:"max_concurrency,omitempty"`
++	MaxRequests        int      `json:"max_requests,omitempty"`
++	MaxTokens          int64    `json:"max_tokens,omitempty"`
++	DryRun             bool     `json:"dry_run,omitempty"`
++	SkipReleaseInvalid bool     `json:"skip_release_invalid,omitempty"`
++	IncludeUnhealthy   bool     `json:"include_unhealthy,omitempty"`
++}
++
++type AutoDistributeAccountLeasesResult struct {
++	Assigned              int64                              `json:"assigned"`
++	Skipped               int64                              `json:"skipped"`
++	Failed                int64                              `json:"failed"`
++	Candidates            int64                              `json:"candidates"`
++	TargetSubsites        int64                              `json:"target_subsites"`
++	ExpiredLeases         int64                              `json:"expired_leases"`
++	ReleasedInvalidLeases int64                              `json:"released_invalid_leases"`
++	DryRun                bool                               `json:"dry_run"`
++	BySubsite             []AutoDistributeSubsiteResult      `json:"by_subsite"`
++	Items                 []AutoDistributeAccountLeaseResult `json:"items,omitempty"`
++}
++
++type AutoDistributeSubsiteResult struct {
++	SubsiteID      string  `json:"subsite_id"`
++	Name           string  `json:"name"`
++	Assigned       int64   `json:"assigned"`
++	ActiveLeases   int64   `json:"active_leases"`
++	LoadScore      float64 `json:"load_score"`
++	HealthScore    int     `json:"health_score"`
++	ActiveRequests int     `json:"active_requests"`
++	QueuedUsage    int     `json:"queued_usage"`
++	QPS            float64 `json:"qps"`
++}
++
++type AutoDistributeAccountLeaseResult struct {
++	AccountID int64  `json:"account_id"`
++	GroupID   int64  `json:"group_id,omitempty"`
++	Platform  string `json:"platform"`
++	SubsiteID string `json:"subsite_id,omitempty"`
++	LeaseID   string `json:"lease_id,omitempty"`
++	Status    string `json:"status"`
++	Error     string `json:"error,omitempty"`
+ }
+ 
+ type SubsiteHeartbeatInput struct {
+@@ -265,6 +324,7 @@ type AuthorizeSubsiteRequestInput struct {
  	InboundEndpoint                string   `json:"inbound_endpoint"`
  	PreferredLeaseID               string   `json:"preferred_lease_id,omitempty"`
  	PreferredAccountID             int64    `json:"preferred_account_id,omitempty"`
@@ -2631,7 +2963,12 @@ index 8cfa424..86d573d 100644
  	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
  	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
  }
-@@ -384,6 +392,157 @@ type SubsiteMaintenanceResult struct {
+@@ -380,10 +440,162 @@ type SubsiteMaintenanceResult struct {
+ 	ExpiredLeases              int64 `json:"expired_leases"`
+ 	ExpiredReservations        int64 `json:"expired_reservations"`
+ 	UnhealthySubsites          int64 `json:"unhealthy_subsites"`
++	ReleasedInvalidLeases      int64 `json:"released_invalid_leases"`
+ 	HeartbeatTimeoutSecs       int64 `json:"heartbeat_timeout_secs"`
  	ReservationExpiryGraceSecs int64 `json:"reservation_expiry_grace_secs"`
  }
  
@@ -2789,7 +3126,7 @@ index 8cfa424..86d573d 100644
  type SubsiteRepository interface {
  	Create(ctx context.Context, subsite *Subsite) error
  	GetBySubsiteID(ctx context.Context, subsiteID string) (*Subsite, error)
-@@ -395,6 +554,18 @@ type SubsiteRepository interface {
+@@ -395,6 +607,18 @@ type SubsiteRepository interface {
  	MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error)
  }
  
@@ -2808,7 +3145,22 @@ index 8cfa424..86d573d 100644
  type AccountLeaseRepository interface {
  	Create(ctx context.Context, lease *AccountLease) error
  	GetByLeaseID(ctx context.Context, leaseID string) (*AccountLease, error)
-@@ -436,12 +607,17 @@ type SubsiteNonceStore interface {
+@@ -402,11 +626,14 @@ type AccountLeaseRepository interface {
+ 	ListBySubsitePaginated(ctx context.Context, subsiteID string, params pagination.PaginationParams) ([]AccountLease, *pagination.PaginationResult, error)
+ 	ListActiveBySubsite(ctx context.Context, subsiteID string) ([]AccountLease, error)
+ 	ListActiveAccountIDsBySubsite(ctx context.Context, subsiteID string) ([]int64, error)
++	ListEffectiveAccountIDs(ctx context.Context) ([]int64, error)
+ 	UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*AccountLease, error)
+ 	Renew(ctx context.Context, leaseID string, expiresAt time.Time) (*AccountLease, error)
+ 	RenewForSubsite(ctx context.Context, subsiteID, leaseID string, expiresAt time.Time) (*AccountLease, error)
++	ExtendForSubsite(ctx context.Context, subsiteID, leaseID string, extendBy time.Duration) (*AccountLease, error)
+ 	Release(ctx context.Context, leaseID string) (*AccountLease, error)
+ 	ReleaseForSubsite(ctx context.Context, subsiteID, leaseID string) (*AccountLease, error)
++	ReleaseInvalid(ctx context.Context, reason string) (int64, error)
+ 	Drain(ctx context.Context, leaseID string) (*AccountLease, error)
+ 	DrainForSubsite(ctx context.Context, subsiteID, leaseID string) (*AccountLease, error)
+ 	DeleteForSubsite(ctx context.Context, subsiteID, leaseID string) (*AccountLease, error)
+@@ -436,12 +663,17 @@ type SubsiteNonceStore interface {
  }
  
  type SubsiteService struct {
@@ -2829,7 +3181,7 @@ index 8cfa424..86d573d 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -580,11 +756,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -580,11 +812,12 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	if strings.TrimSpace(input.SubsiteID) == "" {
  		return nil, ErrSubsiteInvalidInput
  	}
@@ -2847,7 +3199,7 @@ index 8cfa424..86d573d 100644
  	}
  	hb := &SubsiteHeartbeat{
  		SubsiteID:      strings.TrimSpace(input.SubsiteID),
-@@ -596,7 +773,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -596,7 +829,7 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  		CPUPercent:     math.Max(0, input.CPUPercent),
  		MemoryBytes:    int64(math.Max(0, float64(input.MemoryBytes))),
  		Metadata:       normalizeSubsiteMap(input.Metadata),
@@ -2856,7 +3208,7 @@ index 8cfa424..86d573d 100644
  		RemoteIP:       strings.TrimSpace(input.RemoteIP),
  	}
  	if err := s.repo.RecordHeartbeat(ctx, hb); err != nil {
-@@ -605,6 +782,124 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
+@@ -605,6 +838,124 @@ func (s *SubsiteService) RecordHeartbeat(ctx context.Context, input SubsiteHeart
  	return s.repo.GetBySubsiteID(ctx, hb.SubsiteID)
  }
  
@@ -2981,7 +3333,7 @@ index 8cfa424..86d573d 100644
  func (s *SubsiteService) decryptSecret(ctx context.Context, subsiteID string) (string, error) {
  	subsite, err := s.repo.GetBySubsiteID(ctx, strings.TrimSpace(subsiteID))
  	if err != nil {
-@@ -671,6 +966,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
+@@ -671,6 +1022,33 @@ func (s *SubsiteAuthService) Verify(ctx context.Context, req SubsiteSignedReques
  	return nil
  }
  
@@ -3015,7 +3367,7 @@ index 8cfa424..86d573d 100644
  type SubsiteSignedRequest struct {
  	SubsiteID  string
  	Method     string
-@@ -705,6 +1027,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+@@ -705,6 +1083,20 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
  	return hex.EncodeToString(mac.Sum(nil))
  }
  
@@ -3036,7 +3388,271 @@ index 8cfa424..86d573d 100644
  type AccountLeaseService struct {
  	leaseRepo   AccountLeaseRepository
  	subsiteRepo SubsiteRepository
-@@ -1170,52 +1506,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -787,6 +1179,216 @@ func (s *AccountLeaseService) ListActiveAccountIDsBySubsite(ctx context.Context,
+ 	return s.leaseRepo.ListActiveAccountIDsBySubsite(ctx, strings.TrimSpace(subsiteID))
+ }
+ 
++func (s *AccountLeaseService) AutoDistribute(ctx context.Context, input AutoDistributeAccountLeasesInput) (*AutoDistributeAccountLeasesResult, error) {
++	if s == nil || s.leaseRepo == nil || s.subsiteRepo == nil || s.accountRepo == nil {
++		return nil, errors.New("account lease service dependencies are nil")
++	}
++	result := &AutoDistributeAccountLeasesResult{
++		DryRun:    input.DryRun,
++		BySubsite: []AutoDistributeSubsiteResult{},
++		Items:     []AutoDistributeAccountLeaseResult{},
++	}
++	if !input.SkipReleaseInvalid && !input.DryRun {
++		expired, err := s.leaseRepo.ExpireStale(ctx, time.Now())
++		if err != nil {
++			return nil, err
++		}
++		result.ExpiredLeases = expired
++		released, err := s.leaseRepo.ReleaseInvalid(ctx, "account unavailable for scheduling")
++		if err != nil {
++			return nil, err
++		}
++		result.ReleasedInvalidLeases = released
++	}
++
++	targets, err := s.autoDistributeTargets(ctx, input)
++	if err != nil {
++		return nil, err
++	}
++	result.TargetSubsites = int64(len(targets))
++	for _, target := range targets {
++		result.BySubsite = append(result.BySubsite, AutoDistributeSubsiteResult{
++			SubsiteID:      target.Stat.SubsiteID,
++			Name:           target.Stat.Name,
++			ActiveLeases:   int64(target.ActiveLeases),
++			LoadScore:      target.LoadScore,
++			HealthScore:    target.Stat.HealthScore,
++			ActiveRequests: target.Stat.ActiveRequests,
++			QueuedUsage:    target.Stat.QueuedUsage,
++			QPS:            target.Stat.QPS,
++		})
++	}
++	if len(targets) == 0 {
++		return result, nil
++	}
++
++	accounts, err := s.autoDistributeAccounts(ctx, input)
++	if err != nil {
++		return nil, err
++	}
++	effectiveIDs, err := s.leaseRepo.ListEffectiveAccountIDs(ctx)
++	if err != nil {
++		return nil, err
++	}
++	effective := make(map[int64]struct{}, len(effectiveIDs))
++	for _, id := range effectiveIDs {
++		effective[id] = struct{}{}
++	}
++
++	limit := normalizeAutoDistributeLimit(input.Limit)
++	expiresAt := time.Now().Add(normalizeAutoDistributeTTL(input.TTLSeconds))
++	assignedBySubsite := make(map[string]int64, len(targets))
++	for i := range accounts {
++		if limit > 0 && int(result.Assigned) >= limit {
++			break
++		}
++		account := &accounts[i]
++		if account == nil || !account.IsSchedulable() {
++			result.Skipped++
++			continue
++		}
++		if !isAutoDistributeAccountCandidate(account) {
++			result.Skipped++
++			result.Items = appendAutoDistributeItem(result.Items, AutoDistributeAccountLeaseResult{
++				AccountID: account.ID,
++				Platform:  account.Platform,
++				Status:    "skipped",
++				Error:     "account is not in the public auto-distribution pool",
++			})
++			continue
++		}
++		if _, exists := effective[account.ID]; exists {
++			result.Skipped++
++			continue
++		}
++		groupID, ok := pickAutoDistributeGroupID(account, input.GroupID, input.Platform)
++		if !ok {
++			result.Skipped++
++			result.Items = appendAutoDistributeItem(result.Items, AutoDistributeAccountLeaseResult{
++				AccountID: account.ID,
++				Platform:  account.Platform,
++				Status:    "skipped",
++				Error:     "no active matching group",
++			})
++			continue
++		}
++		target := pickLeastLoadedSubsite(targets)
++		if target == nil {
++			result.Skipped++
++			break
++		}
++		item := AutoDistributeAccountLeaseResult{
++			AccountID: account.ID,
++			GroupID:   groupID,
++			Platform:  account.Platform,
++			SubsiteID: target.Stat.SubsiteID,
++		}
++		if input.DryRun {
++			item.Status = "planned"
++			result.Assigned++
++			target.PlannedLeases++
++			assignedBySubsite[target.Stat.SubsiteID]++
++			result.Items = appendAutoDistributeItem(result.Items, item)
++			continue
++		}
++		lease := &AccountLease{
++			LeaseID:        "lease_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
++			SubsiteID:      target.Stat.SubsiteID,
++			AccountID:      account.ID,
++			GroupID:        groupID,
++			Platform:       account.Platform,
++			Status:         AccountLeaseStatusActive,
++			MaxConcurrency: clampNonNegativeInt(input.MaxConcurrency),
++			MaxRequests:    clampNonNegativeInt(input.MaxRequests),
++			MaxTokens:      maxInt64(0, input.MaxTokens),
++			AssignedAt:     time.Now(),
++			ExpiresAt:      expiresAt,
++		}
++		if err := s.leaseRepo.Create(ctx, lease); err != nil {
++			if errors.Is(err, ErrAccountLeaseConflict) {
++				result.Skipped++
++				effective[account.ID] = struct{}{}
++				item.Status = "skipped"
++				item.Error = "account already has active lease"
++			} else {
++				result.Failed++
++				item.Status = "failed"
++				item.Error = err.Error()
++			}
++			result.Items = appendAutoDistributeItem(result.Items, item)
++			continue
++		}
++		effective[account.ID] = struct{}{}
++		item.LeaseID = lease.LeaseID
++		item.Status = "assigned"
++		result.Assigned++
++		target.PlannedLeases++
++		assignedBySubsite[target.Stat.SubsiteID]++
++		result.Items = appendAutoDistributeItem(result.Items, item)
++	}
++	result.Candidates = int64(len(accounts))
++	for i := range result.BySubsite {
++		result.BySubsite[i].Assigned = assignedBySubsite[result.BySubsite[i].SubsiteID]
++		result.BySubsite[i].ActiveLeases += result.BySubsite[i].Assigned
++	}
++	return result, nil
++}
++
++func (s *AccountLeaseService) autoDistributeTargets(ctx context.Context, input AutoDistributeAccountLeasesInput) ([]*autoDistributeTarget, error) {
++	stats, ok := s.subsiteRepo.(SubsiteForwardRepository)
++	if !ok {
++		return nil, errors.New("subsite forward stats repository is unavailable")
++	}
++	routeStats, err := stats.ForwardRouteStats(ctx)
++	if err != nil {
++		return nil, err
++	}
++	allowedSubsites := normalizeSubsiteIDSet(input.SubsiteIDs)
++	targets := make([]*autoDistributeTarget, 0, len(routeStats))
++	for i := range routeStats {
++		stat := routeStats[i]
++		if len(allowedSubsites) > 0 {
++			if _, ok := allowedSubsites[stat.SubsiteID]; !ok {
++				continue
++			}
++		}
++		if !isAutoDistributeSubsiteHealthy(stat, input.IncludeUnhealthy) {
++			continue
++		}
++		activeLeases, err := s.leaseRepo.ListActiveBySubsite(ctx, stat.SubsiteID)
++		if err != nil {
++			return nil, err
++		}
++		target := &autoDistributeTarget{
++			Stat:         stat,
++			ActiveLeases: len(activeLeases),
++		}
++		target.LoadScore = autoDistributeLoadScore(target)
++		targets = append(targets, target)
++	}
++	sort.SliceStable(targets, func(i, j int) bool {
++		if targets[i].LoadScore == targets[j].LoadScore {
++			return targets[i].Stat.SubsiteID < targets[j].Stat.SubsiteID
++		}
++		return targets[i].LoadScore < targets[j].LoadScore
++	})
++	return targets, nil
++}
++
++func (s *AccountLeaseService) autoDistributeAccounts(ctx context.Context, input AutoDistributeAccountLeasesInput) ([]Account, error) {
++	platform := strings.TrimSpace(input.Platform)
++	switch {
++	case input.GroupID > 0 && platform != "":
++		return s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, input.GroupID, platform)
++	case input.GroupID > 0:
++		return s.accountRepo.ListSchedulableByGroupID(ctx, input.GroupID)
++	case platform != "":
++		return s.accountRepo.ListSchedulableByPlatform(ctx, platform)
++	default:
++		return s.accountRepo.ListSchedulable(ctx)
++	}
++}
++
+ func (s *AccountLeaseService) UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*AccountLease, error) {
+ 	subsiteID = strings.TrimSpace(subsiteID)
+ 	leaseID = strings.TrimSpace(leaseID)
+@@ -797,13 +1399,28 @@ func (s *AccountLeaseService) UpdateLimitsForSubsite(ctx context.Context, subsit
+ }
+ 
+ func (s *AccountLeaseService) Renew(ctx context.Context, input RenewAccountLeaseInput) (*AccountLease, error) {
+-	if strings.TrimSpace(input.LeaseID) == "" || !input.ExpiresAt.After(time.Now()) {
++	leaseID := strings.TrimSpace(input.LeaseID)
++	subsiteID := strings.TrimSpace(input.SubsiteID)
++	if leaseID == "" {
+ 		return nil, ErrSubsiteInvalidInput
+ 	}
+-	if subsiteID := strings.TrimSpace(input.SubsiteID); subsiteID != "" {
+-		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
++	extendBy := input.ExtendBy
++	if extendBy <= 0 && input.ExtendSeconds > 0 {
++		extendBy = time.Duration(input.ExtendSeconds) * time.Second
++	}
++	if extendBy > 0 {
++		if subsiteID == "" {
++			return nil, ErrSubsiteInvalidInput
++		}
++		return s.leaseRepo.ExtendForSubsite(ctx, subsiteID, leaseID, extendBy)
++	}
++	if !input.ExpiresAt.After(time.Now()) {
++		return nil, ErrSubsiteInvalidInput
+ 	}
+-	return s.leaseRepo.Renew(ctx, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
++	if subsiteID != "" {
++		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, leaseID, input.ExpiresAt)
++	}
++	return s.leaseRepo.Renew(ctx, leaseID, input.ExpiresAt)
+ }
+ 
+ func (s *AccountLeaseService) Release(ctx context.Context, leaseID string) (*AccountLease, error) {
+@@ -817,6 +1434,13 @@ func (s *AccountLeaseService) ReleaseForSubsite(ctx context.Context, subsiteID,
+ 	return s.leaseRepo.ReleaseForSubsite(ctx, strings.TrimSpace(subsiteID), strings.TrimSpace(leaseID))
+ }
+ 
++func (s *AccountLeaseService) ReleaseInvalid(ctx context.Context, reason string) (int64, error) {
++	if s == nil || s.leaseRepo == nil {
++		return 0, errors.New("account lease service dependencies are nil")
++	}
++	return s.leaseRepo.ReleaseInvalid(ctx, strings.TrimSpace(reason))
++}
++
+ func (s *AccountLeaseService) Drain(ctx context.Context, leaseID string) (*AccountLease, error) {
+ 	return s.leaseRepo.Drain(ctx, strings.TrimSpace(leaseID))
+ }
+@@ -1170,52 +1794,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  		return nil, nil, err
  	}
  	now := time.Now()
@@ -3051,7 +3667,12 @@ index 8cfa424..86d573d 100644
 -		}
 -		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
 -			continue
--		}
++	preferredRequested := input.PreferredLeaseID != "" || input.PreferredAccountID > 0
++	for pass := 0; pass < 2; pass++ {
++		enforcePreferred := preferredRequested && pass == 0
++		if pass == 1 && (!preferredRequested || input.PreferredStrict) {
++			break
+ 		}
 -		if lease.MaxTokens > 0 && lease.UsedTokens >= lease.MaxTokens {
 -			continue
 -		}
@@ -3079,12 +3700,7 @@ index 8cfa424..86d573d 100644
 -		}
 -		if account == nil || !account.IsSchedulable() {
 -			continue
-+	preferredRequested := input.PreferredLeaseID != "" || input.PreferredAccountID > 0
-+	for pass := 0; pass < 2; pass++ {
-+		enforcePreferred := preferredRequested && pass == 0
-+		if pass == 1 && (!preferredRequested || input.PreferredStrict) {
-+			break
- 		}
+-		}
 -		if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
 -			continue
 +		for i := range leases {
@@ -3138,7 +3754,7 @@ index 8cfa424..86d573d 100644
  		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
  		if err != nil {
  			return nil, nil, err
-@@ -1224,7 +1566,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1224,7 +1854,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return lease, account, nil
  		}
  	}
@@ -3147,7 +3763,7 @@ index 8cfa424..86d573d 100644
  		return nil, nil, ErrSubsiteAuthorizeNoLease
  	}
  	return nil, nil, ErrSubsiteAuthorizeNoLease
-@@ -1289,7 +1631,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1289,7 +1919,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  			ExpiresAt:          expiresAt,
  		}
  		if err := s.reservationRepo.Create(ctx, reservation); err != nil {
@@ -3156,7 +3772,7 @@ index 8cfa424..86d573d 100644
  				if _, seen := triedLeaseIDs[lease.LeaseID]; !seen {
  					triedLeaseIDs[lease.LeaseID] = struct{}{}
  					currentInput.ExcludedLeaseIDs = append(currentInput.ExcludedLeaseIDs, lease.LeaseID)
-@@ -1298,6 +1640,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1298,6 +1928,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  					triedAccountIDs[account.ID] = struct{}{}
  					currentInput.ExcludedAccountIDs = append(currentInput.ExcludedAccountIDs, account.ID)
  				}
@@ -3165,7 +3781,212 @@ index 8cfa424..86d573d 100644
  				continue
  			}
  			return nil, nil, nil, err
-@@ -1977,6 +2321,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
+@@ -1367,6 +1999,172 @@ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, accoun
+ 	return true
+ }
+ 
++type autoDistributeTarget struct {
++	Stat          SubsiteForwardSiteStat
++	ActiveLeases  int
++	PlannedLeases int
++	LoadScore     float64
++}
++
++func normalizeAutoDistributeLimit(limit int) int {
++	if limit < 0 {
++		return 0
++	}
++	if limit > 1000 {
++		return 1000
++	}
++	return limit
++}
++
++func normalizeAutoDistributeTTL(ttlSeconds int) time.Duration {
++	if ttlSeconds <= 0 {
++		return 24 * time.Hour
++	}
++	if ttlSeconds < 300 {
++		ttlSeconds = 300
++	}
++	if ttlSeconds > 30*24*3600 {
++		ttlSeconds = 30 * 24 * 3600
++	}
++	return time.Duration(ttlSeconds) * time.Second
++}
++
++func normalizeSubsiteIDSet(values []string) map[string]struct{} {
++	out := make(map[string]struct{}, len(values))
++	for _, value := range values {
++		value = strings.TrimSpace(value)
++		if value != "" {
++			out[value] = struct{}{}
++		}
++	}
++	return out
++}
++
++func isAutoDistributeSubsiteHealthy(stat SubsiteForwardSiteStat, includeUnhealthy bool) bool {
++	if includeUnhealthy {
++		return stat.Status != SubsiteStatusDisabled && stat.Status != SubsiteStatusMaintenance
++	}
++	if stat.Status != SubsiteStatusActive {
++		return false
++	}
++	if stat.CircuitOpen {
++		return false
++	}
++	if stat.HealthScore < 50 {
++		return false
++	}
++	if stat.LastHeartbeatAt == nil {
++		return false
++	}
++	return time.Since(*stat.LastHeartbeatAt) <= 3*time.Minute
++}
++
++func autoDistributeLoadScore(target *autoDistributeTarget) float64 {
++	if target == nil {
++		return math.MaxFloat64
++	}
++	stat := target.Stat
++	score := float64(target.ActiveLeases+target.PlannedLeases) * 10
++	score += float64(stat.ActiveRequests) * 3
++	score += float64(stat.QueuedUsage) * 2
++	score += stat.QPS * 2
++	if stat.CPUPercent > 0 {
++		score += stat.CPUPercent / 20
++	}
++	if stat.Events24h > 0 {
++		score += float64(stat.Failures24h) / float64(stat.Events24h) * 50
++	}
++	if stat.HealthScore < 100 {
++		score += float64(100-stat.HealthScore) / 5
++	}
++	if stat.CircuitOpen {
++		score += 1000
++	}
++	return score
++}
++
++func pickLeastLoadedSubsite(targets []*autoDistributeTarget) *autoDistributeTarget {
++	var selected *autoDistributeTarget
++	selectedScore := math.MaxFloat64
++	for _, target := range targets {
++		score := autoDistributeLoadScore(target)
++		if selected == nil || score < selectedScore || (score == selectedScore && target.Stat.SubsiteID < selected.Stat.SubsiteID) {
++			selected = target
++			selectedScore = score
++		}
++	}
++	return selected
++}
++
++func pickAutoDistributeGroupID(account *Account, preferredGroupID int64, preferredPlatform string) (int64, bool) {
++	if account == nil {
++		return 0, false
++	}
++	if preferredGroupID > 0 {
++		for _, group := range account.Groups {
++			if group == nil || group.ID != preferredGroupID {
++				continue
++			}
++			if isAutoDistributePublicGroup(account, group, preferredPlatform) {
++				return preferredGroupID, true
++			}
++			return 0, false
++		}
++		if account.OwnerUserID == nil && containsInt64(account.GroupIDs, preferredGroupID) {
++			return preferredGroupID, true
++		}
++		return 0, false
++	}
++	platform := strings.TrimSpace(preferredPlatform)
++	for _, group := range account.Groups {
++		if isAutoDistributePublicGroup(account, group, platform) {
++			return group.ID, true
++		}
++	}
++	if account.OwnerUserID == nil {
++		for _, groupID := range account.GroupIDs {
++			if groupID > 0 {
++				return groupID, true
++			}
++		}
++	}
++	return 0, false
++}
++
++func isAutoDistributeAccountCandidate(account *Account) bool {
++	if account == nil || !account.IsSchedulable() {
++		return false
++	}
++	if account.OwnerUserID == nil {
++		return true
++	}
++	return account.IsPublicShareApproved()
++}
++
++func isAutoDistributePublicGroup(account *Account, group *Group, preferredPlatform string) bool {
++	if account == nil || group == nil || !group.IsActive() {
++		return false
++	}
++	if group.OwnerUserID != nil || NormalizeGroupScope(group.Scope) != GroupScopePublic {
++		return false
++	}
++	platform := strings.TrimSpace(preferredPlatform)
++	if platform != "" && !strings.EqualFold(group.Platform, platform) {
++		return false
++	}
++	if account.Platform != "" && group.Platform != "" && !strings.EqualFold(group.Platform, account.Platform) {
++		return false
++	}
++	return true
++}
++
++func appendAutoDistributeItem(items []AutoDistributeAccountLeaseResult, item AutoDistributeAccountLeaseResult) []AutoDistributeAccountLeaseResult {
++	if len(items) >= 100 {
++		return items
++	}
++	return append(items, item)
++}
++
+ func containsStringTrimmed(values []string, target string) bool {
+ 	target = strings.TrimSpace(target)
+ 	if target == "" {
+@@ -1724,10 +2522,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
+ 	}
+ 	if result.ExpiredLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
+ 		log.Printf(
+-			"[SubsiteMaintenance] expired_leases=%d expired_reservations=%d unhealthy_subsites=%d",
++			"[SubsiteMaintenance] expired_leases=%d expired_reservations=%d unhealthy_subsites=%d released_invalid_leases=%d",
+ 			result.ExpiredLeases,
+ 			result.ExpiredReservations,
+ 			result.UnhealthySubsites,
++			result.ReleasedInvalidLeases,
+ 		)
+ 	}
+ }
+@@ -1756,6 +2555,10 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	releasedInvalidLeases, err := s.leaseRepo.ReleaseInvalid(ctx, "account unavailable for scheduling")
++	if err != nil {
++		return nil, err
++	}
+ 	unhealthySubsites, err := s.subsiteRepo.MarkHeartbeatTimeouts(ctx, now.Add(-heartbeatTimeout))
+ 	if err != nil {
+ 		return nil, err
+@@ -1764,6 +2567,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+ 		ExpiredLeases:              expiredLeases,
+ 		ExpiredReservations:        expiredReservations,
+ 		UnhealthySubsites:          unhealthySubsites,
++		ReleasedInvalidLeases:      releasedInvalidLeases,
+ 		HeartbeatTimeoutSecs:       int64(heartbeatTimeout.Seconds()),
+ 		ReservationExpiryGraceSecs: int64(reservationExpiryGrace.Seconds()),
+ 	}, nil
+@@ -1977,6 +2781,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
  	return copySubsiteMap(in)
  }
  
@@ -3183,11 +4004,557 @@ index 8cfa424..86d573d 100644
  func copySubsiteMap(in map[string]any) map[string]any {
  	if in == nil {
  		return map[string]any{}
+diff --git a/backend/internal/service/subsite_auto_distribution_test.go b/backend/internal/service/subsite_auto_distribution_test.go
+new file mode 100644
+index 0000000..f9db6d1
+--- /dev/null
++++ b/backend/internal/service/subsite_auto_distribution_test.go
+@@ -0,0 +1,482 @@
++package service
++
++import (
++	"context"
++	"testing"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++	"github.com/stretchr/testify/require"
++)
++
++type autoDistributionSubsiteRepoStub struct {
++	sites []SubsiteForwardSiteStat
++}
++
++func (s *autoDistributionSubsiteRepoStub) Create(context.Context, *Subsite) error {
++	panic("unexpected Create call")
++}
++func (s *autoDistributionSubsiteRepoStub) GetBySubsiteID(context.Context, string) (*Subsite, error) {
++	panic("unexpected GetBySubsiteID call")
++}
++func (s *autoDistributionSubsiteRepoStub) List(context.Context, pagination.PaginationParams, ListSubsitesFilter) ([]Subsite, *pagination.PaginationResult, error) {
++	panic("unexpected List call")
++}
++func (s *autoDistributionSubsiteRepoStub) Update(context.Context, *Subsite) error {
++	panic("unexpected Update call")
++}
++func (s *autoDistributionSubsiteRepoStub) UpdateStatus(context.Context, string, string) error {
++	panic("unexpected UpdateStatus call")
++}
++func (s *autoDistributionSubsiteRepoStub) UpdateSecret(context.Context, string, string, string) error {
++	panic("unexpected UpdateSecret call")
++}
++func (s *autoDistributionSubsiteRepoStub) RecordHeartbeat(context.Context, *SubsiteHeartbeat) error {
++	panic("unexpected RecordHeartbeat call")
++}
++func (s *autoDistributionSubsiteRepoStub) MarkHeartbeatTimeouts(context.Context, time.Time) (int64, error) {
++	panic("unexpected MarkHeartbeatTimeouts call")
++}
++func (s *autoDistributionSubsiteRepoStub) GetForwardAffinity(context.Context, string) (*SubsiteForwardAffinity, error) {
++	panic("unexpected GetForwardAffinity call")
++}
++func (s *autoDistributionSubsiteRepoStub) UpsertForwardAffinity(context.Context, UpsertSubsiteForwardAffinityInput) (*SubsiteForwardAffinity, error) {
++	panic("unexpected UpsertForwardAffinity call")
++}
++func (s *autoDistributionSubsiteRepoStub) DeleteForwardAffinity(context.Context, int64) error {
++	panic("unexpected DeleteForwardAffinity call")
++}
++func (s *autoDistributionSubsiteRepoStub) ListForwardAffinities(context.Context, pagination.PaginationParams, ListSubsiteForwardAffinitiesFilter) ([]SubsiteForwardAffinity, *pagination.PaginationResult, error) {
++	panic("unexpected ListForwardAffinities call")
++}
++func (s *autoDistributionSubsiteRepoStub) RecordForwardEvent(context.Context, *SubsiteForwardEvent) error {
++	panic("unexpected RecordForwardEvent call")
++}
++func (s *autoDistributionSubsiteRepoStub) ListForwardEvents(context.Context, pagination.PaginationParams, ListSubsiteForwardEventsFilter) ([]SubsiteForwardEvent, *pagination.PaginationResult, error) {
++	panic("unexpected ListForwardEvents call")
++}
++func (s *autoDistributionSubsiteRepoStub) ForwardStats(context.Context) (*SubsiteForwardStats, error) {
++	panic("unexpected ForwardStats call")
++}
++func (s *autoDistributionSubsiteRepoStub) ForwardRouteStats(context.Context) ([]SubsiteForwardSiteStat, error) {
++	return append([]SubsiteForwardSiteStat(nil), s.sites...), nil
++}
++func (s *autoDistributionSubsiteRepoStub) ListActiveCircuitBreakers(context.Context) ([]SubsiteCircuitBreaker, error) {
++	panic("unexpected ListActiveCircuitBreakers call")
++}
++
++type autoDistributionLeaseRepoStub struct {
++	activeBySubsite map[string][]AccountLease
++	effectiveIDs    []int64
++	created         []*AccountLease
++	expired         int64
++	releasedInvalid int64
++}
++
++func (s *autoDistributionLeaseRepoStub) Create(_ context.Context, lease *AccountLease) error {
++	cp := *lease
++	s.created = append(s.created, &cp)
++	s.effectiveIDs = append(s.effectiveIDs, lease.AccountID)
++	return nil
++}
++func (s *autoDistributionLeaseRepoStub) GetByLeaseID(context.Context, string) (*AccountLease, error) {
++	panic("unexpected GetByLeaseID call")
++}
++func (s *autoDistributionLeaseRepoStub) ListBySubsite(context.Context, string) ([]AccountLease, error) {
++	panic("unexpected ListBySubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) ListBySubsitePaginated(context.Context, string, pagination.PaginationParams) ([]AccountLease, *pagination.PaginationResult, error) {
++	panic("unexpected ListBySubsitePaginated call")
++}
++func (s *autoDistributionLeaseRepoStub) ListActiveBySubsite(_ context.Context, subsiteID string) ([]AccountLease, error) {
++	if s == nil || s.activeBySubsite == nil {
++		return nil, nil
++	}
++	return append([]AccountLease(nil), s.activeBySubsite[subsiteID]...), nil
++}
++func (s *autoDistributionLeaseRepoStub) ListActiveAccountIDsBySubsite(context.Context, string) ([]int64, error) {
++	panic("unexpected ListActiveAccountIDsBySubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) ListEffectiveAccountIDs(context.Context) ([]int64, error) {
++	return append([]int64(nil), s.effectiveIDs...), nil
++}
++func (s *autoDistributionLeaseRepoStub) UpdateLimitsForSubsite(context.Context, string, string, int, int, int64) (*AccountLease, error) {
++	panic("unexpected UpdateLimitsForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) Renew(context.Context, string, time.Time) (*AccountLease, error) {
++	panic("unexpected Renew call")
++}
++func (s *autoDistributionLeaseRepoStub) RenewForSubsite(context.Context, string, string, time.Time) (*AccountLease, error) {
++	panic("unexpected RenewForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) ExtendForSubsite(context.Context, string, string, time.Duration) (*AccountLease, error) {
++	panic("unexpected ExtendForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) Release(context.Context, string) (*AccountLease, error) {
++	panic("unexpected Release call")
++}
++func (s *autoDistributionLeaseRepoStub) ReleaseForSubsite(context.Context, string, string) (*AccountLease, error) {
++	panic("unexpected ReleaseForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) ReleaseInvalid(context.Context, string) (int64, error) {
++	return s.releasedInvalid, nil
++}
++func (s *autoDistributionLeaseRepoStub) Drain(context.Context, string) (*AccountLease, error) {
++	panic("unexpected Drain call")
++}
++func (s *autoDistributionLeaseRepoStub) DrainForSubsite(context.Context, string, string) (*AccountLease, error) {
++	panic("unexpected DrainForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) DeleteForSubsite(context.Context, string, string) (*AccountLease, error) {
++	panic("unexpected DeleteForSubsite call")
++}
++func (s *autoDistributionLeaseRepoStub) IncrementUsage(context.Context, string, int64, int64) error {
++	panic("unexpected IncrementUsage call")
++}
++func (s *autoDistributionLeaseRepoStub) ExpireStale(context.Context, time.Time) (int64, error) {
++	return s.expired, nil
++}
++
++type autoDistributionAccountRepoStub struct {
++	accounts []Account
++}
++
++func (s *autoDistributionAccountRepoStub) Create(context.Context, *Account) error {
++	panic("unexpected Create call")
++}
++func (s *autoDistributionAccountRepoStub) GetByID(context.Context, int64) (*Account, error) {
++	panic("unexpected GetByID call")
++}
++func (s *autoDistributionAccountRepoStub) GetByIDs(context.Context, []int64) ([]*Account, error) {
++	panic("unexpected GetByIDs call")
++}
++func (s *autoDistributionAccountRepoStub) ExistsByID(context.Context, int64) (bool, error) {
++	panic("unexpected ExistsByID call")
++}
++func (s *autoDistributionAccountRepoStub) GetByCRSAccountID(context.Context, string) (*Account, error) {
++	panic("unexpected GetByCRSAccountID call")
++}
++func (s *autoDistributionAccountRepoStub) FindByExtraField(context.Context, string, any) ([]Account, error) {
++	panic("unexpected FindByExtraField call")
++}
++func (s *autoDistributionAccountRepoStub) ListCRSAccountIDs(context.Context) (map[string]int64, error) {
++	panic("unexpected ListCRSAccountIDs call")
++}
++func (s *autoDistributionAccountRepoStub) Update(context.Context, *Account) error {
++	panic("unexpected Update call")
++}
++func (s *autoDistributionAccountRepoStub) Delete(context.Context, int64) error {
++	panic("unexpected Delete call")
++}
++func (s *autoDistributionAccountRepoStub) List(context.Context, pagination.PaginationParams) ([]Account, *pagination.PaginationResult, error) {
++	panic("unexpected List call")
++}
++func (s *autoDistributionAccountRepoStub) ListWithFilters(context.Context, pagination.PaginationParams, string, string, string, string, string, int64, int64, string) ([]Account, *pagination.PaginationResult, error) {
++	panic("unexpected ListWithFilters call")
++}
++func (s *autoDistributionAccountRepoStub) ListByGroup(context.Context, int64) ([]Account, error) {
++	panic("unexpected ListByGroup call")
++}
++func (s *autoDistributionAccountRepoStub) ListActive(context.Context) ([]Account, error) {
++	panic("unexpected ListActive call")
++}
++func (s *autoDistributionAccountRepoStub) ListByPlatform(context.Context, string) ([]Account, error) {
++	panic("unexpected ListByPlatform call")
++}
++func (s *autoDistributionAccountRepoStub) UpdateLastUsed(context.Context, int64) error {
++	panic("unexpected UpdateLastUsed call")
++}
++func (s *autoDistributionAccountRepoStub) BatchUpdateLastUsed(context.Context, map[int64]time.Time) error {
++	panic("unexpected BatchUpdateLastUsed call")
++}
++func (s *autoDistributionAccountRepoStub) SetError(context.Context, int64, string) error {
++	panic("unexpected SetError call")
++}
++func (s *autoDistributionAccountRepoStub) ClearError(context.Context, int64) error {
++	panic("unexpected ClearError call")
++}
++func (s *autoDistributionAccountRepoStub) SetSchedulable(context.Context, int64, bool) error {
++	panic("unexpected SetSchedulable call")
++}
++func (s *autoDistributionAccountRepoStub) AutoPauseExpiredAccounts(context.Context, time.Time) (int64, error) {
++	panic("unexpected AutoPauseExpiredAccounts call")
++}
++func (s *autoDistributionAccountRepoStub) BindGroups(context.Context, int64, []int64) error {
++	panic("unexpected BindGroups call")
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulable(context.Context) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableByGroupID(context.Context, int64) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableByPlatform(context.Context, string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableByGroupIDAndPlatform(context.Context, int64, string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableByPlatforms(context.Context, []string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableByGroupIDAndPlatforms(context.Context, int64, []string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableUngroupedByPlatform(context.Context, string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) ListSchedulableUngroupedByPlatforms(context.Context, []string) ([]Account, error) {
++	return append([]Account(nil), s.accounts...), nil
++}
++func (s *autoDistributionAccountRepoStub) SetRateLimited(context.Context, int64, time.Time) error {
++	panic("unexpected SetRateLimited call")
++}
++func (s *autoDistributionAccountRepoStub) SetModelRateLimit(context.Context, int64, string, time.Time) error {
++	panic("unexpected SetModelRateLimit call")
++}
++func (s *autoDistributionAccountRepoStub) SetOverloaded(context.Context, int64, time.Time) error {
++	panic("unexpected SetOverloaded call")
++}
++func (s *autoDistributionAccountRepoStub) SetTempUnschedulable(context.Context, int64, time.Time, string) error {
++	panic("unexpected SetTempUnschedulable call")
++}
++func (s *autoDistributionAccountRepoStub) ClearTempUnschedulable(context.Context, int64) error {
++	panic("unexpected ClearTempUnschedulable call")
++}
++func (s *autoDistributionAccountRepoStub) ClearRateLimit(context.Context, int64) error {
++	panic("unexpected ClearRateLimit call")
++}
++func (s *autoDistributionAccountRepoStub) ClearAntigravityQuotaScopes(context.Context, int64) error {
++	panic("unexpected ClearAntigravityQuotaScopes call")
++}
++func (s *autoDistributionAccountRepoStub) ClearModelRateLimits(context.Context, int64) error {
++	panic("unexpected ClearModelRateLimits call")
++}
++func (s *autoDistributionAccountRepoStub) UpdateSessionWindow(context.Context, int64, *time.Time, *time.Time, string) error {
++	panic("unexpected UpdateSessionWindow call")
++}
++func (s *autoDistributionAccountRepoStub) UpdateExtra(context.Context, int64, map[string]any) error {
++	panic("unexpected UpdateExtra call")
++}
++func (s *autoDistributionAccountRepoStub) BulkUpdate(context.Context, []int64, AccountBulkUpdate) (int64, error) {
++	panic("unexpected BulkUpdate call")
++}
++func (s *autoDistributionAccountRepoStub) IncrementQuotaUsed(context.Context, int64, float64) error {
++	panic("unexpected IncrementQuotaUsed call")
++}
++func (s *autoDistributionAccountRepoStub) ResetQuotaUsed(context.Context, int64) error {
++	panic("unexpected ResetQuotaUsed call")
++}
++
++func TestAccountLeaseServiceAutoDistributeAssignsLowestLoadSubsite(t *testing.T) {
++	now := time.Now()
++	group := &Group{ID: 10, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopePublic}
++	leaseRepo := &autoDistributionLeaseRepoStub{
++		activeBySubsite: map[string][]AccountLease{
++			"busy": {
++				{LeaseID: "lease_busy_1", AccountID: 9001, ExpiresAt: now.Add(time.Hour), Status: AccountLeaseStatusActive},
++				{LeaseID: "lease_busy_2", AccountID: 9002, ExpiresAt: now.Add(time.Hour), Status: AccountLeaseStatusActive},
++			},
++			"idle": {},
++		},
++		effectiveIDs:    []int64{9001, 9002},
++		expired:         1,
++		releasedInvalid: 2,
++	}
++	svc := NewAccountLeaseService(
++		leaseRepo,
++		&autoDistributionSubsiteRepoStub{sites: []SubsiteForwardSiteStat{
++			{
++				SubsiteID:       "busy",
++				Name:            "Busy",
++				Status:          SubsiteStatusActive,
++				HealthScore:     100,
++				LastHeartbeatAt: &now,
++				ActiveRequests:  8,
++				QueuedUsage:     3,
++				QPS:             5,
++			},
++			{
++				SubsiteID:       "idle",
++				Name:            "Idle",
++				Status:          SubsiteStatusActive,
++				HealthScore:     100,
++				LastHeartbeatAt: &now,
++			},
++		}},
++		&autoDistributionAccountRepoStub{accounts: []Account{
++			{ID: 1, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, GroupIDs: []int64{10}, Groups: []*Group{group}},
++			{ID: 2, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, GroupIDs: []int64{10}, Groups: []*Group{group}},
++		}},
++		nil,
++	)
++
++	result, err := svc.AutoDistribute(context.Background(), AutoDistributeAccountLeasesInput{
++		GroupID:    10,
++		Platform:   PlatformOpenAI,
++		Limit:      2,
++		TTLSeconds: 3600,
++	})
++
++	require.NoError(t, err)
++	require.Equal(t, int64(2), result.Assigned)
++	require.Equal(t, int64(1), result.ExpiredLeases)
++	require.Equal(t, int64(2), result.ReleasedInvalidLeases)
++	require.Len(t, leaseRepo.created, 2)
++	require.Equal(t, "idle", leaseRepo.created[0].SubsiteID)
++	require.Equal(t, "idle", leaseRepo.created[1].SubsiteID)
++}
++
++func TestAccountLeaseServiceAutoDistributeDryRunDoesNotCreate(t *testing.T) {
++	now := time.Now()
++	group := &Group{ID: 10, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopePublic}
++	leaseRepo := &autoDistributionLeaseRepoStub{}
++	svc := NewAccountLeaseService(
++		leaseRepo,
++		&autoDistributionSubsiteRepoStub{sites: []SubsiteForwardSiteStat{{
++			SubsiteID:       "edge",
++			Status:          SubsiteStatusActive,
++			HealthScore:     100,
++			LastHeartbeatAt: &now,
++		}}},
++		&autoDistributionAccountRepoStub{accounts: []Account{{
++			ID: 1, Platform: PlatformOpenAI, Status: StatusActive, Schedulable: true, GroupIDs: []int64{10}, Groups: []*Group{group},
++		}}},
++		nil,
++	)
++
++	result, err := svc.AutoDistribute(context.Background(), AutoDistributeAccountLeasesInput{
++		GroupID: 10,
++		DryRun:  true,
++	})
++
++	require.NoError(t, err)
++	require.True(t, result.DryRun)
++	require.Equal(t, int64(1), result.Assigned)
++	require.Empty(t, leaseRepo.created)
++	require.Zero(t, result.ExpiredLeases)
++	require.Zero(t, result.ReleasedInvalidLeases)
++	require.Equal(t, "planned", result.Items[0].Status)
++}
++
++func TestAccountLeaseServiceAutoDistributeSkipsPrivateOwnedAccounts(t *testing.T) {
++	now := time.Now()
++	ownerID := int64(42)
++	privateGroup := &Group{ID: 20, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopeUserPrivate, OwnerUserID: &ownerID}
++	leaseRepo := &autoDistributionLeaseRepoStub{}
++	svc := NewAccountLeaseService(
++		leaseRepo,
++		&autoDistributionSubsiteRepoStub{sites: []SubsiteForwardSiteStat{{
++			SubsiteID:       "edge",
++			Status:          SubsiteStatusActive,
++			HealthScore:     100,
++			LastHeartbeatAt: &now,
++		}}},
++		&autoDistributionAccountRepoStub{accounts: []Account{{
++			ID:          1,
++			Platform:    PlatformOpenAI,
++			Status:      StatusActive,
++			Schedulable: true,
++			OwnerUserID: &ownerID,
++			ShareMode:   AccountShareModePrivate,
++			ShareStatus: AccountShareStatusApproved,
++			GroupIDs:    []int64{20},
++			Groups:      []*Group{privateGroup},
++		}}},
++		nil,
++	)
++
++	result, err := svc.AutoDistribute(context.Background(), AutoDistributeAccountLeasesInput{
++		Platform: PlatformOpenAI,
++		DryRun:   true,
++	})
++
++	require.NoError(t, err)
++	require.Zero(t, result.Assigned)
++	require.Equal(t, int64(1), result.Skipped)
++	require.Empty(t, leaseRepo.created)
++	require.Len(t, result.Items, 1)
++	require.Equal(t, "skipped", result.Items[0].Status)
++	require.Contains(t, result.Items[0].Error, "public auto-distribution pool")
++}
++
++func TestAccountLeaseServiceAutoDistributeAllowsApprovedPublicOwnedAccounts(t *testing.T) {
++	now := time.Now()
++	ownerID := int64(42)
++	publicGroup := &Group{ID: 30, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopePublic}
++	leaseRepo := &autoDistributionLeaseRepoStub{}
++	svc := NewAccountLeaseService(
++		leaseRepo,
++		&autoDistributionSubsiteRepoStub{sites: []SubsiteForwardSiteStat{{
++			SubsiteID:       "edge",
++			Status:          SubsiteStatusActive,
++			HealthScore:     100,
++			LastHeartbeatAt: &now,
++		}}},
++		&autoDistributionAccountRepoStub{accounts: []Account{{
++			ID:          1,
++			Platform:    PlatformOpenAI,
++			Status:      StatusActive,
++			Schedulable: true,
++			OwnerUserID: &ownerID,
++			ShareMode:   AccountShareModePublic,
++			ShareStatus: AccountShareStatusApproved,
++			GroupIDs:    []int64{30},
++			Groups:      []*Group{publicGroup},
++		}}},
++		nil,
++	)
++
++	result, err := svc.AutoDistribute(context.Background(), AutoDistributeAccountLeasesInput{
++		GroupID:  30,
++		Platform: PlatformOpenAI,
++		DryRun:   true,
++	})
++
++	require.NoError(t, err)
++	require.Equal(t, int64(1), result.Assigned)
++	require.Equal(t, int64(0), result.Skipped)
++	require.Empty(t, leaseRepo.created)
++	require.Len(t, result.Items, 1)
++	require.Equal(t, "planned", result.Items[0].Status)
++	require.Equal(t, int64(30), result.Items[0].GroupID)
++}
++
++func TestAccountLeaseServiceAutoDistributeSkipsUnapprovedPublicOwnedAccounts(t *testing.T) {
++	now := time.Now()
++	ownerID := int64(42)
++	publicGroup := &Group{ID: 30, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopePublic}
++	leaseRepo := &autoDistributionLeaseRepoStub{}
++	svc := NewAccountLeaseService(
++		leaseRepo,
++		&autoDistributionSubsiteRepoStub{sites: []SubsiteForwardSiteStat{{
++			SubsiteID:       "edge",
++			Status:          SubsiteStatusActive,
++			HealthScore:     100,
++			LastHeartbeatAt: &now,
++		}}},
++		&autoDistributionAccountRepoStub{accounts: []Account{{
++			ID:          1,
++			Platform:    PlatformOpenAI,
++			Status:      StatusActive,
++			Schedulable: true,
++			OwnerUserID: &ownerID,
++			ShareMode:   AccountShareModePublic,
++			ShareStatus: AccountShareStatusPending,
++			GroupIDs:    []int64{30},
++			Groups:      []*Group{publicGroup},
++		}}},
++		nil,
++	)
++
++	result, err := svc.AutoDistribute(context.Background(), AutoDistributeAccountLeasesInput{
++		GroupID:  30,
++		Platform: PlatformOpenAI,
++		DryRun:   true,
++	})
++
++	require.NoError(t, err)
++	require.Zero(t, result.Assigned)
++	require.Equal(t, int64(1), result.Skipped)
++	require.Empty(t, leaseRepo.created)
++}
 diff --git a/backend/internal/service/subsite_usage_ingest_test.go b/backend/internal/service/subsite_usage_ingest_test.go
-index 9cf0c56..7ea0b8c 100644
+index 9cf0c56..8acbab8 100644
 --- a/backend/internal/service/subsite_usage_ingest_test.go
 +++ b/backend/internal/service/subsite_usage_ingest_test.go
-@@ -1139,6 +1139,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
+@@ -97,6 +97,9 @@ func (s *subsiteUsageLeaseRepoStub) ListActiveBySubsite(context.Context, string)
+ func (s *subsiteUsageLeaseRepoStub) ListActiveAccountIDsBySubsite(context.Context, string) ([]int64, error) {
+ 	panic("unexpected ListActiveAccountIDsBySubsite call")
+ }
++func (s *subsiteUsageLeaseRepoStub) ListEffectiveAccountIDs(context.Context) ([]int64, error) {
++	panic("unexpected ListEffectiveAccountIDs call")
++}
+ func (s *subsiteUsageLeaseRepoStub) UpdateLimitsForSubsite(context.Context, string, string, int, int, int64) (*AccountLease, error) {
+ 	panic("unexpected UpdateLimitsForSubsite call")
+ }
+@@ -106,12 +109,18 @@ func (s *subsiteUsageLeaseRepoStub) Renew(context.Context, string, time.Time) (*
+ func (s *subsiteUsageLeaseRepoStub) RenewForSubsite(context.Context, string, string, time.Time) (*AccountLease, error) {
+ 	panic("unexpected RenewForSubsite call")
+ }
++func (s *subsiteUsageLeaseRepoStub) ExtendForSubsite(context.Context, string, string, time.Duration) (*AccountLease, error) {
++	panic("unexpected ExtendForSubsite call")
++}
+ func (s *subsiteUsageLeaseRepoStub) Release(context.Context, string) (*AccountLease, error) {
+ 	panic("unexpected Release call")
+ }
+ func (s *subsiteUsageLeaseRepoStub) ReleaseForSubsite(context.Context, string, string) (*AccountLease, error) {
+ 	panic("unexpected ReleaseForSubsite call")
+ }
++func (s *subsiteUsageLeaseRepoStub) ReleaseInvalid(context.Context, string) (int64, error) {
++	panic("unexpected ReleaseInvalid call")
++}
+ func (s *subsiteUsageLeaseRepoStub) Drain(context.Context, string) (*AccountLease, error) {
+ 	panic("unexpected Drain call")
+ }
+@@ -518,6 +527,9 @@ func (s *subsiteAuthorizeLeaseRepoStub) ListActiveBySubsite(context.Context, str
+ func (s *subsiteAuthorizeLeaseRepoStub) ListActiveAccountIDsBySubsite(context.Context, string) ([]int64, error) {
+ 	panic("unexpected ListActiveAccountIDsBySubsite call")
+ }
++func (s *subsiteAuthorizeLeaseRepoStub) ListEffectiveAccountIDs(context.Context) ([]int64, error) {
++	panic("unexpected ListEffectiveAccountIDs call")
++}
+ func (s *subsiteAuthorizeLeaseRepoStub) UpdateLimitsForSubsite(context.Context, string, string, int, int, int64) (*AccountLease, error) {
+ 	panic("unexpected UpdateLimitsForSubsite call")
+ }
+@@ -527,12 +539,18 @@ func (s *subsiteAuthorizeLeaseRepoStub) Renew(context.Context, string, time.Time
+ func (s *subsiteAuthorizeLeaseRepoStub) RenewForSubsite(context.Context, string, string, time.Time) (*AccountLease, error) {
+ 	panic("unexpected RenewForSubsite call")
+ }
++func (s *subsiteAuthorizeLeaseRepoStub) ExtendForSubsite(context.Context, string, string, time.Duration) (*AccountLease, error) {
++	panic("unexpected ExtendForSubsite call")
++}
+ func (s *subsiteAuthorizeLeaseRepoStub) Release(context.Context, string) (*AccountLease, error) {
+ 	panic("unexpected Release call")
+ }
+ func (s *subsiteAuthorizeLeaseRepoStub) ReleaseForSubsite(context.Context, string, string) (*AccountLease, error) {
+ 	panic("unexpected ReleaseForSubsite call")
+ }
++func (s *subsiteAuthorizeLeaseRepoStub) ReleaseInvalid(context.Context, string) (int64, error) {
++	panic("unexpected ReleaseInvalid call")
++}
+ func (s *subsiteAuthorizeLeaseRepoStub) Drain(context.Context, string) (*AccountLease, error) {
+ 	panic("unexpected Drain call")
+ }
+@@ -1139,6 +1157,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
  	require.Equal(t, "lease_open", reservationRepo.created.LeaseID)
  }
  
@@ -4266,7 +5633,7 @@ index 0000000..a39e273
 +VALUES ('subsite_forward_mode', 'forward', NOW())
 +ON CONFLICT (key) DO NOTHING;
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
-index 7ff95d3..bd6ed44 100644
+index 7ff95d3..3670b5d 100644
 --- a/frontend/src/api/admin/index.ts
 +++ b/frontend/src/api/admin/index.ts
 @@ -115,4 +115,4 @@ export type { BackupAgentHealth, DataManagementConfig } from './dataManagement'
@@ -4274,9 +5641,9 @@ index 7ff95d3..bd6ed44 100644
  export type { RevenueSummary, RevenueSummaryParams } from './revenue'
  export type { AccountSharePolicy } from './accountSharePolicies'
 -export type { Subsite, AccountLease, ResetSubsiteSecretResult } from './subsites'
-+export type { Subsite, AccountLease, ResetSubsiteSecretResult, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from './subsites'
++export type { Subsite, AccountLease, ResetSubsiteSecretResult, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats, AutoDistributeLeasesResult } from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..4d369e4 100644
+index 1faa4eb..fdfb79a 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
 @@ -43,6 +43,141 @@ export interface AccountLease {
@@ -4421,10 +5788,87 @@ index 1faa4eb..4d369e4 100644
  export interface CreateSubsiteRequest {
    subsite_id?: string
    name: string
-@@ -187,6 +322,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+@@ -85,7 +220,9 @@ export interface CreateLeaseRequest {
+ }
+ 
+ export interface RenewLeaseRequest {
+-  ttl_seconds: number
++  ttl_seconds?: number
++  extend_seconds?: number
++  expires_at?: string
+ }
+ 
+ export interface UpdateLeaseRequest {
+@@ -94,6 +231,55 @@ export interface UpdateLeaseRequest {
+   max_tokens?: number
+ }
+ 
++export interface AutoDistributeLeasesRequest {
++  subsite_ids?: string[]
++  group_id?: number
++  platform?: string
++  limit?: number
++  ttl_seconds?: number
++  max_concurrency?: number
++  max_requests?: number
++  max_tokens?: number
++  dry_run?: boolean
++  skip_release_invalid?: boolean
++  include_unhealthy?: boolean
++}
++
++export interface AutoDistributeSubsiteResult {
++  subsite_id: string
++  name: string
++  assigned: number
++  active_leases: number
++  load_score: number
++  health_score: number
++  active_requests: number
++  queued_usage: number
++  qps: number
++}
++
++export interface AutoDistributeLeaseItem {
++  account_id: number
++  group_id?: number
++  platform: string
++  subsite_id?: string
++  lease_id?: string
++  status: string
++  error?: string
++}
++
++export interface AutoDistributeLeasesResult {
++  assigned: number
++  skipped: number
++  failed: number
++  candidates: number
++  target_subsites: number
++  expired_leases: number
++  released_invalid_leases: number
++  dry_run: boolean
++  by_subsite: AutoDistributeSubsiteResult[]
++  items?: AutoDistributeLeaseItem[]
++}
++
+ export async function list(
+   page = 1,
+   pageSize = 20,
+@@ -187,6 +373,65 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
    await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
  }
  
++export async function autoDistributeLeases(payload: AutoDistributeLeasesRequest): Promise<AutoDistributeLeasesResult> {
++  const { data } = await apiClient.post<AutoDistributeLeasesResult>('/admin/subsites/leases/auto-distribute', payload)
++  return data
++}
++
++export async function releaseInvalidLeases(): Promise<{ released_invalid_leases: number }> {
++  const { data } = await apiClient.post<{ released_invalid_leases: number }>('/admin/subsites/leases/release-invalid')
++  return data
++}
++
 +export async function forwardStats(): Promise<SubsiteForwardStats> {
 +  const { data } = await apiClient.get<SubsiteForwardStats>('/admin/subsites/forward-stats')
 +  return data
@@ -4477,12 +5921,14 @@ index 1faa4eb..4d369e4 100644
  export default {
    list,
    create,
-@@ -202,5 +386,11 @@ export default {
+@@ -202,5 +447,13 @@ export default {
    releaseLease,
    renewLease,
    updateLease,
 -  deleteLease
 +  deleteLease,
++  autoDistributeLeases,
++  releaseInvalidLeases,
 +  forwardStats,
 +  updateForwardMode,
 +  listForwardAffinities,
@@ -4504,7 +5950,7 @@ index d6c7269..279e44f 100644
      { path: '/admin/proxies', label: t('nav.proxies'), icon: ServerIcon },
      { path: '/admin/risk-control', label: t('nav.riskControl'), icon: ShieldIcon, hideInSimpleMode: true, featureFlag: flagRiskControl },
 diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
-index 070fb35..1b5b73c 100644
+index 070fb35..8055898 100644
 --- a/frontend/src/i18n/locales/en.ts
 +++ b/frontend/src/i18n/locales/en.ts
 @@ -356,6 +356,7 @@ export default {
@@ -4515,7 +5961,7 @@ index 070fb35..1b5b73c 100644
      proxies: 'Proxies',
      redeemCodes: 'Redeem Codes',
      ops: 'Ops',
-@@ -1718,6 +1719,176 @@ export default {
+@@ -1718,6 +1719,191 @@ export default {
          file: 'File',
        },
      },
@@ -4568,6 +6014,21 @@ index 070fb35..1b5b73c 100644
 +        copyEnv: 'Copy environment variables',
 +        repairing: 'Repairing...',
 +        resetSecret: 'Reset secret',
++      },
++      distribution: {
++        title: 'Account Auto Distribution',
++        description: 'Release unusable account leases first, then assign unleased schedulable accounts to the lowest-load healthy subsites.',
++        allGroups: 'All public groups',
++        allPlatforms: 'All platforms',
++        limit: 'Max accounts',
++        ttlHours: 'Lease TTL hours',
++        dryRun: 'Preview only',
++        skipCleanup: 'Skip invalid lease cleanup',
++        run: 'Auto distribute',
++        running: 'Distributing...',
++        releaseInvalid: 'Release invalid leases',
++        summary: 'Candidates {candidates}; assigned {assigned}, skipped {skipped}, failed {failed}; released invalid {released}, expired {expired}.',
++        releaseSummary: 'Released {count} invalid leases.',
 +      },
 +      forward: {
 +        requests24h: '24h Requests',
@@ -4634,7 +6095,7 @@ index 070fb35..1b5b73c 100644
 +      leases: {
 +        titleWithName: 'Leases - {name}',
 +        requestsUsage: 'Requests {used} / {max}',
-+        renew24h: 'Renew 24h',
++        renew24h: 'Extend 24h',
 +        drain: 'Drain',
 +        release: 'Release',
 +        createTitle: 'Create lease',
@@ -4666,7 +6127,7 @@ index 070fb35..1b5b73c 100644
 +        noAvailableAccounts: 'No active available account in this group',
 +        confirmUpdateSelected: 'Update request and max token settings for {count} leases?',
 +        bulkSummarySave: 'Bulk save completed: {success} succeeded, {failed} failed',
-+        actionRenew24h: 'renew for 24 hours',
++        actionRenew24h: 'extend for 24 hours',
 +        actionRelease: 'release',
 +        actionDelete: 'delete',
 +        confirmBulkAction: 'Confirm {action} for {count} leases?',
@@ -4693,7 +6154,7 @@ index 070fb35..1b5b73c 100644
      dashboard: {
        title: 'Admin Dashboard',
 diff --git a/frontend/src/i18n/locales/zh.ts b/frontend/src/i18n/locales/zh.ts
-index 4d928d7..18e01b8 100644
+index 4d928d7..f925c39 100644
 --- a/frontend/src/i18n/locales/zh.ts
 +++ b/frontend/src/i18n/locales/zh.ts
 @@ -356,6 +356,7 @@ export default {
@@ -4704,7 +6165,7 @@ index 4d928d7..18e01b8 100644
      proxies: 'IP管理',
      redeemCodes: '兑换码',
      ops: '运维监控',
-@@ -1722,6 +1723,176 @@ export default {
+@@ -1722,6 +1723,191 @@ export default {
          file: '文件',
        },
      },
@@ -4757,6 +6218,21 @@ index 4d928d7..18e01b8 100644
 +        copyEnv: '复制环境变量',
 +        repairing: '修复中...',
 +        resetSecret: '重置密钥',
++      },
++      distribution: {
++        title: '账号自动下发',
++        description: '先释放不可用账号的子站租约，再把未租出的可调度账号按负载分配到健康子站。',
++        allGroups: '全部公共分组',
++        allPlatforms: '全部平台',
++        limit: '最多账号数',
++        ttlHours: '租约 TTL 小时',
++        dryRun: '只预览不执行',
++        skipCleanup: '跳过异常租约清理',
++        run: '自动下发',
++        running: '下发中...',
++        releaseInvalid: '释放异常租约',
++        summary: '候选 {candidates} 个；下发 {assigned} 个，跳过 {skipped} 个，失败 {failed} 个；释放异常 {released} 个，过期 {expired} 个。',
++        releaseSummary: '已释放 {count} 个异常租约。',
 +      },
 +      forward: {
 +        requests24h: '24 小时请求',
@@ -4823,7 +6299,7 @@ index 4d928d7..18e01b8 100644
 +      leases: {
 +        titleWithName: '租约 - {name}',
 +        requestsUsage: '请求 {used} / {max}',
-+        renew24h: '续租 24h',
++        renew24h: '延长 24h',
 +        drain: '排空',
 +        release: '释放',
 +        createTitle: '新增租约',
@@ -4855,7 +6331,7 @@ index 4d928d7..18e01b8 100644
 +        noAvailableAccounts: '当前分组下没有可用活跃账号',
 +        confirmUpdateSelected: '确认更新 {count} 个租约的请求数和最大 Token 设置？',
 +        bulkSummarySave: '批量保存完成：成功 {success} 个，失败 {failed} 个',
-+        actionRenew24h: '续租 24 小时',
++        actionRenew24h: '延长 24 小时',
 +        actionRelease: '释放',
 +        actionDelete: '删除',
 +        confirmBulkAction: '确认{action} {count} 个租约？',
@@ -4897,10 +6373,10 @@ index f59b1e7..b9e73c6 100644
    },
    {
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..3b9e4dd 100644
+index cb5d3f8..b6458eb 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,19 +1,239 @@
+@@ -1,19 +1,280 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -4944,6 +6420,47 @@ index cb5d3f8..3b9e4dd 100644
 +            </button>
 +          </div>
 +          <p class="mt-2 text-xs text-gray-500">{{ t('admin.subsites.forward.policyHint', { count: forwardStats?.circuit_open ?? 0 }) }}</p>
++        </div>
++      </div>
++
++      <div class="rounded-2xl border border-emerald-200 bg-emerald-50/70 p-4 shadow-sm dark:border-emerald-900/40 dark:bg-emerald-950/20">
++        <div class="flex flex-col gap-4 xl:flex-row xl:items-end xl:justify-between">
++          <div class="max-w-2xl">
++            <h2 class="text-base font-semibold text-emerald-950 dark:text-emerald-100">{{ t('admin.subsites.distribution.title') }}</h2>
++            <p class="mt-1 text-sm text-emerald-800 dark:text-emerald-200">{{ t('admin.subsites.distribution.description') }}</p>
++            <p v-if="distributionSummary" class="mt-2 text-xs font-medium text-emerald-800 dark:text-emerald-200">{{ distributionSummary }}</p>
++          </div>
++          <div class="grid gap-2 sm:grid-cols-2 lg:grid-cols-4 xl:min-w-[42rem]">
++            <select v-model.number="distributionForm.group_id" class="input bg-white/90 dark:bg-dark-800">
++              <option :value="0">{{ t('admin.subsites.distribution.allGroups') }}</option>
++              <option v-for="group in leaseGroupOptions" :key="group.id" :value="group.id">{{ group.name }}</option>
++            </select>
++            <select v-model="distributionForm.platform" class="input bg-white/90 dark:bg-dark-800">
++              <option value="">{{ t('admin.subsites.distribution.allPlatforms') }}</option>
++              <option value="openai">OpenAI</option>
++              <option value="anthropic">Anthropic</option>
++              <option value="gemini">Gemini</option>
++              <option value="antigravity">Antigravity</option>
++            </select>
++            <input v-model.number="distributionForm.limit" type="number" min="0" max="1000" class="input bg-white/90 dark:bg-dark-800" :placeholder="t('admin.subsites.distribution.limit')" />
++            <input v-model.number="distributionForm.ttl_hours" type="number" min="1" class="input bg-white/90 dark:bg-dark-800" :placeholder="t('admin.subsites.distribution.ttlHours')" />
++          </div>
++        </div>
++        <div class="mt-3 flex flex-wrap items-center gap-2">
++          <label class="flex items-center gap-2 text-sm text-emerald-900 dark:text-emerald-100">
++            <input v-model="distributionForm.dry_run" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-emerald-600" />
++            {{ t('admin.subsites.distribution.dryRun') }}
++          </label>
++          <label class="flex items-center gap-2 text-sm text-emerald-900 dark:text-emerald-100">
++            <input v-model="distributionForm.skip_release_invalid" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-emerald-600" />
++            {{ t('admin.subsites.distribution.skipCleanup') }}
++          </label>
++          <button class="btn btn-primary" :disabled="distributionSaving" @click="autoDistributeLeases">
++            {{ distributionSaving ? t('admin.subsites.distribution.running') : t('admin.subsites.distribution.run') }}
++          </button>
++          <button class="btn btn-secondary" :disabled="distributionSaving" @click="releaseInvalidLeases">
++            {{ t('admin.subsites.distribution.releaseInvalid') }}
++          </button>
 +        </div>
 +      </div>
 +
@@ -5147,7 +6664,7 @@ index cb5d3f8..3b9e4dd 100644
            </select>
            <div class="ml-auto flex flex-wrap gap-2">
              <button class="btn btn-secondary" :disabled="loading" @click="reload">
-@@ -21,7 +241,7 @@
+@@ -21,7 +282,7 @@
              </button>
              <button class="btn btn-primary" @click="openCreate">
                <Icon name="plus" size="md" class="mr-2" />
@@ -5156,7 +6673,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
            </div>
          </div>
-@@ -36,8 +256,11 @@
+@@ -36,8 +297,11 @@
              </div>
            </template>
  
@@ -5170,7 +6687,7 @@ index cb5d3f8..3b9e4dd 100644
            </template>
  
            <template #cell-public_url="{ value }">
-@@ -46,7 +269,7 @@
+@@ -46,7 +310,7 @@
                  {{ value }}
                </a>
                <span v-else class="text-sm text-gray-400">-</span>
@@ -5179,7 +6696,7 @@ index cb5d3f8..3b9e4dd 100644
                  <Icon name="copy" size="sm" />
                </button>
              </div>
-@@ -54,26 +277,26 @@
+@@ -54,26 +318,26 @@
  
            <template #cell-health_score="{ row }">
              <div class="flex flex-col gap-1">
@@ -5215,7 +6732,7 @@ index cb5d3f8..3b9e4dd 100644
              </div>
            </template>
          </DataTable>
-@@ -91,88 +314,88 @@
+@@ -91,88 +355,88 @@
        </template>
      </TablePageLayout>
  
@@ -5327,7 +6844,7 @@ index cb5d3f8..3b9e4dd 100644
        <div class="grid gap-6 xl:grid-cols-[minmax(0,1fr)_24rem]">
          <div class="min-w-0">
            <DataTable :columns="leaseColumns" :data="leases" :loading="leasesLoading">
-@@ -210,7 +433,7 @@
+@@ -210,7 +474,7 @@
              </template>
              <template #cell-usage="{ row }">
                <div class="text-sm text-gray-700 dark:text-gray-200">
@@ -5336,7 +6853,7 @@ index cb5d3f8..3b9e4dd 100644
                  <br />
                  Token {{ row.used_tokens }} / {{ row.max_tokens || '-' }}
                </div>
-@@ -220,10 +443,10 @@
+@@ -220,10 +484,10 @@
              </template>
              <template #cell-actions="{ row }">
                <div class="flex flex-wrap justify-end gap-1.5">
@@ -5351,7 +6868,7 @@ index cb5d3f8..3b9e4dd 100644
                </div>
              </template>
            </DataTable>
-@@ -241,26 +464,26 @@
+@@ -241,26 +505,26 @@
          <div class="space-y-4">
          <form class="space-y-4 rounded-lg border border-gray-200 p-4 dark:border-dark-500" @submit.prevent="createLease">
            <div>
@@ -5385,7 +6902,7 @@ index cb5d3f8..3b9e4dd 100644
                <option v-for="account in filteredAccountOptions" :key="account.id" :value="account.id">{{ account.label }}</option>
              </select>
              <div v-else class="rounded border border-dashed border-gray-300 px-3 py-2 text-sm text-gray-500 dark:border-dark-500 dark:text-gray-400">
-@@ -269,19 +492,19 @@
+@@ -269,19 +533,19 @@
              <p v-if="leaseBulkSummary" class="text-xs text-gray-500 dark:text-gray-400">{{ leaseBulkSummary }}</p>
            </label>
            <label class="form-field">
@@ -5409,7 +6926,7 @@ index cb5d3f8..3b9e4dd 100644
              <input
                v-model.number="leaseRandomCount"
                type="number"
-@@ -293,7 +516,7 @@
+@@ -293,7 +557,7 @@
            </label>
            <div class="grid gap-2 sm:grid-cols-2 xl:grid-cols-1 2xl:grid-cols-2">
              <button type="submit" class="btn btn-primary w-full" :disabled="leaseSaving || leaseBulkSaving || leaseForm.account_id <= 0">
@@ -5418,7 +6935,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
              <button
                type="button"
-@@ -301,7 +524,7 @@
+@@ -301,7 +565,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createAllVisibleLeases"
              >
@@ -5427,7 +6944,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
              <button
                type="button"
-@@ -309,7 +532,7 @@
+@@ -309,7 +573,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(10)"
              >
@@ -5436,7 +6953,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
              <button
                type="button"
-@@ -317,7 +540,7 @@
+@@ -317,7 +581,7 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0"
                @click="createRandomLeases(20)"
              >
@@ -5445,7 +6962,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
              <button
                type="button"
-@@ -325,39 +548,39 @@
+@@ -325,39 +589,39 @@
                :disabled="leaseSaving || leaseBulkSaving || leaseAccountsLoading || bulkLeaseAccounts.length === 0 || normalizedLeaseRandomCount <= 0"
                @click="createRandomLeases(normalizedLeaseRandomCount)"
              >
@@ -5495,7 +7012,7 @@ index cb5d3f8..3b9e4dd 100644
              </button>
            </div>
          </form>
-@@ -368,9 +591,9 @@
+@@ -368,9 +632,9 @@
  </template>
  
  <script setup lang="ts">
@@ -5503,11 +7020,11 @@ index cb5d3f8..3b9e4dd 100644
 +import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue'
  import { adminAPI } from '@/api/admin'
 -import type { AccountLease, ResetSubsiteSecretResult, Subsite } from '@/api/admin'
-+import type { AccountLease, ResetSubsiteSecretResult, Subsite, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from '@/api/admin'
++import type { AccountLease, AutoDistributeLeasesResult, ResetSubsiteSecretResult, Subsite, SubsiteForwardAffinity, SubsiteForwardEvent, SubsiteForwardStats } from '@/api/admin'
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -380,8 +603,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
+@@ -380,8 +644,12 @@ import BaseDialog from '@/components/common/BaseDialog.vue'
  import Icon from '@/components/icons/Icon.vue'
  import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
@@ -5520,25 +7037,27 @@ index cb5d3f8..3b9e4dd 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,12 +621,17 @@ const leaseBulkSaving = ref(false)
+@@ -394,12 +662,19 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
 +const forwardLoading = ref(false)
 +const forwardSaving = ref(false)
 +const forwardModeSaving = ref(false)
++const distributionSaving = ref(false)
 +const forwardModeForm = ref('forward')
  const search = ref('')
  const status = ref('')
  const leaseAccountSearch = ref('')
  const leaseBulkSummary = ref('')
++const distributionSummary = ref('')
  const leaseRandomCount = ref(10)
  const searchTimer = ref<number | undefined>()
 +const forwardRefreshTimer = ref<number | undefined>()
  const showForm = ref(false)
  const editing = ref<Subsite | null>(null)
  const createdSecret = ref('')
-@@ -408,6 +640,7 @@ const resetTarget = ref<Subsite | null>(null)
+@@ -408,6 +683,7 @@ const resetTarget = ref<Subsite | null>(null)
  const resetSecretResult = ref<ResetSubsiteSecretResult | null>(null)
  const capabilitiesText = ref('openai,claude,gemini,images,websocket')
  const { copyToClipboard } = useClipboard()
@@ -5546,9 +7065,18 @@ index cb5d3f8..3b9e4dd 100644
  
  const resetEnvText = computed(() => {
    if (!resetTarget.value || !resetSecretResult.value) return ''
-@@ -443,6 +676,15 @@ const leaseBulkEditForm = reactive({
+@@ -442,7 +718,24 @@ const leaseBulkEditForm = reactive({
+   max_requests: 0,
    max_tokens: 0
  })
++const distributionForm = reactive({
++  group_id: 0,
++  platform: '',
++  limit: 100,
++  ttl_hours: 24,
++  dry_run: false,
++  skip_release_invalid: false
++})
  const selectedLeaseIDs = ref<Set<string>>(new Set())
 +const forwardLockForm = reactive({
 +  affinity_key: '',
@@ -5562,7 +7090,7 @@ index cb5d3f8..3b9e4dd 100644
  
  const leaseGroupOptions = computed(() => leaseGroups.value
    .filter((group) => group.status === 'active')
-@@ -485,30 +727,30 @@ const leaseBulkProgress = reactive({
+@@ -485,30 +778,30 @@ const leaseBulkProgress = reactive({
  })
  
  const leaseAccountEmptyText = computed(() => {
@@ -5610,7 +7138,7 @@ index cb5d3f8..3b9e4dd 100644
  ])
  
  async function reload(): Promise<void> {
-@@ -520,11 +762,90 @@ async function reload(): Promise<void> {
+@@ -520,11 +813,133 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -5628,7 +7156,8 @@ index cb5d3f8..3b9e4dd 100644
 +    await Promise.all([
 +      loadForwardStats(),
 +      loadForwardAffinities(),
-+      loadForwardEvents()
++      loadForwardEvents(),
++      loadLeaseGroups()
 +    ])
 +  } finally {
 +    forwardLoading.value = false
@@ -5698,10 +7227,60 @@ index cb5d3f8..3b9e4dd 100644
 +  }
 +}
 +
++async function autoDistributeLeases(): Promise<void> {
++  distributionSaving.value = true
++  distributionSummary.value = ''
++  try {
++    const result = await adminAPI.subsites.autoDistributeLeases({
++      group_id: distributionForm.group_id > 0 ? distributionForm.group_id : undefined,
++      platform: distributionForm.platform || undefined,
++      limit: normalizeNonNegativeNumber(distributionForm.limit),
++      ttl_seconds: Math.max(1, normalizeNonNegativeNumber(distributionForm.ttl_hours)) * 3600,
++      dry_run: distributionForm.dry_run,
++      skip_release_invalid: distributionForm.skip_release_invalid
++    })
++    distributionSummary.value = distributionResultSummary(result)
++    await Promise.all([loadForwardConsole(), leaseSubsite.value ? loadLeases() : Promise.resolve()])
++  } finally {
++    distributionSaving.value = false
++  }
++}
++
++async function releaseInvalidLeases(): Promise<void> {
++  distributionSaving.value = true
++  distributionSummary.value = ''
++  try {
++    const result = await adminAPI.subsites.releaseInvalidLeases()
++    distributionSummary.value = t('admin.subsites.distribution.releaseSummary', { count: result.released_invalid_leases || 0 })
++    await Promise.all([loadForwardConsole(), leaseSubsite.value ? loadLeases() : Promise.resolve()])
++  } finally {
++    distributionSaving.value = false
++  }
++}
++
++function distributionResultSummary(result: AutoDistributeLeasesResult): string {
++  return t('admin.subsites.distribution.summary', {
++    assigned: result.assigned || 0,
++    skipped: result.skipped || 0,
++    failed: result.failed || 0,
++    candidates: result.candidates || 0,
++    released: result.released_invalid_leases || 0,
++    expired: result.expired_leases || 0
++  })
++}
++
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -776,7 +1097,7 @@ async function createLease(): Promise<void> {
+@@ -708,6 +1123,7 @@ async function loadLeaseAccounts(): Promise<void> {
+ }
+ 
+ async function loadLeaseGroups(): Promise<void> {
++  if (leaseGroups.value.length > 0) return
+   leaseGroups.value = await adminAPI.groups.getAll(undefined, 'public')
+ }
+ 
+@@ -776,7 +1192,7 @@ async function createLease(): Promise<void> {
  async function updateSelectedLeaseLimits(): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -5710,7 +7289,7 @@ index cb5d3f8..3b9e4dd 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -800,7 +1121,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -800,7 +1216,7 @@ async function updateSelectedLeaseLimits(): Promise<void> {
          leaseBulkProgress.done += 1
        }
      }
@@ -5719,14 +7298,15 @@ index cb5d3f8..3b9e4dd 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -809,21 +1130,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
+@@ -809,21 +1225,21 @@ async function updateSelectedLeaseLimits(): Promise<void> {
  }
  
  async function renewSelectedLeases(): Promise<void> {
 -  await runSelectedLeaseAction('续租 24 小时', async (leaseID) => {
 +  await runSelectedLeaseAction(t('admin.subsites.leases.actionRenew24h'), async (leaseID) => {
      if (!leaseSubsite.value) return
-     await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, leaseID, { ttl_seconds: 24 * 3600 })
+-    await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, leaseID, { ttl_seconds: 24 * 3600 })
++    await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, leaseID, { extend_seconds: 24 * 3600 })
    })
  }
  
@@ -5744,7 +7324,7 @@ index cb5d3f8..3b9e4dd 100644
      if (!leaseSubsite.value) return
      await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, leaseID)
    })
-@@ -832,7 +1153,7 @@ async function deleteSelectedLeases(): Promise<void> {
+@@ -832,7 +1248,7 @@ async function deleteSelectedLeases(): Promise<void> {
  async function runSelectedLeaseAction(label: string, action: (leaseID: string) => Promise<void>): Promise<void> {
    if (!leaseSubsite.value || selectedLeaseIDs.value.size === 0) return
    const leaseIDs = [...selectedLeaseIDs.value]
@@ -5753,7 +7333,7 @@ index cb5d3f8..3b9e4dd 100644
    if (!confirmed) return
  
    leaseBulkUpdating.value = true
-@@ -852,7 +1173,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -852,7 +1268,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
          leaseBulkProgress.done += 1
        }
      }
@@ -5762,7 +7342,7 @@ index cb5d3f8..3b9e4dd 100644
      selectedLeaseIDs.value = new Set()
      await loadLeases()
    } finally {
-@@ -863,7 +1184,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
+@@ -863,7 +1279,7 @@ async function runSelectedLeaseAction(label: string, action: (leaseID: string) =
  async function createAllVisibleLeases(): Promise<void> {
    if (!leaseSubsite.value || bulkLeaseAccounts.value.length === 0) return
    const accounts = [...bulkLeaseAccounts.value]
@@ -5771,7 +7351,7 @@ index cb5d3f8..3b9e4dd 100644
  }
  
  async function createRandomLeases(count: number): Promise<void> {
-@@ -871,7 +1192,7 @@ async function createRandomLeases(count: number): Promise<void> {
+@@ -871,7 +1287,7 @@ async function createRandomLeases(count: number): Promise<void> {
    const normalizedCount = Math.min(Math.max(Math.floor(count), 0), bulkLeaseAccounts.value.length)
    if (normalizedCount <= 0) return
    const accounts = shuffleAccounts(bulkLeaseAccounts.value).slice(0, normalizedCount)
@@ -5780,7 +7360,7 @@ index cb5d3f8..3b9e4dd 100644
  }
  
  async function createBulkLeases(accounts: Account[], confirmMessage: string): Promise<void> {
-@@ -896,7 +1217,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
+@@ -896,7 +1312,7 @@ async function createBulkLeases(accounts: Account[], confirmMessage: string): Pr
          leaseBulkProgress.done += 1
        }
      }
@@ -5789,7 +7369,7 @@ index cb5d3f8..3b9e4dd 100644
      leaseForm.account_id = 0
      leasePagination.page = 1
      await loadLeases()
-@@ -934,7 +1255,7 @@ function normalizeNonNegativeNumber(value: number): number {
+@@ -934,7 +1350,7 @@ function normalizeNonNegativeNumber(value: number): number {
  function accountOptionLabel(account: Account): string {
    const parts = [`#${account.id}`, account.name || account.platform || 'account']
    if (account.account_level && account.account_level !== 'unknown') parts.push(account.account_level)
@@ -5798,7 +7378,16 @@ index cb5d3f8..3b9e4dd 100644
    return parts.join(' · ')
  }
  
-@@ -970,7 +1291,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
+@@ -951,7 +1367,7 @@ function accountSearchText(account: Account): string {
+ 
+ async function renewLease(row: AccountLease): Promise<void> {
+   if (!leaseSubsite.value) return
+-  await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, row.lease_id, { ttl_seconds: 24 * 3600 })
++  await adminAPI.subsites.renewLease(leaseSubsite.value.subsite_id, row.lease_id, { extend_seconds: 24 * 3600 })
+   await loadLeases()
+ }
+ 
+@@ -970,7 +1386,7 @@ async function releaseLease(row: AccountLease): Promise<void> {
  
  async function deleteLease(row: AccountLease): Promise<void> {
    if (!leaseSubsite.value) return
@@ -5807,7 +7396,7 @@ index cb5d3f8..3b9e4dd 100644
    if (!confirmed) return
    await adminAPI.subsites.deleteLease(leaseSubsite.value.subsite_id, row.lease_id)
    selectedLeaseIDs.value = new Set([...selectedLeaseIDs.value].filter((leaseID) => leaseID !== row.lease_id))
-@@ -995,15 +1316,46 @@ async function copyClientConfig(row: Subsite): Promise<void> {
+@@ -995,15 +1411,46 @@ async function copyClientConfig(row: Subsite): Promise<void> {
  }
  
  function statusLabel(value: string): string {
@@ -5856,7 +7445,7 @@ index cb5d3f8..3b9e4dd 100644
  }
  
  function leaseStatusClass(value: string): string {
-@@ -1015,7 +1367,7 @@ function leaseGroupLabel(row: AccountLease): string {
+@@ -1015,7 +1462,7 @@ function leaseGroupLabel(row: AccountLease): string {
  }
  
  function leaseGroupMeta(row: AccountLease): string {
@@ -5865,7 +7454,7 @@ index cb5d3f8..3b9e4dd 100644
  }
  
  function leaseAccountLabel(row: AccountLease): string {
-@@ -1027,7 +1379,30 @@ function formatDate(value?: string): string {
+@@ -1027,7 +1474,30 @@ function formatDate(value?: string): string {
    return new Date(value).toLocaleString()
  }
  
