@@ -1,10 +1,10 @@
 diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
-index c787b21..8bc7aa7 100644
+index c787b21..244e9e0 100644
 --- a/backend/cmd/server/VERSION
 +++ b/backend/cmd/server/VERSION
 @@ -1 +1 @@
 -1.0.22
-+1.0.20.3
++1.0.20.4
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index a9ac9bd..02bc7ae 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -1466,7 +1466,7 @@ index 195fb06..1fc4d98 100644
  
  // DefaultTestModel is the default model to preselect in test flows.
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..070e3d5 100644
+index 782fff0..beeb9cf 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -258,7 +258,7 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -2144,22 +2144,24 @@ index 782fff0..070e3d5 100644
  func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, subsiteID, leaseID string, maxConcurrency int, maxRequests int, maxTokens int64) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
-@@ -492,7 +1135,7 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
+@@ -492,19 +1135,34 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
  func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
 -		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+-		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing')
 +		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
- 		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing')
++		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing', 'expired')
  	`, expiresAt, strings.TrimSpace(leaseID))
  }
-@@ -500,11 +1143,26 @@ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expi
+ 
  func (r *accountLeaseRepository) RenewForSubsite(ctx context.Context, subsiteID, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
  	return r.updateLease(ctx, `
  		UPDATE account_leases
 -		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+-		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
 +		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
- 		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
++		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing', 'expired')
  	`, expiresAt, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
  }
  
@@ -2174,7 +2176,7 @@ index 782fff0..070e3d5 100644
 +			expires_at = GREATEST(expires_at, NOW()) + ($1::bigint * INTERVAL '1 second'),
 +			renewed_at = NOW(),
 +			updated_at = NOW()
-+		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
++		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing', 'expired')
 +	`, seconds, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
 +}
 +
@@ -3224,7 +3226,7 @@ index 46f5e7c..5f4c607 100644
  	EnableFingerprintUnification       bool // 是否统一 OAuth 账号的指纹头（默认 true）
  	EnableMetadataPassthrough          bool // 是否透传客户端原始 metadata（默认 false）
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..7f09ded 100644
+index 8cfa424..f1e607c 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -12,6 +12,7 @@ import (
@@ -4008,8 +4010,10 @@ index 8cfa424..7f09ded 100644
 +	leaseID := strings.TrimSpace(input.LeaseID)
 +	subsiteID := strings.TrimSpace(input.SubsiteID)
 +	if leaseID == "" {
-+		return nil, ErrSubsiteInvalidInput
-+	}
+ 		return nil, ErrSubsiteInvalidInput
+ 	}
+-	if subsiteID := strings.TrimSpace(input.SubsiteID); subsiteID != "" {
+-		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
 +	extendBy := input.ExtendBy
 +	if extendBy <= 0 && input.ExtendSeconds > 0 {
 +		extendBy = time.Duration(input.ExtendSeconds) * time.Second
@@ -4019,16 +4023,14 @@ index 8cfa424..7f09ded 100644
 +			return nil, ErrSubsiteInvalidInput
 +		}
 +		return s.leaseRepo.ExtendForSubsite(ctx, subsiteID, leaseID, extendBy)
-+	}
-+	if !input.ExpiresAt.After(time.Now()) {
- 		return nil, ErrSubsiteInvalidInput
- 	}
--	if subsiteID := strings.TrimSpace(input.SubsiteID); subsiteID != "" {
--		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
-+	if subsiteID != "" {
-+		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, leaseID, input.ExpiresAt)
  	}
 -	return s.leaseRepo.Renew(ctx, strings.TrimSpace(input.LeaseID), input.ExpiresAt)
++	if !input.ExpiresAt.After(time.Now()) {
++		return nil, ErrSubsiteInvalidInput
++	}
++	if subsiteID != "" {
++		return s.leaseRepo.RenewForSubsite(ctx, subsiteID, leaseID, input.ExpiresAt)
++	}
 +	return s.leaseRepo.Renew(ctx, leaseID, input.ExpiresAt)
  }
  
@@ -4047,7 +4049,7 @@ index 8cfa424..7f09ded 100644
  func (s *AccountLeaseService) Drain(ctx context.Context, leaseID string) (*AccountLease, error) {
  	return s.leaseRepo.Drain(ctx, strings.TrimSpace(leaseID))
  }
-@@ -1170,52 +1829,58 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1170,53 +1829,68 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  		return nil, nil, err
  	}
  	now := time.Now()
@@ -4087,16 +4089,6 @@ index 8cfa424..7f09ded 100644
 -			continue
 -		}
 -		if input.Platform != "" && lease.Platform != "" && !strings.EqualFold(lease.Platform, input.Platform) {
--			continue
--		}
--		account, err := s.accountRepo.GetByID(ctx, lease.AccountID)
--		if err != nil {
--			return nil, nil, err
--		}
--		if account == nil || !account.IsSchedulable() {
--			continue
--		}
--		if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
 -			continue
 +		for i := range leases {
 +			lease := &leases[i]
@@ -4142,14 +4134,31 @@ index 8cfa424..7f09ded 100644
 +			}
 +			return lease, account, nil
  		}
+-		account, err := s.accountRepo.GetByID(ctx, lease.AccountID)
++	}
++	if !input.PreferredStrict && isPrivateSubsiteAutoLeaseEligible(apiKey) {
++		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
+ 		if err != nil {
+ 			return nil, nil, err
+ 		}
+-		if account == nil || !account.IsSchedulable() {
+-			continue
+-		}
+-		if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
+-			continue
++		if lease != nil && account != nil {
++			return lease, account, nil
+ 		}
 -		return lease, account, nil
  	}
 -	if !preferredOnly && isPrivateSubsiteAutoLeaseEligible(apiKey) {
-+	if !input.PreferredStrict && isPrivateSubsiteAutoLeaseEligible(apiKey) {
- 		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
+-		lease, account, err := s.ensurePrivateLease(ctx, input, apiKey, groupID)
++	if !input.PreferredStrict && isPublicSubsiteAutoLeaseEligible(apiKey) {
++		lease, account, err := s.ensurePublicLease(ctx, input, apiKey, groupID)
  		if err != nil {
  			return nil, nil, err
-@@ -1224,7 +1889,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+ 		}
+@@ -1224,7 +1898,7 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return lease, account, nil
  		}
  	}
@@ -4158,7 +4167,30 @@ index 8cfa424..7f09ded 100644
  		return nil, nil, ErrSubsiteAuthorizeNoLease
  	}
  	return nil, nil, ErrSubsiteAuthorizeNoLease
-@@ -1289,7 +1954,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1246,6 +1920,22 @@ func isPrivateSubsiteAutoLeaseEligible(apiKey *APIKey) bool {
+ 	return true
+ }
+ 
++func isPublicSubsiteAutoLeaseEligible(apiKey *APIKey) bool {
++	if apiKey == nil || apiKey.Group == nil {
++		return false
++	}
++	if apiKey.GroupID == nil || *apiKey.GroupID <= 0 {
++		return false
++	}
++	if !apiKey.Group.IsActive() {
++		return false
++	}
++	if apiKey.Group.OwnerUserID != nil || NormalizeGroupScope(apiKey.Group.Scope) != GroupScopePublic {
++		return false
++	}
++	return true
++}
++
+ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+ 	ctx context.Context,
+ 	input AuthorizeSubsiteRequestInput,
+@@ -1289,7 +1979,7 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  			ExpiresAt:          expiresAt,
  		}
  		if err := s.reservationRepo.Create(ctx, reservation); err != nil {
@@ -4167,7 +4199,7 @@ index 8cfa424..7f09ded 100644
  				if _, seen := triedLeaseIDs[lease.LeaseID]; !seen {
  					triedLeaseIDs[lease.LeaseID] = struct{}{}
  					currentInput.ExcludedLeaseIDs = append(currentInput.ExcludedLeaseIDs, lease.LeaseID)
-@@ -1298,6 +1963,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1298,6 +1988,8 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  					triedAccountIDs[account.ID] = struct{}{}
  					currentInput.ExcludedAccountIDs = append(currentInput.ExcludedAccountIDs, account.ID)
  				}
@@ -4176,10 +4208,159 @@ index 8cfa424..7f09ded 100644
  				continue
  			}
  			return nil, nil, nil, err
-@@ -1367,6 +2034,210 @@ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, accoun
+@@ -1339,6 +2031,75 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+ 		}
+ 		if err := s.leaseRepo.Create(ctx, lease); err != nil {
+ 			if errors.Is(err, ErrAccountLeaseConflict) {
++				lease, leasedAccount, findErr := s.findActiveLeaseCandidate(ctx, input, groupID)
++				if findErr != nil {
++					return nil, nil, findErr
++				}
++				if lease != nil && leasedAccount != nil {
++					return lease, leasedAccount, nil
++				}
++				continue
++			}
++			return nil, nil, err
++		}
++		return lease, account, nil
++	}
++	return nil, nil, nil
++}
++
++func (s *RequestAuthorizeService) ensurePublicLease(ctx context.Context, input AuthorizeSubsiteRequestInput, apiKey *APIKey, groupID int64) (*AccountLease, *Account, error) {
++	if s == nil || s.accountRepo == nil || s.leaseRepo == nil || apiKey == nil || apiKey.Group == nil {
++		return nil, nil, nil
++	}
++	if groupID <= 0 || strings.TrimSpace(input.SubsiteID) == "" {
++		return nil, nil, nil
++	}
++	if !isPublicSubsiteAutoLeaseEligible(apiKey) {
++		return nil, nil, nil
++	}
++	if _, err := s.leaseRepo.ExpireStale(ctx, time.Now()); err != nil {
++		return nil, nil, err
++	}
++	platform := strings.TrimSpace(input.Platform)
++	if platform == "" {
++		platform = strings.TrimSpace(apiKey.Group.Platform)
++	}
++	if platform == "" {
++		return nil, nil, nil
++	}
++	accounts, err := s.accountRepo.ListSchedulableByGroupIDAndPlatform(ctx, groupID, platform)
++	if err != nil {
++		return nil, nil, err
++	}
++	now := time.Now()
++	for i := range accounts {
++		account := &accounts[i]
++		if containsInt64(input.ExcludedAccountIDs, account.ID) {
++			continue
++		}
++		if !isPublicLeaseCandidate(groupID, platform, account) {
++			continue
++		}
++		lease := &AccountLease{
++			LeaseID:        "lease_" + strings.ReplaceAll(uuid.NewString(), "-", ""),
++			SubsiteID:      strings.TrimSpace(input.SubsiteID),
++			AccountID:      account.ID,
++			GroupID:        groupID,
++			Platform:       account.Platform,
++			Status:         AccountLeaseStatusActive,
++			MaxConcurrency: 0,
++			AssignedAt:     now,
++			ExpiresAt:      now.Add(normalizeAutoDistributeTTL(0)),
++		}
++		if err := s.leaseRepo.Create(ctx, lease); err != nil {
++			if errors.Is(err, ErrAccountLeaseConflict) {
++				lease, leasedAccount, findErr := s.findActiveLeaseCandidate(ctx, input, groupID)
++				if findErr != nil {
++					return nil, nil, findErr
++				}
++				if lease != nil && leasedAccount != nil {
++					return lease, leasedAccount, nil
++				}
+ 				continue
+ 			}
+ 			return nil, nil, err
+@@ -1348,6 +2109,56 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+ 	return nil, nil, nil
+ }
+ 
++func (s *RequestAuthorizeService) findActiveLeaseCandidate(ctx context.Context, input AuthorizeSubsiteRequestInput, groupID int64) (*AccountLease, *Account, error) {
++	if s == nil || s.leaseRepo == nil || s.accountRepo == nil || groupID <= 0 {
++		return nil, nil, nil
++	}
++	leases, err := s.leaseRepo.ListActiveBySubsite(ctx, input.SubsiteID)
++	if err != nil {
++		return nil, nil, err
++	}
++	now := time.Now()
++	for i := range leases {
++		lease := &leases[i]
++		if lease.Status != AccountLeaseStatusActive && lease.Status != AccountLeaseStatusRenewing {
++			continue
++		}
++		if !lease.ExpiresAt.After(now) {
++			continue
++		}
++		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
++			continue
++		}
++		if lease.MaxTokens > 0 && lease.UsedTokens >= lease.MaxTokens {
++			continue
++		}
++		if lease.GroupID != groupID {
++			continue
++		}
++		if containsStringTrimmed(input.ExcludedLeaseIDs, lease.LeaseID) {
++			continue
++		}
++		if containsInt64(input.ExcludedAccountIDs, lease.AccountID) {
++			continue
++		}
++		if input.Platform != "" && lease.Platform != "" && !strings.EqualFold(lease.Platform, input.Platform) {
++			continue
++		}
++		account, err := s.accountRepo.GetByID(ctx, lease.AccountID)
++		if err != nil {
++			return nil, nil, err
++		}
++		if account == nil || !account.IsSchedulable() {
++			continue
++		}
++		if input.Platform != "" && !strings.EqualFold(account.Platform, input.Platform) {
++			continue
++		}
++		return lease, account, nil
++	}
++	return nil, nil, nil
++}
++
+ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, account *Account) bool {
+ 	if account == nil {
+ 		return false
+@@ -1367,6 +2178,226 @@ func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, accoun
  	return true
  }
  
++func isPublicLeaseCandidate(groupID int64, requestedPlatform string, account *Account) bool {
++	if account == nil || groupID <= 0 {
++		return false
++	}
++	if !account.IsSchedulable() {
++		return false
++	}
++	if !isAutoDistributeAccountCandidate(account) {
++		return false
++	}
++	if requestedPlatform != "" && !strings.EqualFold(account.Platform, requestedPlatform) {
++		return false
++	}
++	return containsInt64(account.GroupIDs, groupID)
++}
++
 +type autoDistributeTarget struct {
 +	Stat          SubsiteForwardSiteStat
 +	ActiveLeases  int
@@ -4387,7 +4568,7 @@ index 8cfa424..7f09ded 100644
  func containsStringTrimmed(values []string, target string) bool {
  	target = strings.TrimSpace(target)
  	if target == "" {
-@@ -1493,6 +2364,7 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
+@@ -1493,6 +2524,7 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
  		item.GroupID = reservation.GroupID
  		item.SubscriptionID = reservation.SubscriptionID
  		item.BillingType = reservation.BillingType
@@ -4395,7 +4576,7 @@ index 8cfa424..7f09ded 100644
  	}
  	if s == nil || s.billingService == nil || s.apiKeyService == nil || s.accountRepo == nil {
  		return item, ErrQuotaReservationCostRequired
-@@ -1592,6 +2464,30 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
+@@ -1592,6 +2624,30 @@ func (s *UsageIngestService) enrichUsageCosts(ctx context.Context, item UsageIng
  	return item, nil
  }
  
@@ -4426,7 +4607,7 @@ index 8cfa424..7f09ded 100644
  func (s *UsageIngestService) calculatePrivateGroupCommissionCost(ctx context.Context, apiKey *APIKey, cost *CostBreakdown, billingType int8) float64 {
  	if s == nil || s.settingService == nil || apiKey == nil || apiKey.Group == nil || cost == nil {
  		return 0
-@@ -1724,10 +2620,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
+@@ -1724,10 +2780,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
  	}
  	if result.ExpiredLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
  		log.Printf(
@@ -4439,7 +4620,7 @@ index 8cfa424..7f09ded 100644
  		)
  	}
  }
-@@ -1756,6 +2653,10 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1756,6 +2813,10 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -4450,7 +4631,7 @@ index 8cfa424..7f09ded 100644
  	unhealthySubsites, err := s.subsiteRepo.MarkHeartbeatTimeouts(ctx, now.Add(-heartbeatTimeout))
  	if err != nil {
  		return nil, err
-@@ -1764,6 +2665,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1764,6 +2825,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  		ExpiredLeases:              expiredLeases,
  		ExpiredReservations:        expiredReservations,
  		UnhealthySubsites:          unhealthySubsites,
@@ -4458,7 +4639,7 @@ index 8cfa424..7f09ded 100644
  		HeartbeatTimeoutSecs:       int64(heartbeatTimeout.Seconds()),
  		ReservationExpiryGraceSecs: int64(reservationExpiryGrace.Seconds()),
  	}, nil
-@@ -1977,6 +2879,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
+@@ -1977,6 +3039,17 @@ func normalizeSubsiteMap(in map[string]any) map[string]any {
  	return copySubsiteMap(in)
  }
  
@@ -4476,7 +4657,7 @@ index 8cfa424..7f09ded 100644
  func copySubsiteMap(in map[string]any) map[string]any {
  	if in == nil {
  		return map[string]any{}
-@@ -2002,6 +2915,13 @@ func maxInt(a, b int) int {
+@@ -2002,6 +3075,13 @@ func maxInt(a, b int) int {
  	return b
  }
  
@@ -4979,7 +5160,7 @@ index 0000000..f9db6d1
 +	require.Empty(t, leaseRepo.created)
 +}
 diff --git a/backend/internal/service/subsite_usage_ingest_test.go b/backend/internal/service/subsite_usage_ingest_test.go
-index 9cf0c56..8acbab8 100644
+index 9cf0c56..5eb8657 100644
 --- a/backend/internal/service/subsite_usage_ingest_test.go
 +++ b/backend/internal/service/subsite_usage_ingest_test.go
 @@ -97,6 +97,9 @@ func (s *subsiteUsageLeaseRepoStub) ListActiveBySubsite(context.Context, string)
@@ -5011,7 +5192,15 @@ index 9cf0c56..8acbab8 100644
  func (s *subsiteUsageLeaseRepoStub) Drain(context.Context, string) (*AccountLease, error) {
  	panic("unexpected Drain call")
  }
-@@ -518,6 +527,9 @@ func (s *subsiteAuthorizeLeaseRepoStub) ListActiveBySubsite(context.Context, str
+@@ -432,6 +441,7 @@ type subsiteAuthorizeLeaseRepoStub struct {
+ 	leases        []AccountLease
+ 	createdLeases []*AccountLease
+ 	createErr     error
++	expireCalls   int
+ }
+ 
+ type subsiteAuthorizeGroupRepoStub struct {
+@@ -518,6 +528,9 @@ func (s *subsiteAuthorizeLeaseRepoStub) ListActiveBySubsite(context.Context, str
  func (s *subsiteAuthorizeLeaseRepoStub) ListActiveAccountIDsBySubsite(context.Context, string) ([]int64, error) {
  	panic("unexpected ListActiveAccountIDsBySubsite call")
  }
@@ -5021,7 +5210,7 @@ index 9cf0c56..8acbab8 100644
  func (s *subsiteAuthorizeLeaseRepoStub) UpdateLimitsForSubsite(context.Context, string, string, int, int, int64) (*AccountLease, error) {
  	panic("unexpected UpdateLimitsForSubsite call")
  }
-@@ -527,12 +539,18 @@ func (s *subsiteAuthorizeLeaseRepoStub) Renew(context.Context, string, time.Time
+@@ -527,12 +540,18 @@ func (s *subsiteAuthorizeLeaseRepoStub) Renew(context.Context, string, time.Time
  func (s *subsiteAuthorizeLeaseRepoStub) RenewForSubsite(context.Context, string, string, time.Time) (*AccountLease, error) {
  	panic("unexpected RenewForSubsite call")
  }
@@ -5040,7 +5229,19 @@ index 9cf0c56..8acbab8 100644
  func (s *subsiteAuthorizeLeaseRepoStub) Drain(context.Context, string) (*AccountLease, error) {
  	panic("unexpected Drain call")
  }
-@@ -1139,6 +1157,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
+@@ -546,7 +565,10 @@ func (s *subsiteAuthorizeLeaseRepoStub) IncrementUsage(context.Context, string,
+ 	panic("unexpected IncrementUsage call")
+ }
+ func (s *subsiteAuthorizeLeaseRepoStub) ExpireStale(context.Context, time.Time) (int64, error) {
+-	panic("unexpected ExpireStale call")
++	if s != nil {
++		s.expireCalls++
++	}
++	return 0, nil
+ }
+ 
+ type subsiteAuthorizeReservationRepoStub struct {
+@@ -1139,6 +1161,147 @@ func TestRequestAuthorize_SkipsLeaseWithNoImmediateCapacity(t *testing.T) {
  	require.Equal(t, "lease_open", reservationRepo.created.LeaseID)
  }
  
@@ -5188,6 +5389,94 @@ index 9cf0c56..8acbab8 100644
  func TestRequestAuthorize_RejectsLeaseGroupMismatch(t *testing.T) {
  	now := time.Now()
  	apiKeyGroupID := int64(7)
+@@ -1462,6 +1625,87 @@ func TestRequestAuthorize_PrivateSubscriptionGroupDoesNotUsePublicSharedAccount(
+ 	require.Nil(t, reservationRepo.created)
+ }
+ 
++func TestRequestAuthorize_AutoCreatesLeaseForPublicGroupWhenAllLeasesExpired(t *testing.T) {
++	now := time.Now()
++	groupID := int64(7)
++	reservationRepo := &subsiteAuthorizeReservationRepoStub{}
++	leaseRepo := &subsiteAuthorizeLeaseRepoStub{leases: []AccountLease{
++		{
++			LeaseID:   "lease_expired",
++			SubsiteID: "site_1",
++			AccountID: 101,
++			GroupID:   groupID,
++			Platform:  PlatformOpenAI,
++			Status:    AccountLeaseStatusExpired,
++			ExpiresAt: now.Add(-time.Hour),
++		},
++	}}
++	svc := NewRequestAuthorizeService(
++		&subsiteAuthorizeRepoStub{subsite: &Subsite{SubsiteID: "site_1", Status: SubsiteStatusActive}},
++		leaseRepo,
++		reservationRepo,
++		NewAPIKeyService(&subsiteAuthorizeAPIKeyRepoStub{apiKey: &APIKey{
++			ID:      200,
++			Key:     "client-key",
++			UserID:  300,
++			GroupID: &groupID,
++			Status:  StatusActive,
++			User:    &User{ID: 300, Status: StatusActive, Balance: 10},
++			Group:   &Group{ID: groupID, Platform: PlatformOpenAI, SubscriptionType: SubscriptionTypeStandard, Scope: GroupScopePublic, Status: StatusActive, RateMultiplier: 1},
++		}}, nil, nil, nil, nil, nil, &config.Config{}),
++		nil,
++		&subsiteAuthorizeAccountRepoStub{
++			accounts: map[int64]*Account{
++				101: {
++					ID:          101,
++					Type:        AccountTypeAPIKey,
++					Platform:    PlatformOpenAI,
++					Status:      StatusActive,
++					Schedulable: true,
++					GroupIDs:    []int64{groupID},
++				},
++			},
++			schedulableByGroupAndPlatform: map[int64]map[string][]Account{
++				groupID: {
++					PlatformOpenAI: {{
++						ID:          101,
++						Type:        AccountTypeAPIKey,
++						Platform:    PlatformOpenAI,
++						Status:      StatusActive,
++						Schedulable: true,
++						GroupIDs:    []int64{groupID},
++					}},
++				},
++			},
++		},
++		NewBillingService(&config.Config{}, nil),
++		nil,
++	)
++
++	authorization, err := svc.Authorize(context.Background(), AuthorizeSubsiteRequestInput{
++		SubsiteID:             "site_1",
++		APIKey:                "client-key",
++		Platform:              PlatformOpenAI,
++		RequestedModel:        "gpt-5.4",
++		RequestFingerprint:    "fp_public_lease_recover_1",
++		ClientIP:              "127.0.0.1",
++		InboundEndpoint:       "/v1/responses",
++		EstimatedInputTokens:  1000,
++		EstimatedOutputTokens: 1000,
++	})
++
++	require.NoError(t, err)
++	require.NotNil(t, authorization)
++	require.Equal(t, int64(101), authorization.AccountID)
++	require.Len(t, leaseRepo.createdLeases, 1)
++	require.Equal(t, int64(101), leaseRepo.createdLeases[0].AccountID)
++	require.Equal(t, groupID, leaseRepo.createdLeases[0].GroupID)
++	require.Equal(t, AccountLeaseStatusActive, leaseRepo.createdLeases[0].Status)
++	require.Equal(t, 1, leaseRepo.expireCalls)
++	require.NotNil(t, reservationRepo.created)
++	require.Equal(t, leaseRepo.createdLeases[0].LeaseID, reservationRepo.created.LeaseID)
++}
++
+ func TestRequestAuthorize_SkipsTempUnschedulableLeaseAccount(t *testing.T) {
+ 	now := time.Now()
+ 	groupID := int64(7)
 diff --git a/backend/internal/service/usage_cleanup_service.go b/backend/internal/service/usage_cleanup_service.go
 index 939b8f9..6cfffd4 100644
 --- a/backend/internal/service/usage_cleanup_service.go
