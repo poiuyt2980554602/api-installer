@@ -1,10 +1,10 @@
 diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
-index c787b21..8f4da1b 100644
+index c787b21..e2855f2 100644
 --- a/backend/cmd/server/VERSION
 +++ b/backend/cmd/server/VERSION
 @@ -1 +1 @@
 -1.0.22
-+1.0.20.6
++1.0.20.7
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index a9ac9bd..02bc7ae 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -69,6 +69,28 @@ index 7ee3353..27431f2 100644
  	// 其他官方模型
  	"gpt-oss-120b-medium":    "gpt-oss-120b-medium",
  	"tab_flash_lite_preview": "tab_flash_lite_preview",
+diff --git a/backend/internal/handler/admin/account_share_policy_handler.go b/backend/internal/handler/admin/account_share_policy_handler.go
+index b5637b7..242fc62 100644
+--- a/backend/internal/handler/admin/account_share_policy_handler.go
++++ b/backend/internal/handler/admin/account_share_policy_handler.go
+@@ -22,7 +22,7 @@ func NewAccountSharePolicyHandler(service *service.AccountSharePolicyService) *A
+ }
+ 
+ type createAccountSharePolicyRequest struct {
+-	ScopeType        string     `json:"scope_type" binding:"omitempty,oneof=global"`
++	ScopeType        string     `json:"scope_type" binding:"omitempty,oneof=global platform group account"`
+ 	ScopeID          *int64     `json:"scope_id"`
+ 	Platform         *string    `json:"platform"`
+ 	OwnerShareRatio  *float64   `json:"owner_share_ratio" binding:"required,gte=0,lte=1"`
+@@ -32,7 +32,7 @@ type createAccountSharePolicyRequest struct {
+ }
+ 
+ type updateAccountSharePolicyRequest struct {
+-	ScopeType        *string    `json:"scope_type" binding:"omitempty,oneof=global"`
++	ScopeType        *string    `json:"scope_type" binding:"omitempty,oneof=global platform group account"`
+ 	ScopeID          *int64     `json:"scope_id"`
+ 	Platform         *string    `json:"platform"`
+ 	OwnerShareRatio  *float64   `json:"owner_share_ratio" binding:"omitempty,gte=0,lte=1"`
 diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
 index f83507c..1f23a9e 100644
 --- a/backend/internal/handler/admin/subsite_handler.go
@@ -1573,6 +1595,97 @@ index 195fb06..1fc4d98 100644
  }
  
  // DefaultTestModel is the default model to preselect in test flows.
+diff --git a/backend/internal/repository/account_share_policy_repo.go b/backend/internal/repository/account_share_policy_repo.go
+index fa264da..141b152 100644
+--- a/backend/internal/repository/account_share_policy_repo.go
++++ b/backend/internal/repository/account_share_policy_repo.go
+@@ -76,6 +76,30 @@ func (r *accountSharePolicyRepository) GetAccountSharePolicyByID(ctx context.Con
+ }
+ 
+ func (r *accountSharePolicyRepository) ResolveEnabledAccountSharePolicy(ctx context.Context, accountID int64, groupID *int64, platform string, explicitPolicyID *int64) (*service.AccountSharePolicy, error) {
++	if explicitPolicyID != nil && *explicitPolicyID > 0 {
++		policy, found, err := r.queryEnabledAccountSharePolicy(ctx, "id = $1", *explicitPolicyID)
++		if err != nil || found {
++			return policy, err
++		}
++	}
++	if accountID > 0 {
++		policy, found, err := r.queryEnabledAccountSharePolicy(ctx, "scope_type = 'account' AND scope_id = $1", accountID)
++		if err != nil || found {
++			return policy, err
++		}
++	}
++	if groupID != nil && *groupID > 0 {
++		policy, found, err := r.queryEnabledAccountSharePolicy(ctx, "scope_type = 'group' AND scope_id = $1", *groupID)
++		if err != nil || found {
++			return policy, err
++		}
++	}
++	if platform = strings.TrimSpace(platform); platform != "" {
++		policy, found, err := r.queryEnabledAccountSharePolicy(ctx, "scope_type = 'platform' AND LOWER(platform) = LOWER($1)", platform)
++		if err != nil || found {
++			return policy, err
++		}
++	}
+ 	policy, found, err := r.queryEnabledAccountSharePolicy(ctx, "scope_type = 'global'")
+ 	if err != nil || found {
+ 		return policy, err
+diff --git a/backend/internal/repository/account_share_policy_repo_test.go b/backend/internal/repository/account_share_policy_repo_test.go
+new file mode 100644
+index 0000000..c4b5faa
+--- /dev/null
++++ b/backend/internal/repository/account_share_policy_repo_test.go
+@@ -0,0 +1,50 @@
++package repository
++
++import (
++	"context"
++	"database/sql"
++	"testing"
++	"time"
++
++	"github.com/DATA-DOG/go-sqlmock"
++	"github.com/stretchr/testify/require"
++)
++
++func TestResolveEnabledAccountSharePolicyPriority(t *testing.T) {
++	db, mock, err := sqlmock.New(sqlmock.QueryMatcherOption(sqlmock.QueryMatcherRegexp))
++	require.NoError(t, err)
++	t.Cleanup(func() { _ = db.Close() })
++
++	repo := &accountSharePolicyRepository{db: db}
++	now := time.Now()
++	groupID := int64(20)
++	explicitID := int64(99)
++
++	baseRows := func() *sqlmock.Rows {
++		return sqlmock.NewRows([]string{
++			"id", "scope_type", "scope_id", "platform", "owner_share_ratio", "invite_share_ratio",
++			"version", "enabled", "effective_at", "created_by_admin_id", "created_at", "updated_at", "deleted_at",
++		})
++	}
++
++	mock.ExpectQuery(`SELECT id, scope_type, scope_id, platform, owner_share_ratio::text, invite_share_ratio::text, version, enabled,\s+effective_at, created_by_admin_id, created_at, updated_at, deleted_at\s+FROM account_share_policies`).
++		WithArgs(explicitID).
++		WillReturnRows(baseRows())
++	mock.ExpectQuery(`SELECT id, scope_type, scope_id, platform, owner_share_ratio::text, invite_share_ratio::text, version, enabled,\s+effective_at, created_by_admin_id, created_at, updated_at, deleted_at\s+FROM account_share_policies`).
++		WithArgs(int64(10)).
++		WillReturnRows(baseRows())
++	mock.ExpectQuery(`SELECT id, scope_type, scope_id, platform, owner_share_ratio::text, invite_share_ratio::text, version, enabled,\s+effective_at, created_by_admin_id, created_at, updated_at, deleted_at\s+FROM account_share_policies`).
++		WithArgs(groupID).
++		WillReturnRows(baseRows().
++			AddRow(int64(7), "group", groupID, sql.NullString{String: "openai", Valid: true}, "0.800000", "0.050000", 2, true, now, nil, now, now, nil))
++
++	policy, err := repo.ResolveEnabledAccountSharePolicy(context.Background(), 10, &groupID, "openai", &explicitID)
++
++	require.NoError(t, err)
++	require.NotNil(t, policy)
++	require.Equal(t, int64(7), policy.ID)
++	require.Equal(t, "group", policy.ScopeType)
++	require.InDelta(t, 0.8, policy.OwnerShareRatio, 1e-9)
++	require.InDelta(t, 0.05, policy.InviteShareRatio, 1e-9)
++	require.NoError(t, mock.ExpectationsWereMet())
++}
 diff --git a/backend/internal/repository/api_key_repo.go b/backend/internal/repository/api_key_repo.go
 index ef75889..32fcf8c 100644
 --- a/backend/internal/repository/api_key_repo.go
@@ -2688,6 +2801,85 @@ index 5576e2a..0c4ad6d 100644
 +	require.NoError(t, err)
 +	require.NoError(t, mock.ExpectationsWereMet())
 +}
+diff --git a/backend/internal/repository/usage_billing_repo.go b/backend/internal/repository/usage_billing_repo.go
+index 2cc9eee..3b4dc19 100644
+--- a/backend/internal/repository/usage_billing_repo.go
++++ b/backend/internal/repository/usage_billing_repo.go
+@@ -562,6 +562,7 @@ type accountShareSnapshot struct {
+ 	ShareStatus   string
+ 	Platform      string
+ 	SharePolicyID any
++	GroupID       any
+ }
+ 
+ type accountSharePolicySnapshot struct {
+@@ -742,6 +743,7 @@ func accountShareSnapshotForSettlement(ctx context.Context, tx *sql.Tx, cmd *ser
+ 			ShareStatus:   cmd.ShareStatusSnapshot,
+ 			Platform:      strings.TrimSpace(cmd.SharePlatform),
+ 			SharePolicyID: nullablePtrInt64(cmd.SharePolicyID),
++			GroupID:       nullablePtrInt64(cmd.GroupID),
+ 		}
+ 		if cmd.ShareOwnerUserID != nil && *cmd.ShareOwnerUserID > 0 {
+ 			out.OwnerUserID = *cmd.ShareOwnerUserID
+@@ -757,6 +759,7 @@ func accountShareSnapshotForSettlement(ctx context.Context, tx *sql.Tx, cmd *ser
+ 		ShareStatus:   cmd.ShareStatusSnapshot,
+ 		Platform:      strings.TrimSpace(cmd.SharePlatform),
+ 		SharePolicyID: nullablePtrInt64(cmd.SharePolicyID),
++		GroupID:       nullablePtrInt64(cmd.GroupID),
+ 	}
+ 	if out.ShareMode == "" || out.ShareStatus == "" {
+ 		dbSnapshot, err := loadAccountShareSnapshot(ctx, tx, cmd.AccountID)
+@@ -824,12 +827,50 @@ func resolveAccountSharePolicy(ctx context.Context, tx *sql.Tx, cmd *service.Usa
+ 			InviteShareRatio: inviteRatio,
+ 		}, nil
+ 	}
++	if policyID := nullableInt64FromAny(account.SharePolicyID); policyID > 0 {
++		if policy, found, err := queryAccountSharePolicy(ctx, tx, "id = $1", policyID); err != nil || found {
++			return policy, err
++		}
++	}
++	if cmd != nil && cmd.AccountID > 0 {
++		if policy, found, err := queryAccountSharePolicy(ctx, tx, "scope_type = 'account' AND scope_id = $1", cmd.AccountID); err != nil || found {
++			return policy, err
++		}
++	}
++	if groupID := nullableInt64FromAny(account.GroupID); groupID > 0 {
++		if policy, found, err := queryAccountSharePolicy(ctx, tx, "scope_type = 'group' AND scope_id = $1", groupID); err != nil || found {
++			return policy, err
++		}
++	}
++	if platform := strings.TrimSpace(account.Platform); platform != "" {
++		if policy, found, err := queryAccountSharePolicy(ctx, tx, "scope_type = 'platform' AND LOWER(platform) = LOWER($1)", platform); err != nil || found {
++			return policy, err
++		}
++	}
+ 	if policy, found, err := queryAccountSharePolicy(ctx, tx, "scope_type = 'global'", nil); err != nil || found {
+ 		return policy, err
+ 	}
+ 	return accountSharePolicySnapshot{OwnerShareRatio: decimal.Zero}, nil
+ }
+ 
++func nullableInt64FromAny(v any) int64 {
++	switch typed := v.(type) {
++	case int64:
++		return typed
++	case *int64:
++		if typed != nil {
++			return *typed
++		}
++	case int:
++		return int64(typed)
++	case *int:
++		if typed != nil {
++			return int64(*typed)
++		}
++	}
++	return 0
++}
++
+ func usageBillingCommandHasPolicySnapshot(cmd *service.UsageBillingCommand) bool {
+ 	if cmd == nil {
+ 		return false
 diff --git a/backend/internal/server/middleware/master_data_plane_guard.go b/backend/internal/server/middleware/master_data_plane_guard.go
 index 8725039..afef002 100644
 --- a/backend/internal/server/middleware/master_data_plane_guard.go
@@ -3013,10 +3205,113 @@ index 2302ae5..d3b4100 100644
  func getGroupPlatform(c *gin.Context) string {
  	apiKey, ok := middleware.GetAPIKeyFromContext(c)
 diff --git a/backend/internal/service/account.go b/backend/internal/service/account.go
-index 74c3f22..1207b5c 100644
+index 74c3f22..74eed8c 100644
 --- a/backend/internal/service/account.go
 +++ b/backend/internal/service/account.go
-@@ -349,25 +349,61 @@ func (a *Account) IsSchedulable() bool {
+@@ -131,33 +131,91 @@ func NormalizeOpenAIAccountLevel(platform, accountLevel string, credentials, ext
+ 
+ func InferOpenAIAccountLevel(credentials, extra map[string]any) string {
+ 	for _, values := range []map[string]any{credentials, extra} {
+-		for _, key := range []string{"plan_type", "chatgpt_plan_type", "subscription_plan"} {
+-			raw, ok := values[key].(string)
+-			if !ok {
+-				continue
+-			}
+-			if inferred := NormalizeOpenAIPlanAccountLevel(raw); inferred != AccountLevelUnknown {
++		if inferred := inferOpenAIAccountLevelFromMap(values, 0); inferred != AccountLevelUnknown {
++			return inferred
++		}
++	}
++	return AccountLevelUnknown
++}
++
++func inferOpenAIAccountLevelFromMap(values map[string]any, depth int) string {
++	if len(values) == 0 || depth > 4 {
++		return AccountLevelUnknown
++	}
++	for _, key := range []string{
++		"account_level",
++		"accountLevel",
++		"plan_type",
++		"planType",
++		"chatgpt_plan_type",
++		"chatgptPlanType",
++		"subscription_plan",
++		"subscriptionPlan",
++		"subscription_tier",
++		"subscriptionTier",
++		"subscription_tier_raw",
++		"subscriptionTierRaw",
++		"plan",
++		"tier",
++		"sku",
++		"product",
++	} {
++		if inferred := NormalizeOpenAIPlanAccountLevel(valueAsString(values[key])); inferred != AccountLevelUnknown {
++			return inferred
++		}
++	}
++	for _, raw := range values {
++		switch v := raw.(type) {
++		case map[string]any:
++			if inferred := inferOpenAIAccountLevelFromMap(v, depth+1); inferred != AccountLevelUnknown {
+ 				return inferred
+ 			}
++		case []any:
++			for _, item := range v {
++				if nested, ok := item.(map[string]any); ok {
++					if inferred := inferOpenAIAccountLevelFromMap(nested, depth+1); inferred != AccountLevelUnknown {
++						return inferred
++					}
++				}
++			}
+ 		}
+ 	}
+ 	return AccountLevelUnknown
+ }
+ 
++func valueAsString(raw any) string {
++	switch v := raw.(type) {
++	case string:
++		return v
++	case fmt.Stringer:
++		return v.String()
++	default:
++		return ""
++	}
++}
++
++func NormalizeOpenAIAccountLevelAfterValidation(platform, accountLevel string, credentials, extra map[string]any) string {
++	level := NormalizeOpenAIAccountLevel(platform, accountLevel, credentials, extra)
++	if platform == PlatformOpenAI && !IsConcreteAccountLevel(level) {
++		return AccountLevelFree
++	}
++	return level
++}
++
+ func NormalizeOpenAIPlanAccountLevel(planType string) string {
+ 	if level := NormalizeAccountLevel(planType); IsConcreteAccountLevel(level) {
+ 		return level
+ 	}
+ 	normalized := strings.ToLower(strings.TrimSpace(planType))
+-	normalized = strings.NewReplacer(" ", "", "-", "", "_", "").Replace(normalized)
++	normalized = strings.NewReplacer(" ", "", "-", "", "_", "", ".", "", ":", "", "/", "").Replace(normalized)
+ 	switch {
+-	case normalized == "chatgptfree":
++	case normalized == "chatgptfree" || normalized == "free" || normalized == "none" || normalized == "trial":
+ 		return AccountLevelFree
+-	case normalized == "chatgptplus" || strings.HasPrefix(normalized, "plus"):
++	case normalized == "chatgptplus" || normalized == "plus" || normalized == "plusmonthly" || normalized == "plusyearly" || strings.Contains(normalized, "chatgptplus"):
+ 		return AccountLevelPlus
+-	case normalized == "chatgptpro":
++	case normalized == "chatgptpro" || normalized == "pro" || strings.Contains(normalized, "chatgptpro"):
+ 		return AccountLevelPro
+-	case normalized == "chatgptteam":
++	case normalized == "chatgptteam" || normalized == "team" || normalized == "business" || strings.Contains(normalized, "chatgptteam"):
+ 		return AccountLevelTeam
+ 	default:
+ 		return AccountLevelUnknown
+@@ -349,25 +407,61 @@ func (a *Account) IsSchedulable() bool {
  }
  
  func (a *Account) IsSchedulableAt(now time.Time) bool {
@@ -3087,7 +3382,7 @@ index 74c3f22..1207b5c 100644
  }
  
  func (a *Account) IsRateLimited() bool {
-@@ -1817,6 +1853,22 @@ func (a *Account) GetQuotaWeeklyUsed() float64 {
+@@ -1817,6 +1911,22 @@ func (a *Account) GetQuotaWeeklyUsed() float64 {
  	return a.getExtraFloat64("quota_weekly_used")
  }
  
@@ -3110,7 +3405,7 @@ index 74c3f22..1207b5c 100644
  // getExtraFloat64 从 Extra 中读取指定 key 的 float64 值
  func (a *Account) getExtraFloat64(key string) float64 {
  	if a.Extra == nil {
-@@ -2214,37 +2266,8 @@ func (a *Account) IsQuotaExceeded() bool {
+@@ -2214,37 +2324,8 @@ func (a *Account) IsQuotaExceeded() bool {
  }
  
  func (a *Account) IsQuotaExceededAt(now time.Time) bool {
@@ -3150,7 +3445,7 @@ index 74c3f22..1207b5c 100644
  }
  
  // GetWindowCostLimit 获取 5h 窗口费用阈值（美元）
-@@ -2422,6 +2445,102 @@ func (a *Account) CheckWindowCostSchedulability(currentWindowCost float64) Windo
+@@ -2422,6 +2503,102 @@ func (a *Account) CheckWindowCostSchedulability(currentWindowCost float64) Windo
  	return WindowCostNotSchedulable
  }
  
@@ -3253,6 +3548,178 @@ index 74c3f22..1207b5c 100644
  // GetCurrentWindowStartTime 获取当前有效的窗口开始时间
  // 逻辑：
  // 1. 如果窗口未过期（SessionWindowEnd 存在且在当前时间之后），使用记录的 SessionWindowStart
+diff --git a/backend/internal/service/account_openai_plus_concurrency_test.go b/backend/internal/service/account_openai_plus_concurrency_test.go
+index 0bfef18..efd4a7a 100644
+--- a/backend/internal/service/account_openai_plus_concurrency_test.go
++++ b/backend/internal/service/account_openai_plus_concurrency_test.go
+@@ -29,6 +29,18 @@ func TestNormalizeOpenAIAccountLevel_FromPlanType(t *testing.T) {
+ 		map[string]any{"plan_type": "plus"},
+ 		nil,
+ 	))
++	require.Equal(t, AccountLevelPro, NormalizeOpenAIAccountLevel(
++		PlatformOpenAI,
++		AccountLevelUnknown,
++		nil,
++		map[string]any{"account": map[string]any{"subscription": map[string]any{"plan": "chatgpt-pro"}}},
++	))
++	require.Equal(t, AccountLevelFree, NormalizeOpenAIAccountLevelAfterValidation(
++		PlatformOpenAI,
++		AccountLevelUnknown,
++		nil,
++		nil,
++	))
+ }
+ 
+ func TestNormalizeOpenAIAccountLevel_ManualLevelTakesPriority(t *testing.T) {
+@@ -38,7 +50,7 @@ func TestNormalizeOpenAIAccountLevel_ManualLevelTakesPriority(t *testing.T) {
+ 		map[string]any{"plan_type": "plus"},
+ 		nil,
+ 	))
+-	require.Equal(t, AccountLevelUnknown, NormalizeOpenAIAccountLevel(
++	require.Equal(t, AccountLevelPro, NormalizeOpenAIAccountLevel(
+ 		PlatformOpenAI,
+ 		AccountLevelUnknown,
+ 		map[string]any{"account_level": "pro"},
+diff --git a/backend/internal/service/account_service.go b/backend/internal/service/account_service.go
+index 31a1cf1..4c80964 100644
+--- a/backend/internal/service/account_service.go
++++ b/backend/internal/service/account_service.go
+@@ -1383,6 +1383,7 @@ func (s *AccountService) ApproveOwnedPublicShareWithOptions(ctx context.Context,
+ 		return nil, err
+ 	}
+ 
++	account.AccountLevel = NormalizeOpenAIAccountLevelAfterValidation(account.Platform, account.AccountLevel, account.Credentials, account.Extra)
+ 	account.ShareMode = AccountShareModePublic
+ 	account.ShareStatus = AccountShareStatusApproved
+ 	account.ErrorMessage = ""
+diff --git a/backend/internal/service/account_service_owned_group_test.go b/backend/internal/service/account_service_owned_group_test.go
+index f0ddb17..37d804a 100644
+--- a/backend/internal/service/account_service_owned_group_test.go
++++ b/backend/internal/service/account_service_owned_group_test.go
+@@ -669,6 +669,49 @@ func TestAccountServiceValidateOwnedPublicSharePolicyRequiresEnabledPositivePoli
+ 	})
+ }
+ 
++func TestAccountServiceApproveOwnedPublicShareDefaultsValidatedUnknownOpenAIToFree(t *testing.T) {
++	ownerID := int64(101)
++	accountID := int64(202)
++	privateGroup := &Group{ID: 99, Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopeUserPrivate}
++	publicGroup := Group{ID: 11, Name: "OpenAI Free Public", Platform: PlatformOpenAI, Status: StatusActive, Scope: GroupScopePublic, RequiredAccountLevel: AccountLevelFree}
++	repo := &ownedAccountDuplicateRepoStub{
++		getByIDAccounts: map[int64]*Account{
++			accountID: {
++				ID:           accountID,
++				Name:         "owned-openai",
++				Platform:     PlatformOpenAI,
++				AccountLevel: AccountLevelUnknown,
++				Type:         AccountTypeOAuth,
++				Credentials:  map[string]any{"access_token": "token"},
++				OwnerUserID:  &ownerID,
++				ShareMode:    AccountShareModePublic,
++				ShareStatus:  AccountShareStatusPending,
++				Status:       StatusActive,
++				Schedulable:  true,
++				Concurrency:  OpenAIPlusDefaultConcurrency,
++			},
++		},
++	}
++	svc := &AccountService{
++		accountRepo: repo,
++		groupRepo: &ownedPublicShareGroupRepoStub{
++			groups: []Group{publicGroup},
++		},
++		privateGroupProvisioner: &ownedPrivateGroupProvisionerStub{group: privateGroup},
++		accountSharePolicyRepo: &ownedPublicSharePolicyRepoStub{
++			policy: &AccountSharePolicy{ID: 1, OwnerShareRatio: 0.7, Enabled: true},
++		},
++	}
++
++	account, err := svc.ApproveOwnedPublicShare(context.Background(), ownerID, accountID)
++
++	require.NoError(t, err)
++	require.Equal(t, AccountLevelFree, account.AccountLevel)
++	require.Len(t, repo.updatedAccounts, 1)
++	require.Equal(t, AccountLevelFree, repo.updatedAccounts[0].AccountLevel)
++	require.Equal(t, []int64{99, 11}, repo.boundGroupIDs[accountID])
++}
++
+ func TestAccountServiceInitialOwnedAccountGroupIDsUsesPrivateGroupForPublicMode(t *testing.T) {
+ 	svc := &AccountService{
+ 		privateGroupProvisioner: &ownedPrivateGroupProvisionerStub{
+diff --git a/backend/internal/service/account_share_policy_service.go b/backend/internal/service/account_share_policy_service.go
+index fa01fda..3e8a658 100644
+--- a/backend/internal/service/account_share_policy_service.go
++++ b/backend/internal/service/account_share_policy_service.go
+@@ -191,11 +191,26 @@ func normalizeCreateAccountSharePolicyInput(input CreateAccountSharePolicyInput)
+ 			input.Platform = &platform
+ 		}
+ 	}
+-	if input.ScopeType != AccountSharePolicyScopeGlobal {
+-		return input, fmt.Errorf("only global account share policy is supported")
++	switch input.ScopeType {
++	case AccountSharePolicyScopeGlobal:
++		input.ScopeID = nil
++		input.Platform = nil
++	case AccountSharePolicyScopePlatform:
++		if input.Platform == nil || strings.TrimSpace(*input.Platform) == "" {
++			return input, fmt.Errorf("platform is required for platform account share policy")
++		}
++		input.ScopeID = nil
++	case AccountSharePolicyScopeGroup, AccountSharePolicyScopeAccount:
++		if input.ScopeID == nil || *input.ScopeID <= 0 {
++			return input, fmt.Errorf("scope_id must be > 0 for %s account share policy", input.ScopeType)
++		}
++	case "":
++		input.ScopeType = AccountSharePolicyScopeGlobal
++		input.ScopeID = nil
++		input.Platform = nil
++	default:
++		return input, fmt.Errorf("unsupported account share policy scope: %s", input.ScopeType)
+ 	}
+-	input.ScopeID = nil
+-	input.Platform = nil
+ 	return input, nil
+ }
+ 
+diff --git a/backend/internal/service/account_test_service.go b/backend/internal/service/account_test_service.go
+index d459c25..728200c 100644
+--- a/backend/internal/service/account_test_service.go
++++ b/backend/internal/service/account_test_service.go
+@@ -616,6 +616,7 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
+ 			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+ 			mergeAccountExtra(account, updates)
+ 		}
++		s.persistOpenAIValidatedAccountLevel(ctx, account, resp.StatusCode)
+ 	}
+ 
+ 	if resp.StatusCode != http.StatusOK {
+@@ -731,6 +732,7 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
+ 			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+ 			mergeAccountExtra(account, updates)
+ 		}
++		s.persistOpenAIValidatedAccountLevel(ctx, account, resp.StatusCode)
+ 		// 探测如返回 429,主动同步限流状态,避免后续短时间内继续选中。
+ 		if resp.StatusCode == http.StatusTooManyRequests {
+ 			s.reconcileOpenAI429State(ctx, account, resp.Header, body)
+@@ -750,6 +752,18 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
+ 	return nil
+ }
+ 
++func (s *AccountTestService) persistOpenAIValidatedAccountLevel(ctx context.Context, account *Account, statusCode int) {
++	if s == nil || s.accountRepo == nil || account == nil || statusCode < 200 || statusCode >= 300 {
++		return
++	}
++	level := NormalizeOpenAIAccountLevelAfterValidation(account.Platform, account.AccountLevel, account.Credentials, account.Extra)
++	if !IsConcreteAccountLevel(level) || level == NormalizeAccountLevel(account.AccountLevel) {
++		return
++	}
++	account.AccountLevel = level
++	_ = s.accountRepo.Update(ctx, account)
++}
++
+ func (s *AccountTestService) reconcileOpenAI429State(ctx context.Context, account *Account, headers http.Header, body []byte) {
+ 	if s == nil || s.accountRepo == nil || account == nil {
+ 		return
 diff --git a/backend/internal/service/domain_constants.go b/backend/internal/service/domain_constants.go
 index 92cbd62..dbbfc03 100644
 --- a/backend/internal/service/domain_constants.go
@@ -7288,6 +7755,71 @@ index 0000000..be0acd0
 +ALTER TABLE subsite_forward_events
 +    ADD CONSTRAINT subsite_forward_events_outcome_check
 +    CHECK (outcome IN ('success', 'failed', 'no_candidate', 'fallback', 'client_error', 'upstream_error'));
+diff --git a/backend/migrations/166_default_account_share_policy.sql b/backend/migrations/166_default_account_share_policy.sql
+new file mode 100644
+index 0000000..1fd4384
+--- /dev/null
++++ b/backend/migrations/166_default_account_share_policy.sql
+@@ -0,0 +1,27 @@
++-- Ensure public account sharing has a usable default settlement policy.
++
++INSERT INTO account_share_policies (
++    scope_type,
++    scope_id,
++    platform,
++    owner_share_ratio,
++    invite_share_ratio,
++    enabled,
++    effective_at
++)
++SELECT
++    'global',
++    NULL,
++    NULL,
++    0.700000,
++    0.000000,
++    TRUE,
++    NOW()
++WHERE NOT EXISTS (
++    SELECT 1
++    FROM account_share_policies
++    WHERE deleted_at IS NULL
++      AND enabled = TRUE
++      AND owner_share_ratio > 0
++      AND effective_at <= NOW()
++);
+diff --git a/backend/migrations/167_backfill_approved_openai_public_unknown_level.sql b/backend/migrations/167_backfill_approved_openai_public_unknown_level.sql
+new file mode 100644
+index 0000000..7030b38
+--- /dev/null
++++ b/backend/migrations/167_backfill_approved_openai_public_unknown_level.sql
+@@ -0,0 +1,13 @@
++-- Backfill legacy approved OpenAI public-share accounts that were validated
++-- before account level persistence was added. Pending or failed accounts are
++-- intentionally left unchanged so they must pass validation first.
++
++UPDATE accounts
++SET account_level = 'free',
++    updated_at = NOW()
++WHERE deleted_at IS NULL
++  AND LOWER(platform) = 'openai'
++  AND COALESCE(account_level, '') IN ('', 'unknown')
++  AND share_mode = 'public'
++  AND share_status = 'approved'
++  AND status = 'active';
+diff --git a/frontend/src/api/admin/accountSharePolicies.ts b/frontend/src/api/admin/accountSharePolicies.ts
+index d46b422..3d24262 100644
+--- a/frontend/src/api/admin/accountSharePolicies.ts
++++ b/frontend/src/api/admin/accountSharePolicies.ts
+@@ -1,7 +1,7 @@
+ import { apiClient } from '../client'
+ import type { PaginatedResponse } from '@/types'
+ 
+-export type AccountSharePolicyScopeType = 'global'
++export type AccountSharePolicyScopeType = 'global' | 'platform' | 'group' | 'account'
+ 
+ export interface AccountSharePolicy {
+   id: number
 diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
 index 7ff95d3..3670b5d 100644
 --- a/frontend/src/api/admin/index.ts
