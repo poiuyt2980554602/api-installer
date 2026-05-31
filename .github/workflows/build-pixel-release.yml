@@ -6,11 +6,11 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.20.8"
+        default: "1.0.26"
       pixel_source_version:
-        description: Upstream Pixel source tag
+        description: Upstream Pixel source tag or branch
         required: true
-        default: "1.0.20"
+        default: "upgrade/v0.1.121-merge"
   push:
     tags:
       - "v*-pixel"
@@ -23,8 +23,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.20.8' }}
-      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.20' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.26' }}
+      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'upgrade/v0.1.121-merge' }}
     steps:
       - name: Download installer repo
         run: |
@@ -41,26 +41,41 @@ jobs:
           source_version="${version}"
           if printf '%s\n' "${version}" | grep -Eq '^1\.0\.20\.[0-9]+$'; then
             source_version="1.0.20"
+          elif printf '%s\n' "${version}" | grep -Eq '^1\.0\.26(\.[0-9]+)?$'; then
+            source_version="upgrade/v0.1.121-merge"
           fi
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
           echo "PIXEL_SOURCE_VERSION=${source_version}" >> "$GITHUB_ENV"
 
       - name: Download Pixel source
         run: |
-          curl -fsSL "https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz
+          set -euo pipefail
+          if curl -fsSL "https://github.com/Pixel-API/Pixel/archive/refs/tags/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz; then
+            echo "Downloaded Pixel tag ${PIXEL_SOURCE_VERSION}"
+          else
+            curl -fsSL "https://github.com/Pixel-API/Pixel/archive/refs/heads/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz
+            echo "Downloaded Pixel branch ${PIXEL_SOURCE_VERSION}"
+          fi
           mkdir pixel-src
           tar -xzf pixel.tar.gz -C pixel-src --strip-components=1
 
-      - name: Apply Pixel compatibility patches
+      - name: Apply Pixel compatibility patches and overlays
         run: |
           set -euo pipefail
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
           if [ -f "$patch_file" ]; then
             git apply --directory=pixel-src "$patch_file"
+          elif [ "${PIXEL_SOURCE_VERSION}" = "upgrade/v0.1.121-merge" ]; then
+            echo "Using upstream upgrade/v0.1.121-merge source as the forwarder base."
           else
             echo "::error::Missing compatibility patch: ${patch_file}"
             echo "Refusing to build an unpatched forwarder release."
             exit 1
+          fi
+          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
+          overlay_dir="overlays/${overlay_key}"
+          if [ -d "$overlay_dir" ]; then
+            cp -a "${overlay_dir}/." pixel-src/
           fi
 
       - name: Setup Node.js
@@ -152,7 +167,7 @@ jobs:
           tag="v${PIXEL_VERSION}-forwarder-pixel"
           body_file="$(mktemp)"
           cat > "$body_file" <<EOF
-          Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel tag \`${PIXEL_SOURCE_VERSION}\` with the subsite forwarder patch. Published as \`${PIXEL_VERSION}\` for this custom forwarder release.
+          Prebuilt Sub2API-compatible binaries built from Pixel-API/Pixel source \`${PIXEL_SOURCE_VERSION}\` with the subsite forwarder patch/overlay. Published as \`${PIXEL_VERSION}\` for this custom forwarder release.
 
           Install:
           \`\`\`bash

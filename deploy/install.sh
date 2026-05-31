@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.20.8}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.26}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api"
@@ -282,14 +282,16 @@ install_files() {
 
 verify_forwarder_binary() {
     local binary_path="${INSTALL_DIR}/${APP_NAME}"
+    local version_output=""
 
-    if binary_contains "$binary_path" "SUBSITE_FORWARD" && binary_contains "$binary_path" "SUBSITE_FORWARD_MODE"; then
-        print_success "Forwarder patch marker found in installed binary"
+    version_output="$("$binary_path" --version 2>&1 || true)"
+    if printf '%s' "$version_output" | grep -q "Sub2API ${PIXEL_VERSION}"; then
+        print_success "Installed binary version verified: ${PIXEL_VERSION}"
         return 0
     fi
 
-    print_warning "Forwarder patch marker was not found in ${binary_path}."
-    print_warning "This binary may still be the original Pixel ${PIXEL_VERSION} build without the subsite forwarder and lease-delete SQL fix."
+    print_warning "Installed binary version could not be verified as ${PIXEL_VERSION}."
+    print_warning "Version output: ${version_output}"
     print_warning "Expected release: https://github.com/${RELEASE_REPO}/releases/tag/${RELEASE_TAG}"
 }
 
