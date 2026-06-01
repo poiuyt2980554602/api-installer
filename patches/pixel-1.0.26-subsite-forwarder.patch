@@ -1,3 +1,10 @@
+diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
+index 8955a01..f96743f 100644
+--- a/backend/cmd/server/VERSION
++++ b/backend/cmd/server/VERSION
+@@ -1 +1 @@
+-1.0.26
++1.0.26.5
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index 526ea32..ca4822c 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -224,10 +231,10 @@ index e545f4b..5eb7dfd 100644
  	Payment          *PaymentHandler
 diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
 new file mode 100644
-index 0000000..ab74fbc
+index 0000000..9e08633
 --- /dev/null
 +++ b/backend/internal/handler/subsite_forwarder.go
-@@ -0,0 +1,1043 @@
+@@ -0,0 +1,1144 @@
 +package handler
 +
 +import (
@@ -285,6 +292,7 @@ index 0000000..ab74fbc
 +type subsiteForwardContext struct {
 +	Key              string
 +	Type             string
++	Platform         string
 +	Model            string
 +	Session          string
 +	APIKeyID         int64
@@ -386,7 +394,14 @@ index 0000000..ab74fbc
 +			return true
 +		}
 +		lastErr = err
-+		if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, "failed", proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, err); recordErr != nil {
++		outcome := "failed"
++		if proxyResult.RetryableSelectionFailure {
++			outcome = "no_candidate"
++			if proxyResult.SelectionFailureCode != "" {
++				reason = proxyResult.SelectionFailureCode
++			}
++		}
++		if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, outcome, proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, err); recordErr != nil {
 +			log.Printf("[subsite-forwarder] record failed event failed: %v", recordErr)
 +		}
 +		if c.Writer.Written() {
@@ -414,10 +429,15 @@ index 0000000..ab74fbc
 +	excludedSubsites := sortedStringSet(excluded)
 +	ineligibleSubsites := make([]string, 0)
 +	capacityLimitedSubsites := make([]string, 0)
++	capabilityMismatchSubsites := make([]string, 0)
 +	active := make([]subsiteRouteCandidate, 0, len(snapshot.items))
 +	for _, item := range snapshot.items {
 +		if !isForwardableSubsite(item, now) {
 +			ineligibleSubsites = append(ineligibleSubsites, item.SubsiteID)
++			continue
++		}
++		if !subsiteSupportsForwardPlatform(item, forwardCtx.Platform) {
++			capabilityMismatchSubsites = append(capabilityMismatchSubsites, item.SubsiteID)
 +			continue
 +		}
 +		if _, skip := excluded[item.SubsiteID]; skip {
@@ -437,20 +457,22 @@ index 0000000..ab74fbc
 +		})
 +	}
 +	diagnostics := map[string]any{
-+		"total_subsites":               len(snapshot.items),
-+		"candidate_subsites":           len(active),
-+		"ineligible_subsite_ids":       sortedStrings(ineligibleSubsites),
-+		"capacity_limited_subsite_ids": sortedStrings(capacityLimitedSubsites),
-+		"retry_excluded_subsite_ids":   excludedSubsites,
-+		"circuit_blocked_subsite_ids":  sortedStringSet(blockedSubsites),
-+		"circuit_blocked_account_ids":  sortedInt64Set(blockedAccounts),
-+		"circuit_blocked_lease_ids":    sortedStringSet(blockedLeases),
-+		"affinity_key":                 forwardCtx.Key,
-+		"api_key_id":                   forwardCtx.APIKeyID,
-+		"user_id":                      forwardCtx.UserID,
-+		"group_id":                     forwardCtx.GroupID,
-+		"requested_model":              forwardCtx.Model,
-+		"loaded_at":                    snapshot.loadedAt.Format(time.RFC3339Nano),
++		"total_subsites":                  len(snapshot.items),
++		"candidate_subsites":              len(active),
++		"ineligible_subsite_ids":          sortedStrings(ineligibleSubsites),
++		"capability_mismatch_subsite_ids": sortedStrings(capabilityMismatchSubsites),
++		"capacity_limited_subsite_ids":    sortedStrings(capacityLimitedSubsites),
++		"retry_excluded_subsite_ids":      excludedSubsites,
++		"circuit_blocked_subsite_ids":     sortedStringSet(blockedSubsites),
++		"circuit_blocked_account_ids":     sortedInt64Set(blockedAccounts),
++		"circuit_blocked_lease_ids":       sortedStringSet(blockedLeases),
++		"affinity_key":                    forwardCtx.Key,
++		"api_key_id":                      forwardCtx.APIKeyID,
++		"user_id":                         forwardCtx.UserID,
++		"group_id":                        forwardCtx.GroupID,
++		"platform":                        forwardCtx.Platform,
++		"requested_model":                 forwardCtx.Model,
++		"loaded_at":                       snapshot.loadedAt.Format(time.RFC3339Nano),
 +	}
 +	forwardCtx.Diagnostics = diagnostics
 +	if len(active) == 0 {
@@ -506,6 +528,9 @@ index 0000000..ab74fbc
 +		if active[i].load.QPS != active[j].load.QPS {
 +			return active[i].load.QPS < active[j].load.QPS
 +		}
++		if active[i].load.ActiveLeases != active[j].load.ActiveLeases {
++			return active[i].load.ActiveLeases < active[j].load.ActiveLeases
++		}
 +		if active[i].subsite.HealthScore != active[j].subsite.HealthScore {
 +			return active[i].subsite.HealthScore > active[j].subsite.HealthScore
 +		}
@@ -521,9 +546,10 @@ index 0000000..ab74fbc
 +	bestLoad := active[0].load.ActiveRequests
 +	bestQueue := active[0].load.QueuedUsage
 +	bestQPS := active[0].load.QPS
++	bestLeases := active[0].load.ActiveLeases
 +	top := active[:0]
 +	for _, item := range active {
-+		if item.subsite.HealthScore == bestScore && item.load.ActiveRequests == bestLoad && item.load.QueuedUsage == bestQueue && item.load.QPS == bestQPS {
++		if item.subsite.HealthScore == bestScore && item.load.ActiveRequests == bestLoad && item.load.QueuedUsage == bestQueue && item.load.QPS == bestQPS && item.load.ActiveLeases == bestLeases {
 +			top = append(top, item)
 +		}
 +	}
@@ -533,6 +559,7 @@ index 0000000..ab74fbc
 +	diagnostics["selected_active_requests"] = selected.load.ActiveRequests
 +	diagnostics["selected_queued_usage"] = selected.load.QueuedUsage
 +	diagnostics["selected_qps"] = selected.load.QPS
++	diagnostics["selected_active_leases"] = selected.load.ActiveLeases
 +	diagnostics["selected_health_score"] = selected.subsite.HealthScore
 +	return &selected.subsite, "least_load", nil
 +}
@@ -572,10 +599,12 @@ index 0000000..ab74fbc
 +}
 +
 +type subsiteProxyResult struct {
-+	StatusCode    int
-+	LatencyMS     int64
-+	ResponseBytes int64
-+	ClientError   bool
++	StatusCode                int
++	LatencyMS                 int64
++	ResponseBytes             int64
++	ClientError               bool
++	RetryableSelectionFailure bool
++	SelectionFailureCode      string
 +}
 +
 +type subsiteHTTPStatusError struct {
@@ -591,6 +620,22 @@ index 0000000..ab74fbc
 +		return fmt.Sprintf("subsite returned %d: %s", e.statusCode, e.body)
 +	}
 +	return fmt.Sprintf("subsite returned %d", e.statusCode)
++}
++
++type subsiteAuthorizationSelectionError struct {
++	statusCode int
++	code       string
++	body       string
++}
++
++func (e *subsiteAuthorizationSelectionError) Error() string {
++	if e == nil {
++		return "subsite authorization selection failed"
++	}
++	if e.code != "" {
++		return fmt.Sprintf("subsite authorization selection failed: %s", e.code)
++	}
++	return fmt.Sprintf("subsite authorization selection failed with status %d", e.statusCode)
 +}
 +
 +func (f *SubsiteForwarder) proxy(c *gin.Context, subsite *service.Subsite, body []byte, reason string, forwardCtx *subsiteForwardContext) (subsiteProxyResult, error) {
@@ -650,7 +695,20 @@ index 0000000..ab74fbc
 +	latencyMS := time.Since(started).Milliseconds()
 +	if shouldFailoverSubsiteStatus(resp.StatusCode) {
 +		payload, _ := io.ReadAll(http.MaxBytesReader(c.Writer, resp.Body, 1<<20))
-+		if isSubsiteAuthorizationSelectionFailure(resp.StatusCode, payload) {
++		if code, retryable := classifySubsiteAuthorizationSelectionFailure(resp.StatusCode, payload); code != "" {
++			if retryable {
++				return subsiteProxyResult{
++						StatusCode:                resp.StatusCode,
++						LatencyMS:                 latencyMS,
++						ResponseBytes:             int64(len(payload)),
++						RetryableSelectionFailure: true,
++						SelectionFailureCode:      code,
++					}, &subsiteAuthorizationSelectionError{
++						statusCode: resp.StatusCode,
++						code:       code,
++						body:       strings.TrimSpace(string(payload)),
++					}
++			}
 +			copyResponseHeaders(c.Writer.Header(), resp.Header)
 +			c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
 +			c.Header(subsiteForwardReasonHeader, reason)
@@ -661,7 +719,7 @@ index 0000000..ab74fbc
 +			if n == 0 {
 +				n = int64(len(payload))
 +			}
-+			return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n, ClientError: true}, writeErr
++			return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n, ClientError: true, SelectionFailureCode: code}, writeErr
 +		}
 +		return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: int64(len(payload))}, &subsiteHTTPStatusError{
 +			statusCode: resp.StatusCode,
@@ -695,14 +753,16 @@ index 0000000..ab74fbc
 +	}
 +	model := extractForwardModel(body)
 +	session := extractForwardSession(body, c.Request.Header)
++	platform := platformForForwardPath(c.Request.URL.Path)
 +	affinityType := "session"
 +	if session == "" {
 +		affinityType = "api_key"
 +		session = stableModelAffinityScope(c.Request.Method, c.Request.URL.Path, model)
 +	}
 +	return &subsiteForwardContext{
-+		Key:      fmt.Sprintf("%s:api:%d:user:%d:group:%d:model:%s:session:%s", affinityType, apiKeyID, userID, groupID, model, session),
++		Key:      fmt.Sprintf("%s:api:%d:user:%d:group:%d:platform:%s:model:%s:session:%s", affinityType, apiKeyID, userID, groupID, platform, model, session),
 +		Type:     affinityType,
++		Platform: platform,
 +		Model:    model,
 +		Session:  session,
 +		APIKeyID: apiKeyID,
@@ -813,6 +873,25 @@ index 0000000..ab74fbc
 +		return false
 +	}
 +	return now.Sub(*subsite.LastHeartbeatAt) <= subsiteForwardHealthyWindow
++}
++
++func subsiteSupportsForwardPlatform(subsite service.Subsite, platform string) bool {
++	platform = strings.ToLower(strings.TrimSpace(platform))
++	if platform == "" || len(subsite.Capabilities) == 0 {
++		return true
++	}
++	for _, capability := range subsite.Capabilities {
++		value := strings.ToLower(strings.TrimSpace(capability))
++		switch value {
++		case platform, "all", "gateway", "relay", "subsite_relay":
++			return true
++		case "openai", "anthropic", "gemini", "antigravity":
++			if value == platform {
++				return true
++			}
++		}
++	}
++	return false
 +}
 +
 +func isSubsiteAtRelayCapacity(subsite service.Subsite, load service.SubsiteForwardSiteStat) bool {
@@ -928,16 +1007,25 @@ index 0000000..ab74fbc
 +		statusCode >= http.StatusInternalServerError
 +}
 +
-+func isSubsiteAuthorizationSelectionFailure(statusCode int, body []byte) bool {
++func classifySubsiteAuthorizationSelectionFailure(statusCode int, body []byte) (string, bool) {
 +	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
-+		return false
++		return "", false
 +	}
 +	text := string(body)
 +	if !strings.Contains(text, "SUBSITE_AUTHORIZE_FAILED") {
-+		return false
++		return "", false
 +	}
 +	for _, code := range []string{
 +		"SUBSITE_NO_ACCOUNT_LEASE",
++		"SUBSITE_LEASE_CAPACITY_EXCEEDED",
++		"ACCOUNT_LEASE_NOT_FOUND",
++		"ACCOUNT_LEASE_CONFLICT",
++	} {
++		if strings.Contains(text, code) {
++			return code, true
++		}
++	}
++	for _, code := range []string{
 +		"SUBSITE_GROUP_REQUIRED",
 +		"SUBSITE_MODEL_MISMATCH",
 +		"QUOTA_RESERVATION_INSUFFICIENT_FUNDS",
@@ -945,10 +1033,30 @@ index 0000000..ab74fbc
 +		"SUBSCRIPTION_LIMIT",
 +	} {
 +		if strings.Contains(text, code) {
-+			return true
++			return code, false
 +		}
 +	}
-+	return false
++	return "SUBSITE_AUTHORIZE_FAILED", false
++}
++
++func platformForForwardPath(path string) string {
++	switch {
++	case isForwardOpenAIModelsEndpoint(path):
++		return service.PlatformOpenAI
++	case strings.HasPrefix(path, "/v1beta/"):
++		return service.PlatformGemini
++	case strings.Contains(path, "/chat/completions"), strings.Contains(path, "/responses"), strings.Contains(path, "/images/"):
++		return service.PlatformOpenAI
++	case strings.Contains(path, "/backend-api/codex/"):
++		return service.PlatformOpenAI
++	default:
++		return service.PlatformAnthropic
++	}
++}
++
++func isForwardOpenAIModelsEndpoint(path string) bool {
++	normalized := strings.TrimRight(strings.TrimSpace(path), "/")
++	return normalized == "/v1/models" || normalized == "/models"
 +}
 +
 +func readForwardBody(c *gin.Context) ([]byte, error) {
@@ -1271,6 +1379,65 @@ index 0000000..ab74fbc
 +	s.staleAt = snapshot.loadedAt.Add(s.ttl + s.staleTTL)
 +	return snapshot, nil
 +}
+diff --git a/backend/internal/handler/subsite_forwarder_test.go b/backend/internal/handler/subsite_forwarder_test.go
+new file mode 100644
+index 0000000..2ad82d1
+--- /dev/null
++++ b/backend/internal/handler/subsite_forwarder_test.go
+@@ -0,0 +1,53 @@
++package handler
++
++import (
++	"net/http"
++	"testing"
++
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/stretchr/testify/require"
++)
++
++func TestClassifySubsiteAuthorizationSelectionFailure(t *testing.T) {
++	t.Run("lease miss is retryable", func(t *testing.T) {
++		code, retryable := classifySubsiteAuthorizationSelectionFailure(
++			http.StatusUnauthorized,
++			[]byte(`{"error":{"code":"SUBSITE_AUTHORIZE_FAILED","message":"master returned 503: SUBSITE_NO_ACCOUNT_LEASE"}}`),
++		)
++		require.Equal(t, "SUBSITE_NO_ACCOUNT_LEASE", code)
++		require.True(t, retryable)
++	})
++
++	t.Run("insufficient funds stays client error", func(t *testing.T) {
++		code, retryable := classifySubsiteAuthorizationSelectionFailure(
++			http.StatusUnauthorized,
++			[]byte(`{"error":{"code":"SUBSITE_AUTHORIZE_FAILED","message":"master returned 403: QUOTA_RESERVATION_INSUFFICIENT_FUNDS"}}`),
++		)
++		require.Equal(t, "QUOTA_RESERVATION_INSUFFICIENT_FUNDS", code)
++		require.False(t, retryable)
++	})
++
++	t.Run("unrelated unauthorized response is not relay selection failure", func(t *testing.T) {
++		code, retryable := classifySubsiteAuthorizationSelectionFailure(
++			http.StatusUnauthorized,
++			[]byte(`{"error":{"message":"invalid api key"}}`),
++		)
++		require.Empty(t, code)
++		require.False(t, retryable)
++	})
++}
++
++func TestSubsiteSupportsForwardPlatform(t *testing.T) {
++	require.True(t, subsiteSupportsForwardPlatform(service.Subsite{}, service.PlatformOpenAI))
++	require.True(t, subsiteSupportsForwardPlatform(service.Subsite{Capabilities: []string{"relay"}}, service.PlatformOpenAI))
++	require.True(t, subsiteSupportsForwardPlatform(service.Subsite{Capabilities: []string{"openai"}}, service.PlatformOpenAI))
++	require.False(t, subsiteSupportsForwardPlatform(service.Subsite{Capabilities: []string{"anthropic"}}, service.PlatformOpenAI))
++}
++
++func TestPlatformForForwardPath(t *testing.T) {
++	require.Equal(t, service.PlatformOpenAI, platformForForwardPath("/v1/responses"))
++	require.Equal(t, service.PlatformOpenAI, platformForForwardPath("/v1/chat/completions"))
++	require.Equal(t, service.PlatformOpenAI, platformForForwardPath("/v1/images/generations"))
++	require.Equal(t, service.PlatformGemini, platformForForwardPath("/v1beta/models/gemini:generateContent"))
++	require.Equal(t, service.PlatformAnthropic, platformForForwardPath("/v1/messages"))
++}
 diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
 index 80bed32..c5fa486 100644
 --- a/backend/internal/handler/wire.go
@@ -1301,10 +1468,10 @@ index 80bed32..c5fa486 100644
  	NewPaymentHandler,
 diff --git a/backend/internal/repository/subsite_relay_repo.go b/backend/internal/repository/subsite_relay_repo.go
 new file mode 100644
-index 0000000..83c3d4f
+index 0000000..c1bc359
 --- /dev/null
 +++ b/backend/internal/repository/subsite_relay_repo.go
-@@ -0,0 +1,695 @@
+@@ -0,0 +1,799 @@
 +package repository
 +
 +import (
@@ -1515,7 +1682,7 @@ index 0000000..83c3d4f
 +	if err != nil {
 +		return fmt.Errorf("insert subsite forward event: %w", err)
 +	}
-+	if event.Outcome == "failed" || event.Outcome == "upstream_error" || (event.Outcome == "no_candidate" && strings.TrimSpace(event.SubsiteID) != "") {
++	if event.Outcome == "failed" || event.Outcome == "upstream_error" {
 +		_ = r.upsertCircuitBreaker(ctx, event)
 +	} else if event.Outcome == "success" || event.Outcome == "fallback" {
 +		_ = r.clearCircuitBreaker(ctx, "subsite", event.SubsiteID)
@@ -1641,11 +1808,57 @@ index 0000000..83c3d4f
 +		return nil, err
 +	}
 +	stats.CircuitBreakers = breakers
++	distribution, err := r.ListRelayLeaseDistribution(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.LeaseDistribution = distribution
 +	return stats, nil
 +}
 +
 +func (r *subsiteRepository) ForwardRouteStats(ctx context.Context) ([]service.SubsiteForwardSiteStat, error) {
 +	return r.forwardSiteStats(ctx, false)
++}
++
++func (r *subsiteRepository) ListRelayLeaseDistribution(ctx context.Context) ([]service.SubsiteRelayLeaseStat, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		SELECT al.group_id, COALESCE(NULLIF(g.name, ''), ''), g.platform,
++			COALESCE(NULLIF(g.scope, ''), 'public'), COALESCE(g.required_account_level, ''),
++			COUNT(*) AS active_leases,
++			COUNT(DISTINCT al.subsite_id) AS assigned_subsites,
++			COUNT(*) FILTER (WHERE al.expires_at <= NOW() + INTERVAL '1 hour') AS expiring_leases_1h,
++			COUNT(*) FILTER (WHERE al.expires_at <= NOW() + INTERVAL '24 hours') AS expiring_leases_24h
++		FROM account_leases al
++		JOIN groups g ON g.id = al.group_id AND g.deleted_at IS NULL
++		WHERE al.deleted_at IS NULL
++		  AND al.status IN ('active', 'renewing')
++		  AND al.expires_at > NOW()
++		GROUP BY al.group_id, g.name, g.platform, g.scope, g.required_account_level
++		ORDER BY g.platform ASC, g.required_account_level ASC, al.group_id ASC
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list relay lease distribution: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteRelayLeaseStat, 0)
++	for rows.Next() {
++		var item service.SubsiteRelayLeaseStat
++		if err := rows.Scan(
++			&item.GroupID,
++			&item.GroupName,
++			&item.Platform,
++			&item.Scope,
++			&item.RequiredLevel,
++			&item.ActiveLeases,
++			&item.AssignedSubsites,
++			&item.ExpiringLeases1h,
++			&item.ExpiringLeases24h,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
 +}
 +
 +func (r *subsiteRepository) forwardSiteStats(ctx context.Context, includeUsage bool) ([]service.SubsiteForwardSiteStat, error) {
@@ -1901,6 +2114,64 @@ index 0000000..83c3d4f
 +		return fmt.Errorf("clear subsite circuit breaker: %w", err)
 +	}
 +	return nil
++}
++
++func (r *subsiteRepository) CleanupForwardState(ctx context.Context, now time.Time) (*service.SubsiteForwardCleanupResult, error) {
++	if now.IsZero() {
++		now = time.Now()
++	}
++	tx, err := r.db.BeginTx(ctx, nil)
++	if err != nil {
++		return nil, fmt.Errorf("begin relay cleanup tx: %w", err)
++	}
++	defer func() { _ = tx.Rollback() }()
++
++	result := &service.SubsiteForwardCleanupResult{}
++	expiredAffinities, err := tx.ExecContext(ctx, `
++		UPDATE subsite_forward_affinities
++		SET deleted_at = $1, updated_at = $1
++		WHERE deleted_at IS NULL
++		  AND locked = FALSE
++		  AND expires_at <= $1
++	`, now)
++	if err != nil {
++		return nil, fmt.Errorf("cleanup expired relay affinities: %w", err)
++	}
++	result.ExpiredAffinities, _ = expiredAffinities.RowsAffected()
++
++	expiredBreakers, err := tx.ExecContext(ctx, `
++		UPDATE subsite_circuit_breakers
++		SET deleted_at = $1, updated_at = $1
++		WHERE deleted_at IS NULL
++		  AND cooldown_until <= $1
++	`, now)
++	if err != nil {
++		return nil, fmt.Errorf("cleanup expired relay circuit breakers: %w", err)
++	}
++	result.ExpiredBreakers, _ = expiredBreakers.RowsAffected()
++
++	deletedEvents, err := tx.ExecContext(ctx, `
++		DELETE FROM subsite_forward_events
++		WHERE created_at < $1 - INTERVAL '14 days'
++	`, now)
++	if err != nil {
++		return nil, fmt.Errorf("cleanup relay forward events: %w", err)
++	}
++	result.DeletedEvents, _ = deletedEvents.RowsAffected()
++
++	deletedSamples, err := tx.ExecContext(ctx, `
++		DELETE FROM subsite_health_samples
++		WHERE created_at < $1 - INTERVAL '7 days'
++	`, now)
++	if err != nil {
++		return nil, fmt.Errorf("cleanup relay health samples: %w", err)
++	}
++	result.DeletedSamples, _ = deletedSamples.RowsAffected()
++
++	if err := tx.Commit(); err != nil {
++		return nil, fmt.Errorf("commit relay cleanup tx: %w", err)
++	}
++	return result, nil
 +}
 +
 +func forwardAffinitySelectSQL() string {
@@ -2540,7 +2811,7 @@ index 0000000..d730f7d
 +	return normalized, nil
 +}
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..6886156 100644
+index 8cfa424..0d4a63d 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -12,6 +12,7 @@ import (
@@ -2573,20 +2844,30 @@ index 8cfa424..6886156 100644
  	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
  	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
  }
-@@ -378,6 +387,7 @@ type SubsiteMaintenanceInput struct {
+@@ -378,8 +387,13 @@ type SubsiteMaintenanceInput struct {
  
  type SubsiteMaintenanceResult struct {
  	ExpiredLeases              int64 `json:"expired_leases"`
 +	ReleasedInvalidLeases      int64 `json:"released_invalid_leases"`
  	ExpiredReservations        int64 `json:"expired_reservations"`
  	UnhealthySubsites          int64 `json:"unhealthy_subsites"`
++	ExpiredAffinities          int64 `json:"expired_affinities"`
++	ExpiredCircuitBreakers     int64 `json:"expired_circuit_breakers"`
++	DeletedForwardEvents       int64 `json:"deleted_forward_events"`
++	DeletedHealthSamples       int64 `json:"deleted_health_samples"`
  	HeartbeatTimeoutSecs       int64 `json:"heartbeat_timeout_secs"`
-@@ -431,17 +441,26 @@ type QuotaReservationRepository interface {
+ 	ReservationExpiryGraceSecs int64 `json:"reservation_expiry_grace_secs"`
+ }
+@@ -431,17 +445,30 @@ type QuotaReservationRepository interface {
  	ExpireStale(ctx context.Context, now time.Time) (int64, error)
  }
  
 +type subsiteRelayLeaseMaintenanceRepository interface {
 +	ReleaseInvalidAssignments(ctx context.Context, now time.Time) (int64, error)
++}
++
++type subsiteRelayForwardMaintenanceRepository interface {
++	CleanupForwardState(ctx context.Context, now time.Time) (*SubsiteForwardCleanupResult, error)
 +}
 +
  type SubsiteNonceStore interface {
@@ -2611,7 +2892,7 @@ index 8cfa424..6886156 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -1180,9 +1199,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1180,9 +1207,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			continue
  		}
  		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
@@ -2623,7 +2904,7 @@ index 8cfa424..6886156 100644
  			continue
  		}
  		if lease.GroupID != groupID {
-@@ -1208,15 +1229,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1208,15 +1237,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return nil, nil, err
  		}
  		if account == nil || !account.IsSchedulable() {
@@ -2646,7 +2927,7 @@ index 8cfa424..6886156 100644
  		if err != nil {
  			return nil, nil, err
  		}
-@@ -1230,6 +1256,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1230,6 +1264,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  	return nil, nil, ErrSubsiteAuthorizeNoLease
  }
  
@@ -2678,7 +2959,7 @@ index 8cfa424..6886156 100644
  func isPrivateSubsiteAutoLeaseEligible(apiKey *APIKey) bool {
  	if apiKey == nil || apiKey.User == nil || apiKey.Group == nil {
  		return false
-@@ -1306,24 +1357,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1306,24 +1365,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  	}
  }
  
@@ -2707,7 +2988,7 @@ index 8cfa424..6886156 100644
  			continue
  		}
  		lease := &AccountLease{
-@@ -1333,7 +1385,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1333,7 +1393,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  			GroupID:        groupID,
  			Platform:       account.Platform,
  			Status:         AccountLeaseStatusActive,
@@ -2716,7 +2997,7 @@ index 8cfa424..6886156 100644
  			AssignedAt:     now,
  			ExpiresAt:      now.Add(30 * time.Minute),
  		}
-@@ -1348,6 +1400,89 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1348,6 +1408,89 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  	return nil, nil, nil
  }
  
@@ -2806,21 +3087,28 @@ index 8cfa424..6886156 100644
  func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, account *Account) bool {
  	if account == nil {
  		return false
-@@ -1722,10 +1857,11 @@ func (s *SubsiteMaintenanceService) runOnce() {
+@@ -1722,12 +1865,18 @@ func (s *SubsiteMaintenanceService) runOnce() {
  		log.Printf("[SubsiteMaintenance] run failed: %v", err)
  		return
  	}
 -	if result.ExpiredLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
-+	if result.ExpiredLeases > 0 || result.ReleasedInvalidLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
++	if result.ExpiredLeases > 0 || result.ReleasedInvalidLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 ||
++		result.ExpiredAffinities > 0 || result.ExpiredCircuitBreakers > 0 || result.DeletedForwardEvents > 0 || result.DeletedHealthSamples > 0 {
  		log.Printf(
 -			"[SubsiteMaintenance] expired_leases=%d expired_reservations=%d unhealthy_subsites=%d",
-+			"[SubsiteMaintenance] expired_leases=%d released_invalid_leases=%d expired_reservations=%d unhealthy_subsites=%d",
++			"[SubsiteMaintenance] expired_leases=%d released_invalid_leases=%d expired_reservations=%d unhealthy_subsites=%d expired_affinities=%d expired_breakers=%d deleted_events=%d deleted_samples=%d",
  			result.ExpiredLeases,
 +			result.ReleasedInvalidLeases,
  			result.ExpiredReservations,
  			result.UnhealthySubsites,
++			result.ExpiredAffinities,
++			result.ExpiredCircuitBreakers,
++			result.DeletedForwardEvents,
++			result.DeletedHealthSamples,
  		)
-@@ -1752,6 +1888,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+ 	}
+ }
+@@ -1752,6 +1901,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -2834,20 +3122,35 @@ index 8cfa424..6886156 100644
  	expiredReservations, err := s.reservationRepo.ExpireStale(ctx, now.Add(-reservationExpiryGrace))
  	if err != nil {
  		return nil, err
-@@ -1762,6 +1905,7 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1760,10 +1916,22 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+ 	if err != nil {
+ 		return nil, err
  	}
++	forwardCleanup := &SubsiteForwardCleanupResult{}
++	if relayRepo, ok := s.subsiteRepo.(subsiteRelayForwardMaintenanceRepository); ok {
++		forwardCleanup, err = relayRepo.CleanupForwardState(ctx, now)
++		if err != nil {
++			return nil, err
++		}
++	}
  	return &SubsiteMaintenanceResult{
  		ExpiredLeases:              expiredLeases,
 +		ReleasedInvalidLeases:      releasedInvalidLeases,
  		ExpiredReservations:        expiredReservations,
  		UnhealthySubsites:          unhealthySubsites,
++		ExpiredAffinities:          forwardCleanup.ExpiredAffinities,
++		ExpiredCircuitBreakers:     forwardCleanup.ExpiredBreakers,
++		DeletedForwardEvents:       forwardCleanup.DeletedEvents,
++		DeletedHealthSamples:       forwardCleanup.DeletedSamples,
  		HeartbeatTimeoutSecs:       int64(heartbeatTimeout.Seconds()),
+ 		ReservationExpiryGraceSecs: int64(reservationExpiryGrace.Seconds()),
+ 	}, nil
 diff --git a/backend/internal/service/subsite_relay.go b/backend/internal/service/subsite_relay.go
 new file mode 100644
-index 0000000..37c8d96
+index 0000000..28401cf
 --- /dev/null
 +++ b/backend/internal/service/subsite_relay.go
-@@ -0,0 +1,377 @@
+@@ -0,0 +1,436 @@
 +package service
 +
 +import (
@@ -2941,6 +3244,33 @@ index 0000000..37c8d96
 +	Mode               string                   `json:"mode"`
 +	BySubsite          []SubsiteForwardSiteStat `json:"by_subsite"`
 +	CircuitBreakers    []SubsiteCircuitBreaker  `json:"circuit_breakers"`
++	LeaseDistribution  []SubsiteRelayLeaseStat  `json:"lease_distribution"`
++	Recommendations    []SubsiteRelayAdvice     `json:"recommendations"`
++}
++
++type SubsiteRelayLeaseStat struct {
++	GroupID           int64  `json:"group_id"`
++	GroupName         string `json:"group_name"`
++	Platform          string `json:"platform"`
++	Scope             string `json:"scope"`
++	RequiredLevel     string `json:"required_level"`
++	ActiveLeases      int64  `json:"active_leases"`
++	AssignedSubsites  int64  `json:"assigned_subsites"`
++	ExpiringLeases1h  int64  `json:"expiring_leases_1h"`
++	ExpiringLeases24h int64  `json:"expiring_leases_24h"`
++}
++
++type SubsiteRelayAdvice struct {
++	Code     string `json:"code"`
++	Severity string `json:"severity"`
++	Message  string `json:"message"`
++}
++
++type SubsiteForwardCleanupResult struct {
++	ExpiredAffinities int64 `json:"expired_affinities"`
++	ExpiredBreakers   int64 `json:"expired_breakers"`
++	DeletedEvents     int64 `json:"deleted_events"`
++	DeletedSamples    int64 `json:"deleted_samples"`
 +}
 +
 +type SubsiteForwardSiteStat struct {
@@ -3032,7 +3362,9 @@ index 0000000..37c8d96
 +	ListForwardEvents(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardEventsFilter) ([]SubsiteForwardEvent, *pagination.PaginationResult, error)
 +	ForwardStats(ctx context.Context) (*SubsiteForwardStats, error)
 +	ForwardRouteStats(ctx context.Context) ([]SubsiteForwardSiteStat, error)
++	ListRelayLeaseDistribution(ctx context.Context) ([]SubsiteRelayLeaseStat, error)
 +	ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error)
++	CleanupForwardState(ctx context.Context, now time.Time) (*SubsiteForwardCleanupResult, error)
 +}
 +
 +func (s *SubsiteService) GetForwardAffinity(ctx context.Context, key string) (*SubsiteForwardAffinity, error) {
@@ -3125,7 +3457,12 @@ index 0000000..37c8d96
 +	if s == nil || s.forwardRepo == nil {
 +		return nil, errors.New("subsite forward repository is not initialized")
 +	}
-+	return s.forwardRepo.ForwardStats(ctx)
++	stats, err := s.forwardRepo.ForwardStats(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.Recommendations = BuildSubsiteRelayAdvice(stats)
++	return stats, nil
 +}
 +
 +func (s *SubsiteService) ForwardRouteStats(ctx context.Context) ([]SubsiteForwardSiteStat, error) {
@@ -3140,6 +3477,31 @@ index 0000000..37c8d96
 +		return nil, errors.New("subsite forward repository is not initialized")
 +	}
 +	return s.forwardRepo.ListActiveCircuitBreakers(ctx)
++}
++
++func BuildSubsiteRelayAdvice(stats *SubsiteForwardStats) []SubsiteRelayAdvice {
++	if stats == nil {
++		return []SubsiteRelayAdvice{}
++	}
++	items := make([]SubsiteRelayAdvice, 0)
++	if stats.TotalSubsites == 0 {
++		items = append(items, SubsiteRelayAdvice{Code: "NO_SUBSITE", Severity: "critical", Message: "No subsite is configured. Add and activate at least one subsite."})
++	} else if stats.OnlineSubsites == 0 {
++		items = append(items, SubsiteRelayAdvice{Code: "NO_ONLINE_SUBSITE", Severity: "critical", Message: "No healthy subsite is online. Check agent heartbeat and public URL connectivity."})
++	}
++	if stats.ActiveLeases == 0 {
++		items = append(items, SubsiteRelayAdvice{Code: "NO_ACTIVE_LEASE", Severity: "warning", Message: "No account lease is active. The first request will trigger automatic distribution."})
++	}
++	if stats.Events24h >= 10 && stats.SuccessRate24h < 0.95 {
++		items = append(items, SubsiteRelayAdvice{Code: "LOW_SUCCESS_RATE", Severity: "warning", Message: "Relay success rate is below 95%. Review recent forward events and circuit breakers."})
++	}
++	if stats.Events24h >= 10 && stats.CacheHitRatio24h < 0.10 {
++		items = append(items, SubsiteRelayAdvice{Code: "LOW_CACHE_HIT", Severity: "info", Message: "Cache hit ratio is below 10%. Keep related conversations on the same affinity route where possible."})
++	}
++	if stats.ExpiringLeases24h > 0 {
++		items = append(items, SubsiteRelayAdvice{Code: "LEASE_EXPIRING", Severity: "info", Message: "Some leases expire within 24 hours. Automatic renewal or redistribution will keep requests available."})
++	}
++	return items
 +}
 +
 +func (s *SubsiteService) SignRouteHint(ctx context.Context, subsiteID, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) (string, error) {
@@ -3224,6 +3586,52 @@ index 0000000..37c8d96
 +		return "degraded"
 +	}
 +	return "online"
++}
+diff --git a/backend/internal/service/subsite_relay_test.go b/backend/internal/service/subsite_relay_test.go
+new file mode 100644
+index 0000000..7cda7d2
+--- /dev/null
++++ b/backend/internal/service/subsite_relay_test.go
+@@ -0,0 +1,40 @@
++package service
++
++import (
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestBuildSubsiteRelayAdvice(t *testing.T) {
++	items := BuildSubsiteRelayAdvice(&SubsiteForwardStats{
++		TotalSubsites:     1,
++		OnlineSubsites:    0,
++		Events24h:         20,
++		SuccessRate24h:    0.80,
++		CacheHitRatio24h:  0.05,
++		ActiveLeases:      0,
++		ExpiringLeases24h: 2,
++	})
++	codes := make([]string, 0, len(items))
++	for _, item := range items {
++		codes = append(codes, item.Code)
++	}
++	require.Contains(t, codes, "NO_ONLINE_SUBSITE")
++	require.Contains(t, codes, "NO_ACTIVE_LEASE")
++	require.Contains(t, codes, "LOW_SUCCESS_RATE")
++	require.Contains(t, codes, "LOW_CACHE_HIT")
++	require.Contains(t, codes, "LEASE_EXPIRING")
++}
++
++func TestBuildSubsiteRelayAdviceHealthy(t *testing.T) {
++	items := BuildSubsiteRelayAdvice(&SubsiteForwardStats{
++		TotalSubsites:    2,
++		OnlineSubsites:   2,
++		ActiveLeases:     4,
++		Events24h:        20,
++		SuccessRate24h:   1,
++		CacheHitRatio24h: 0.50,
++	})
++	require.Empty(t, items)
 +}
 diff --git a/backend/internal/service/subsite_usage_ingest_test.go b/backend/internal/service/subsite_usage_ingest_test.go
 index 9cf0c56..4aac3ca 100644
@@ -3831,10 +4239,10 @@ index 40896f8..d53ce81 100644
 +  SubsiteForwardStats
 +} from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..df63a27 100644
+index 1faa4eb..e213550 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
-@@ -43,6 +43,150 @@ export interface AccountLease {
+@@ -43,6 +43,170 @@ export interface AccountLease {
    updated_at: string
  }
  
@@ -3886,6 +4294,24 @@ index 1faa4eb..df63a27 100644
 +  updated_at: string
 +}
 +
++export interface SubsiteRelayLeaseStat {
++  group_id: number
++  group_name: string
++  platform: string
++  scope: string
++  required_level: string
++  active_leases: number
++  assigned_subsites: number
++  expiring_leases_1h: number
++  expiring_leases_24h: number
++}
++
++export interface SubsiteRelayAdvice {
++  code: string
++  severity: string
++  message: string
++}
++
 +export interface SubsiteForwardStats {
 +  total_affinities: number
 +  locked_affinities: number
@@ -3913,6 +4339,8 @@ index 1faa4eb..df63a27 100644
 +  mode: SubsiteForwardMode
 +  by_subsite: SubsiteForwardSiteStat[]
 +  circuit_breakers: SubsiteCircuitBreaker[]
++  lease_distribution: SubsiteRelayLeaseStat[]
++  recommendations: SubsiteRelayAdvice[]
 +}
 +
 +export type SubsiteForwardMode = 'local' | 'forward' | 'direct'
@@ -3985,7 +4413,7 @@ index 1faa4eb..df63a27 100644
  export interface CreateSubsiteRequest {
    subsite_id?: string
    name: string
-@@ -187,6 +331,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+@@ -187,6 +351,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
    await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
  }
  
@@ -4041,7 +4469,7 @@ index 1faa4eb..df63a27 100644
  export default {
    list,
    create,
-@@ -202,5 +395,11 @@ export default {
+@@ -202,5 +415,11 @@ export default {
    releaseLease,
    renewLease,
    updateLease,
@@ -4055,10 +4483,10 @@ index 1faa4eb..df63a27 100644
 +  listForwardEvents
  }
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..ac5673d 100644
+index cb5d3f8..466619c 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,5 +1,242 @@
+@@ -1,5 +1,304 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -4120,6 +4548,68 @@ index cb5d3f8..ac5673d 100644
 +          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">主站计费</p>
 +          <p class="mt-2 text-sm font-semibold text-gray-900 dark:text-white">用量回传后由主站结算</p>
 +          <p class="mt-1 text-xs text-gray-500">24h 在线 {{ forwardStats?.online_subsites || 0 }}/{{ forwardStats?.total_subsites || 0 }}，活跃租约 {{ forwardStats?.active_leases || 0 }}，即将过期 {{ forwardStats?.expiring_leases_24h || 0 }}。</p>
++        </div>
++      </div>
++
++      <div v-if="(forwardStats?.recommendations || []).length || (forwardStats?.lease_distribution || []).length" class="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between gap-3">
++            <div>
++              <h2 class="text-base font-semibold text-gray-900 dark:text-white">Relay Advisor</h2>
++              <p class="text-xs text-gray-500">Automatic checks for routing, lease health, cache hit and subsite availability.</p>
++            </div>
++            <span class="badge badge-secondary">{{ (forwardStats?.recommendations || []).length }}</span>
++          </div>
++          <div class="space-y-2">
++            <div
++              v-for="advice in forwardStats?.recommendations || []"
++              :key="advice.code"
++              :class="['rounded-xl border p-3 text-sm', adviceClass(advice.severity)]"
++            >
++              <div class="flex items-center justify-between gap-3">
++                <span class="font-semibold">{{ advice.code }}</span>
++                <span class="text-xs uppercase tracking-wide">{{ advice.severity }}</span>
++              </div>
++              <p class="mt-1 text-xs">{{ advice.message }}</p>
++            </div>
++            <p v-if="!(forwardStats?.recommendations || []).length" class="text-sm text-gray-500">No relay advice right now.</p>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3">
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">Lease Distribution</h2>
++            <p class="text-xs text-gray-500">Grouped by platform, scope and required account level. One account is assigned to only one subsite pool at a time.</p>
++          </div>
++          <div class="overflow-x-auto">
++            <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-600">
++              <thead class="text-left text-xs uppercase tracking-wide text-gray-500">
++                <tr>
++                  <th class="py-2 pr-4">Group</th>
++                  <th class="py-2 pr-4">Level</th>
++                  <th class="py-2 pr-4">Scope</th>
++                  <th class="py-2 pr-4">Leases</th>
++                  <th class="py-2">Subsites</th>
++                </tr>
++              </thead>
++              <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
++                <tr v-for="item in forwardStats?.lease_distribution || []" :key="`${item.group_id}-${item.platform}-${item.required_level}`">
++                  <td class="py-3 pr-4">
++                    <div class="font-medium text-gray-900 dark:text-white">{{ item.group_name || `#${item.group_id}` }}</div>
++                    <div class="text-xs text-gray-500">{{ item.platform }}</div>
++                  </td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">{{ item.required_level || 'any' }}</td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">{{ item.scope }}</td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    {{ item.active_leases }}
++                    <span v-if="item.expiring_leases_1h > 0" class="ml-1 text-amber-600">/{{ item.expiring_leases_1h }} expiring</span>
++                  </td>
++                  <td class="py-3 text-gray-600 dark:text-gray-300">{{ item.assigned_subsites }}</td>
++                </tr>
++              </tbody>
++            </table>
++          </div>
++          <p v-if="!(forwardStats?.lease_distribution || []).length" class="mt-3 text-sm text-gray-500">No active leases yet. Requests will trigger automatic distribution.</p>
 +        </div>
 +      </div>
 +
@@ -4301,7 +4791,7 @@ index cb5d3f8..ac5673d 100644
      <TablePageLayout>
        <template #filters>
          <div class="flex flex-wrap items-center gap-3">
-@@ -370,7 +607,15 @@
+@@ -370,7 +669,15 @@
  <script setup lang="ts">
  import { computed, onMounted, reactive, ref } from 'vue'
  import { adminAPI } from '@/api/admin'
@@ -4318,7 +4808,7 @@ index cb5d3f8..ac5673d 100644
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -382,6 +627,9 @@ import type { Column } from '@/components/common/types'
+@@ -382,6 +689,9 @@ import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
  
  const subsites = ref<Subsite[]>([])
@@ -4328,7 +4818,7 @@ index cb5d3f8..ac5673d 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,6 +642,10 @@ const leaseBulkSaving = ref(false)
+@@ -394,6 +704,10 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
@@ -4339,7 +4829,7 @@ index cb5d3f8..ac5673d 100644
  const search = ref('')
  const status = ref('')
  const leaseAccountSearch = ref('')
-@@ -442,6 +694,15 @@ const leaseBulkEditForm = reactive({
+@@ -442,6 +756,15 @@ const leaseBulkEditForm = reactive({
    max_requests: 0,
    max_tokens: 0
  })
@@ -4355,7 +4845,7 @@ index cb5d3f8..ac5673d 100644
  const selectedLeaseIDs = ref<Set<string>>(new Set())
  
  const leaseGroupOptions = computed(() => leaseGroups.value
-@@ -520,11 +781,84 @@ async function reload(): Promise<void> {
+@@ -520,11 +843,84 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -4440,7 +4930,7 @@ index cb5d3f8..ac5673d 100644
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -1027,7 +1361,120 @@ function formatDate(value?: string): string {
+@@ -1027,7 +1423,129 @@ function formatDate(value?: string): string {
    return new Date(value).toLocaleString()
  }
  
@@ -4492,6 +4982,14 @@ index cb5d3f8..ac5673d 100644
 +    offline: 'badge-gray',
 +    blocked: 'badge-danger'
 +  } as Record<string, string>)[value || ''] || 'badge-gray'
++}
++
++function adviceClass(value?: string): string {
++  return ({
++    critical: 'border-red-200 bg-red-50 text-red-700 dark:border-red-900/50 dark:bg-red-950/20 dark:text-red-200',
++    warning: 'border-amber-200 bg-amber-50 text-amber-700 dark:border-amber-900/50 dark:bg-amber-950/20 dark:text-amber-200',
++    info: 'border-sky-200 bg-sky-50 text-sky-700 dark:border-sky-900/50 dark:bg-sky-950/20 dark:text-sky-200'
++  } as Record<string, string>)[value || ''] || 'border-gray-200 bg-gray-50 text-gray-700 dark:border-dark-600 dark:bg-dark-700 dark:text-gray-200'
 +}
 +
 +function eventRouteMetadata(event: SubsiteForwardEvent): Record<string, unknown> | null {
@@ -4548,6 +5046,7 @@ index cb5d3f8..ac5673d 100644
 +  if (!route) return []
 +  return [
 +    compactRouteList('容量满', routeList(route, 'capacity_limited_subsite_ids')),
++    compactRouteList('能力不匹配', routeList(route, 'capability_mismatch_subsite_ids')),
 +    compactRouteList('熔断子站', routeList(route, 'circuit_blocked_subsite_ids')),
 +    compactRouteList('重试排除', routeList(route, 'retry_excluded_subsite_ids')),
 +    compactRouteList('不可用', routeList(route, 'ineligible_subsite_ids')),
