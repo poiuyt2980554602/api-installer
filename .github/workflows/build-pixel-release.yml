@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.26.1"
+        default: "1.0.26.2"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -27,7 +27,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.26.1' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.26.2' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PixelAPI001/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.0.26' }}
     steps:
@@ -70,7 +70,7 @@ jobs:
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
           if [ -f "$patch_file" ]; then
             git apply --directory=pixel-src "$patch_file"
-          elif [ "${PIXEL_SOURCE_VERSION}" = "upgrade/v0.1.121-merge" ] || [ "${PIXEL_SOURCE_VERSION}" = "1.0.26" ]; then
+          elif [ "${PIXEL_SOURCE_VERSION}" = "upgrade/v0.1.121-merge" ]; then
             echo "Using upstream ${PIXEL_SOURCE_VERSION} source as the forwarder base."
           else
             echo "::error::Missing compatibility patch: ${patch_file}"
@@ -83,6 +83,12 @@ jobs:
               cp -a "${overlay_dir}/." pixel-src/
             fi
           done
+          if [ ! -f pixel-src/backend/internal/handler/subsite_forwarder.go ] ||
+             ! grep -q "SUBSITE_FORWARD_NO_CANDIDATE" pixel-src/backend/internal/handler/subsite_forwarder.go; then
+            echo "::error::Subsite Relay capability is missing after patch/overlay application."
+            echo "Refusing to publish an incomplete forwarder release."
+            exit 1
+          fi
 
       - name: Setup Node.js
         run: |

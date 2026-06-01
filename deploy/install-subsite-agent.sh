@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.26.1}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.26.2}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api-subsite-agent"
@@ -81,6 +81,23 @@ check_root() {
 
 command_exists() {
     command -v "$1" >/dev/null 2>&1
+}
+
+binary_contains() {
+    local file="$1"
+    local pattern="$2"
+
+    if command_exists grep; then
+        grep -a -q "$pattern" "$file" 2>/dev/null
+        return $?
+    fi
+
+    if command_exists strings; then
+        strings "$file" | grep -q "$pattern" 2>/dev/null
+        return $?
+    fi
+
+    return 2
 }
 
 detect_platform() {
@@ -211,6 +228,17 @@ EOF
     print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
+verify_relay_binary() {
+    local binary_path="${INSTALL_DIR}/${APP_NAME}"
+
+    if ! binary_contains "$binary_path" "SUBSITE_MODELS_PROXY_FAILED"; then
+        print_error "Installed binary does not contain the Subsite Relay agent module."
+        print_error "Refusing to start an incomplete subsite-agent package."
+        exit 1
+    fi
+    print_success "Subsite Relay agent capability verified"
+}
+
 install_service() {
     if [ -f "${TMP_DIR}/deploy/sub2api-subsite-agent.service" ]; then
         install -m 0644 "${TMP_DIR}/deploy/sub2api-subsite-agent.service" "$SERVICE_FILE"
@@ -282,6 +310,7 @@ do_install() {
     download_and_extract
     create_user_if_needed
     install_files
+    verify_relay_binary
     install_service
     start_or_explain
 }

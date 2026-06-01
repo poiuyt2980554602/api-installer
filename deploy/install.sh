@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.26.1}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.26.2}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
 
 APP_NAME="sub2api"
@@ -283,6 +283,13 @@ install_files() {
 verify_forwarder_binary() {
     local binary_path="${INSTALL_DIR}/${APP_NAME}"
     local version_output=""
+
+    if ! binary_contains "$binary_path" "SUBSITE_FORWARD_NO_CANDIDATE"; then
+        print_error "Installed binary does not contain the Subsite Relay module."
+        print_error "Refusing to start an incomplete forwarder package."
+        exit 1
+    fi
+    print_success "Subsite Relay capability verified"
 
     version_output="$("$binary_path" --version 2>&1 || true)"
     if printf '%s' "$version_output" | grep -q "Sub2API ${PIXEL_VERSION}"; then

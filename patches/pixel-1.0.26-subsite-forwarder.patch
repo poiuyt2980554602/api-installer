@@ -1,0 +1,3745 @@
+diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
+index 526ea32..ca4822c 100644
+--- a/backend/cmd/server/wire_gen.go
++++ b/backend/cmd/server/wire_gen.go
+@@ -267,13 +267,14 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	subsiteService := service.NewSubsiteService(subsiteRepository, secretEncryptor)
+ 	accountLeaseRepository := repository.NewAccountLeaseRepository(db)
+ 	accountLeaseService := service.NewAccountLeaseService(accountLeaseRepository, subsiteRepository, accountRepository, groupRepository)
+-	subsiteHandler := admin.NewSubsiteHandler(subsiteService, accountLeaseService)
++	subsiteHandler := admin.NewSubsiteHandler(subsiteService, accountLeaseService, settingService)
+ 	adminHandlers := handler.ProvideAdminHandlers(dashboardHandler, adminUserHandler, groupHandler, accountHandler, accountSharePolicyHandler, adminAnnouncementHandler, adminConversationHandler, dataManagementHandler, backupHandler, oAuthHandler, openAIOAuthHandler, geminiOAuthHandler, antigravityOAuthHandler, proxyHandler, adminRedeemHandler, promoHandler, settingHandler, opsHandler, systemHandler, adminSubscriptionHandler, adminUsageHandler, userAttributeHandler, errorPassthroughHandler, tlsFingerprintProfileHandler, adminAPIKeyHandler, scheduledTestHandler, channelHandler, channelMonitorHandler, channelMonitorRequestTemplateHandler, contentModerationHandler, paymentHandler, revenueHandler, withdrawalHandler, adminShopHandler, affiliateHandler, subsiteHandler)
+ 	usageRecordWorkerPool := service.NewUsageRecordWorkerPool(configConfig)
+ 	userMsgQueueCache := repository.NewUserMsgQueueCache(redisClient)
+ 	userMessageQueueService := service.ProvideUserMessageQueueService(userMsgQueueCache, rpmCache, configConfig)
+ 	gatewayHandler := handler.NewGatewayHandler(gatewayService, geminiMessagesCompatService, antigravityGatewayService, userService, concurrencyService, billingCacheService, usageService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, userMessageQueueService, configConfig, settingService)
+ 	openAIGatewayHandler := handler.NewOpenAIGatewayHandler(openAIGatewayService, concurrencyService, billingCacheService, apiKeyService, usageRecordWorkerPool, errorPassthroughService, contentModerationService, configConfig)
++	subsiteForwarder := handler.NewSubsiteForwarder(subsiteService, settingService)
+ 	handlerSettingHandler := handler.ProvideSettingHandler(settingService, buildInfo)
+ 	totpHandler := handler.NewTotpHandler(totpService)
+ 	handlerPaymentHandler := handler.NewPaymentHandler(paymentService, paymentConfigService, channelService)
+@@ -290,7 +291,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
+ 	shopHandler := handler.NewShopHandler(shopService)
+ 	idempotencyCoordinator := service.ProvideIdempotencyCoordinator(idempotencyRepository, configConfig)
+ 	idempotencyCleanupService := service.ProvideIdempotencyCleanupService(idempotencyRepository, configConfig)
+-	handlers := handler.ProvideHandlers(authHandler, userHandler, apiKeyHandler, userAccountHandler, usageHandler, redeemHandler, subscriptionHandler, announcementHandler, conversationHandler, channelMonitorUserHandler, adminHandlers, gatewayHandler, openAIGatewayHandler, handlerSettingHandler, totpHandler, handlerPaymentHandler, paymentWebhookHandler, availableChannelHandler, subsiteInternalHandler, receiptCodeHandler, handlerWithdrawalHandler, shopHandler, idempotencyCoordinator, idempotencyCleanupService)
++	handlers := handler.ProvideHandlers(authHandler, userHandler, apiKeyHandler, userAccountHandler, usageHandler, redeemHandler, subscriptionHandler, announcementHandler, conversationHandler, channelMonitorUserHandler, adminHandlers, gatewayHandler, openAIGatewayHandler, subsiteForwarder, handlerSettingHandler, totpHandler, handlerPaymentHandler, paymentWebhookHandler, availableChannelHandler, subsiteInternalHandler, receiptCodeHandler, handlerWithdrawalHandler, shopHandler, idempotencyCoordinator, idempotencyCleanupService)
+ 	jwtAuthMiddleware := middleware.NewJWTAuthMiddleware(authService, userService)
+ 	adminAuthMiddleware := middleware.NewAdminAuthMiddleware(authService, userService, settingService)
+ 	apiKeyAuthMiddleware := middleware.NewAPIKeyAuthMiddleware(apiKeyService, subscriptionService, configConfig)
+diff --git a/backend/internal/handler/admin/subsite_handler.go b/backend/internal/handler/admin/subsite_handler.go
+index f83507c..2ab34f4 100644
+--- a/backend/internal/handler/admin/subsite_handler.go
++++ b/backend/internal/handler/admin/subsite_handler.go
+@@ -1,6 +1,9 @@
+ package admin
+ 
+ import (
++	"context"
++	"os"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+@@ -13,10 +16,11 @@ import (
+ type SubsiteHandler struct {
+ 	subsiteService *service.SubsiteService
+ 	leaseService   *service.AccountLeaseService
++	settingService *service.SettingService
+ }
+ 
+-func NewSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService) *SubsiteHandler {
+-	return &SubsiteHandler{subsiteService: subsiteService, leaseService: leaseService}
++func NewSubsiteHandler(subsiteService *service.SubsiteService, leaseService *service.AccountLeaseService, settingService *service.SettingService) *SubsiteHandler {
++	return &SubsiteHandler{subsiteService: subsiteService, leaseService: leaseService, settingService: settingService}
+ }
+ 
+ func (h *SubsiteHandler) List(c *gin.Context) {
+@@ -39,6 +43,154 @@ func (h *SubsiteHandler) List(c *gin.Context) {
+ 	})
+ }
+ 
++func (h *SubsiteHandler) ForwardStats(c *gin.Context) {
++	stats, err := h.subsiteService.ForwardStats(c.Request.Context())
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	stats.Mode = h.forwardMode(c.Request.Context())
++	response.Success(c, stats)
++}
++
++func (h *SubsiteHandler) forwardMode(ctx context.Context) string {
++	fallback := os.Getenv("SUBSITE_FORWARD_MODE")
++	if h == nil || h.settingService == nil {
++		return service.NormalizeSubsiteForwardMode(fallback)
++	}
++	return h.settingService.GetSubsiteForwardMode(ctx, fallback)
++}
++
++func (h *SubsiteHandler) UpdateForwardMode(c *gin.Context) {
++	if h == nil || h.settingService == nil {
++		response.BadRequest(c, "setting service is not initialized")
++		return
++	}
++	var input struct {
++		Mode string `json:"mode" binding:"required"`
++	}
++	if err := c.ShouldBindJSON(&input); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	mode, err := h.settingService.SetSubsiteForwardMode(c.Request.Context(), input.Mode)
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.Success(c, gin.H{"mode": mode})
++}
++
++func (h *SubsiteHandler) ListForwardAffinities(c *gin.Context) {
++	page, pageSize := response.ParsePagination(c)
++	var locked *bool
++	if value := strings.TrimSpace(c.Query("locked")); value != "" {
++		parsed, err := strconv.ParseBool(value)
++		if err != nil {
++			response.BadRequest(c, "locked must be true or false")
++			return
++		}
++		locked = &parsed
++	}
++	apiKeyID, _ := strconv.ParseInt(strings.TrimSpace(c.Query("api_key_id")), 10, 64)
++	accountID, _ := strconv.ParseInt(strings.TrimSpace(c.Query("account_id")), 10, 64)
++	items, result, err := h.subsiteService.ListForwardAffinities(c.Request.Context(), pagination.PaginationParams{
++		Page:     page,
++		PageSize: pageSize,
++	}, service.ListSubsiteForwardAffinitiesFilter{
++		SubsiteID: strings.TrimSpace(c.Query("subsite_id")),
++		APIKeyID:  apiKeyID,
++		AccountID: accountID,
++		Search:    strings.TrimSpace(c.Query("search")),
++		Locked:    locked,
++	})
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.PaginatedWithResult(c, items, &response.PaginationResult{
++		Total:    result.Total,
++		Page:     result.Page,
++		PageSize: result.PageSize,
++		Pages:    result.Pages,
++	})
++}
++
++func (h *SubsiteHandler) UpsertForwardAffinity(c *gin.Context) {
++	var input struct {
++		Key        string `json:"affinity_key" binding:"required"`
++		Type       string `json:"affinity_type"`
++		SubsiteID  string `json:"subsite_id" binding:"required"`
++		LeaseID    string `json:"lease_id"`
++		AccountID  int64  `json:"account_id"`
++		APIKeyID   int64  `json:"api_key_id"`
++		UserID     int64  `json:"user_id"`
++		GroupID    int64  `json:"group_id"`
++		Model      string `json:"model"`
++		SessionID  string `json:"session_id"`
++		TTLSeconds int    `json:"ttl_seconds"`
++		Locked     bool   `json:"locked"`
++	}
++	if err := c.ShouldBindJSON(&input); err != nil {
++		response.BadRequest(c, err.Error())
++		return
++	}
++	ttl := input.TTLSeconds
++	if ttl <= 0 {
++		ttl = 7 * 24 * 3600
++	}
++	affinity, err := h.subsiteService.UpsertForwardAffinity(c.Request.Context(), service.UpsertSubsiteForwardAffinityInput{
++		Key:        input.Key,
++		Type:       input.Type,
++		SubsiteID:  input.SubsiteID,
++		LeaseID:    input.LeaseID,
++		AccountID:  input.AccountID,
++		APIKeyID:   input.APIKeyID,
++		UserID:     input.UserID,
++		GroupID:    input.GroupID,
++		Model:      input.Model,
++		SessionID:  input.SessionID,
++		Source:     "manual",
++		Locked:     input.Locked,
++		LastReason: "manual",
++		ExpiresAt:  time.Now().Add(time.Duration(ttl) * time.Second),
++	})
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.Success(c, affinity)
++}
++
++func (h *SubsiteHandler) DeleteForwardAffinity(c *gin.Context) {
++	id, err := strconv.ParseInt(c.Param("affinity_id"), 10, 64)
++	if err != nil || id <= 0 {
++		response.BadRequest(c, "invalid affinity id")
++		return
++	}
++	if response.ErrorFrom(c, h.subsiteService.DeleteForwardAffinity(c.Request.Context(), id)) {
++		return
++	}
++	response.Success(c, gin.H{"deleted": true})
++}
++
++func (h *SubsiteHandler) ListForwardEvents(c *gin.Context) {
++	page, pageSize := response.ParsePagination(c)
++	items, result, err := h.subsiteService.ListForwardEvents(c.Request.Context(), pagination.PaginationParams{
++		Page:     page,
++		PageSize: pageSize,
++	}, service.ListSubsiteForwardEventsFilter{
++		SubsiteID: strings.TrimSpace(c.Query("subsite_id")),
++		Outcome:   strings.TrimSpace(c.Query("outcome")),
++		Search:    strings.TrimSpace(c.Query("search")),
++	})
++	if response.ErrorFrom(c, err) {
++		return
++	}
++	response.PaginatedWithResult(c, items, &response.PaginationResult{
++		Total:    result.Total,
++		Page:     result.Page,
++		PageSize: result.PageSize,
++		Pages:    result.Pages,
++	})
++}
++
+ func (h *SubsiteHandler) Create(c *gin.Context) {
+ 	var input service.CreateSubsiteInput
+ 	if err := c.ShouldBindJSON(&input); err != nil {
+diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
+index e545f4b..5eb7dfd 100644
+--- a/backend/internal/handler/handler.go
++++ b/backend/internal/handler/handler.go
+@@ -59,6 +59,7 @@ type Handlers struct {
+ 	Admin            *AdminHandlers
+ 	Gateway          *GatewayHandler
+ 	OpenAIGateway    *OpenAIGatewayHandler
++	SubsiteForwarder *SubsiteForwarder
+ 	Setting          *SettingHandler
+ 	Totp             *TotpHandler
+ 	Payment          *PaymentHandler
+diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
+new file mode 100644
+index 0000000..c034718
+--- /dev/null
++++ b/backend/internal/handler/subsite_forwarder.go
+@@ -0,0 +1,939 @@
++package handler
++
++import (
++	"bytes"
++	"context"
++	"crypto/sha256"
++	"encoding/hex"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"io"
++	"log"
++	"math/rand"
++	"net"
++	"net/http"
++	"net/url"
++	"sort"
++	"strings"
++	"sync"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/ctxkey"
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++	"github.com/Wei-Shaw/sub2api/internal/server/middleware"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++	"github.com/gin-gonic/gin"
++)
++
++const (
++	subsiteForwardAffinityTTL      = 12 * time.Hour
++	subsiteForwardMaxBodyBytes     = 64 << 20
++	subsiteForwardHealthyWindow    = 3 * time.Minute
++	subsiteForwardRouteSnapshotTTL = 1500 * time.Millisecond
++	subsiteForwardRouteStaleTTL    = 10 * time.Second
++	subsiteForwardHeader           = "X-Sub2API-Master-Forwarded"
++	subsiteForwardTargetHeader     = "X-Sub2API-Forward-Target"
++	subsiteForwardAffinityHeader   = "X-Sub2API-Forward-Affinity"
++	subsiteForwardReasonHeader     = "X-Sub2API-Forward-Reason"
++	subsiteForwardLeaseHeader      = "X-Sub2API-Lease-ID"
++	subsiteForwardAccountHeader    = "X-Sub2API-Account-ID"
++	subsiteForwardRequestIDHeader  = "X-Sub2API-Request-ID"
++	subsiteForwardNoCandidateCode  = "SUBSITE_FORWARD_NO_CANDIDATE"
++)
++
++var errSubsiteForwardNoCandidate = errors.New("no healthy subsite is available for forwarding")
++
++type SubsiteForwarder struct {
++	subsiteService *service.SubsiteService
++	settingService *service.SettingService
++	client         *http.Client
++	affinity       *subsiteAffinityStore
++	routes         *subsiteRouteSnapshotStore
++}
++
++type subsiteForwardContext struct {
++	Key              string
++	Type             string
++	Model            string
++	Session          string
++	APIKeyID         int64
++	UserID           int64
++	GroupID          int64
++	AccountID        int64
++	LeaseID          string
++	SubsiteRequestID string
++	Strict           bool
++}
++
++type subsiteRouteCandidate struct {
++	subsite service.Subsite
++	load    service.SubsiteForwardSiteStat
++}
++
++func NewSubsiteForwarder(subsiteService *service.SubsiteService, settingService *service.SettingService) *SubsiteForwarder {
++	return &SubsiteForwarder{
++		subsiteService: subsiteService,
++		settingService: settingService,
++		client: &http.Client{
++			Timeout: 0,
++			Transport: &http.Transport{
++				Proxy:                 http.ProxyFromEnvironment,
++				DialContext:           (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
++				ForceAttemptHTTP2:     true,
++				MaxIdleConns:          512,
++				MaxIdleConnsPerHost:   128,
++				MaxConnsPerHost:       256,
++				IdleConnTimeout:       90 * time.Second,
++				TLSHandshakeTimeout:   10 * time.Second,
++				ExpectContinueTimeout: 1 * time.Second,
++			},
++		},
++		affinity: newSubsiteAffinityStore(subsiteForwardAffinityTTL),
++		routes:   newSubsiteRouteSnapshotStore(subsiteForwardRouteSnapshotTTL, subsiteForwardRouteStaleTTL),
++	}
++}
++
++func (f *SubsiteForwarder) Mode(ctx context.Context, fallback string) string {
++	if f == nil || f.settingService == nil {
++		return service.NormalizeSubsiteForwardMode(fallback)
++	}
++	return f.settingService.GetSubsiteForwardMode(ctx, fallback)
++}
++
++func (f *SubsiteForwarder) ForwardGatewayRequest(c *gin.Context) bool {
++	if f == nil || f.subsiteService == nil {
++		return false
++	}
++	if strings.EqualFold(c.GetHeader(subsiteForwardHeader), "1") {
++		writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_LOOP", "subsite forward loop detected")
++		return true
++	}
++
++	body, err := readForwardBody(c)
++	if err != nil {
++		writeSubsiteForwardError(c, http.StatusBadRequest, "SUBSITE_FORWARD_BODY", err.Error())
++		return true
++	}
++	c.Request.Body = io.NopCloser(bytes.NewReader(body))
++
++	forwardCtx := f.forwardContext(c, body)
++	excluded := make(map[string]struct{})
++	fallbackFrom := ""
++	var lastErr error
++	for attempt := 0; attempt < 3; attempt++ {
++		candidate, reason, err := f.selectSubsite(c.Request.Context(), forwardCtx, excluded)
++		if err != nil {
++			if recordErr := f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, err); recordErr != nil {
++				log.Printf("[subsite-forwarder] record no_candidate event failed: %v", recordErr)
++			}
++			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, err.Error())
++			return true
++		}
++		if candidate == nil {
++			if recordErr := f.recordForwardEvent(c, forwardCtx, nil, fallbackFrom, reason, "no_candidate", 0, 0, len(body), 0, errSubsiteForwardNoCandidate); recordErr != nil {
++				log.Printf("[subsite-forwarder] record no_candidate event failed: %v", recordErr)
++			}
++			writeSubsiteForwardError(c, http.StatusServiceUnavailable, subsiteForwardNoCandidateCode, errSubsiteForwardNoCandidate.Error())
++			return true
++		}
++
++		proxyResult, err := f.proxy(c, candidate, body, reason, forwardCtx)
++		if err == nil {
++			outcome := forwardOutcomeForProxyResult(proxyResult, fallbackFrom)
++			var eventErr error
++			if outcome == "success" || outcome == "fallback" {
++				if affinityErr := f.storeAffinity(c.Request.Context(), forwardCtx, candidate, reason, ""); affinityErr != nil {
++					log.Printf("[subsite-forwarder] store affinity failed: %v", affinityErr)
++				}
++			} else {
++				eventErr = fmt.Errorf("subsite returned %d", proxyResult.StatusCode)
++			}
++			if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, outcome, proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, eventErr); recordErr != nil {
++				log.Printf("[subsite-forwarder] record %s event failed: %v", outcome, recordErr)
++			}
++			return true
++		}
++		lastErr = err
++		if recordErr := f.recordForwardEvent(c, forwardCtx, candidate, fallbackFrom, reason, "failed", proxyResult.StatusCode, proxyResult.LatencyMS, len(body), proxyResult.ResponseBytes, err); recordErr != nil {
++			log.Printf("[subsite-forwarder] record failed event failed: %v", recordErr)
++		}
++		if c.Writer.Written() {
++			return true
++		}
++		forwardCtx.LeaseID = ""
++		forwardCtx.AccountID = 0
++		excluded[candidate.SubsiteID] = struct{}{}
++		fallbackFrom = candidate.SubsiteID
++	}
++	if lastErr == nil {
++		lastErr = errSubsiteForwardNoCandidate
++	}
++	writeSubsiteForwardError(c, http.StatusBadGateway, "SUBSITE_FORWARD_FAILED", lastErr.Error())
++	return true
++}
++
++func (f *SubsiteForwarder) selectSubsite(ctx context.Context, forwardCtx *subsiteForwardContext, excluded map[string]struct{}) (*service.Subsite, string, error) {
++	snapshot, err := f.routeSnapshot(ctx)
++	if err != nil {
++		return nil, "", err
++	}
++	blockedSubsites, blockedAccounts, blockedLeases := activeCircuitMaps(snapshot.breakers)
++	now := time.Now()
++	active := make([]subsiteRouteCandidate, 0, len(snapshot.items))
++	for _, item := range snapshot.items {
++		if !isForwardableSubsite(item, now) {
++			continue
++		}
++		if _, skip := excluded[item.SubsiteID]; skip {
++			continue
++		}
++		if _, skip := blockedSubsites[item.SubsiteID]; skip {
++			continue
++		}
++		active = append(active, subsiteRouteCandidate{
++			subsite: item,
++			load:    snapshot.loadBySubsite[item.SubsiteID],
++		})
++	}
++	if len(active) == 0 {
++		return nil, "", errSubsiteForwardNoCandidate
++	}
++	if persisted, err := f.subsiteService.GetForwardAffinity(ctx, forwardCtx.Key); err == nil && persisted != nil {
++		if persisted.AccountID > 0 {
++			if _, blocked := blockedAccounts[persisted.AccountID]; blocked {
++				persisted.AccountID = 0
++				persisted.LeaseID = ""
++			}
++		}
++		if strings.TrimSpace(persisted.LeaseID) != "" {
++			if _, blocked := blockedLeases[persisted.LeaseID]; blocked {
++				persisted.LeaseID = ""
++				persisted.AccountID = 0
++			}
++		}
++		for i := range active {
++			if active[i].subsite.SubsiteID == persisted.SubsiteID {
++				forwardCtx.AccountID = persisted.AccountID
++				forwardCtx.LeaseID = persisted.LeaseID
++				forwardCtx.Strict = persisted.Locked
++				return &active[i].subsite, "db_affinity", nil
++			}
++		}
++	}
++	if id, ok := f.affinity.Get(forwardCtx.Key); ok {
++		for i := range active {
++			if active[i].subsite.SubsiteID == id {
++				return &active[i].subsite, "memory_affinity", nil
++			}
++		}
++	}
++	sort.SliceStable(active, func(i, j int) bool {
++		if active[i].load.ActiveRequests != active[j].load.ActiveRequests {
++			return active[i].load.ActiveRequests < active[j].load.ActiveRequests
++		}
++		if active[i].load.QPS != active[j].load.QPS {
++			return active[i].load.QPS < active[j].load.QPS
++		}
++		if active[i].subsite.HealthScore != active[j].subsite.HealthScore {
++			return active[i].subsite.HealthScore > active[j].subsite.HealthScore
++		}
++		if active[i].subsite.LastHeartbeatAt == nil {
++			return false
++		}
++		if active[j].subsite.LastHeartbeatAt == nil {
++			return true
++		}
++		return active[i].subsite.LastHeartbeatAt.After(*active[j].subsite.LastHeartbeatAt)
++	})
++	bestScore := active[0].subsite.HealthScore
++	bestLoad := active[0].load.ActiveRequests
++	top := active[:0]
++	for _, item := range active {
++		if item.subsite.HealthScore == bestScore && item.load.ActiveRequests == bestLoad {
++			top = append(top, item)
++		}
++	}
++	selected := top[rand.Intn(len(top))]
++	return &selected.subsite, "least_load", nil
++}
++
++func (f *SubsiteForwarder) routeSnapshot(ctx context.Context) (*subsiteRouteSnapshot, error) {
++	if f == nil || f.subsiteService == nil {
++		return nil, errors.New("subsite forwarder dependencies are nil")
++	}
++	if f.routes == nil {
++		f.routes = newSubsiteRouteSnapshotStore(subsiteForwardRouteSnapshotTTL, subsiteForwardRouteStaleTTL)
++	}
++	return f.routes.Get(ctx, func(ctx context.Context) (*subsiteRouteSnapshot, error) {
++		items, _, err := f.subsiteService.List(ctx, pagination.PaginationParams{Page: 1, PageSize: 1000}, service.ListSubsitesFilter{})
++		if err != nil {
++			return nil, err
++		}
++		breakers, err := f.subsiteService.ListActiveCircuitBreakers(ctx)
++		if err != nil {
++			log.Printf("[subsite-forwarder] list circuit breakers failed; routing without circuit filter: %v", err)
++			breakers = nil
++		}
++		loadBySubsite := make(map[string]service.SubsiteForwardSiteStat)
++		stats, err := f.subsiteService.ForwardRouteStats(ctx)
++		if err != nil {
++			log.Printf("[subsite-forwarder] forward stats failed; routing without load stats: %v", err)
++		}
++		for _, item := range stats {
++			loadBySubsite[item.SubsiteID] = item
++		}
++		return &subsiteRouteSnapshot{
++			items:         items,
++			breakers:      breakers,
++			loadBySubsite: loadBySubsite,
++			loadedAt:      time.Now(),
++		}, nil
++	})
++}
++
++type subsiteProxyResult struct {
++	StatusCode    int
++	LatencyMS     int64
++	ResponseBytes int64
++	ClientError   bool
++}
++
++type subsiteHTTPStatusError struct {
++	statusCode int
++	body       string
++}
++
++func (e *subsiteHTTPStatusError) Error() string {
++	if e == nil {
++		return "subsite returned an error status"
++	}
++	if e.body != "" {
++		return fmt.Sprintf("subsite returned %d: %s", e.statusCode, e.body)
++	}
++	return fmt.Sprintf("subsite returned %d", e.statusCode)
++}
++
++func (f *SubsiteForwarder) proxy(c *gin.Context, subsite *service.Subsite, body []byte, reason string, forwardCtx *subsiteForwardContext) (subsiteProxyResult, error) {
++	targetURL, err := buildSubsiteForwardURL(subsite.PublicURL, c.Request.URL)
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	req, err := http.NewRequestWithContext(c.Request.Context(), c.Request.Method, targetURL, bytes.NewReader(body))
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	copyForwardHeaders(req.Header, c.Request.Header)
++	if requestID := requestIDFromContextOrHeader(c); requestID != "" {
++		req.Header.Set("X-Request-ID", requestID)
++	}
++	req.Header.Set(subsiteForwardHeader, "1")
++	req.Header.Set("X-Forwarded-Host", c.Request.Host)
++	req.Header.Set("X-Forwarded-Proto", forwardedProto(c))
++	req.Header.Set("X-Forwarded-For", c.ClientIP())
++	if forwardCtx.AccountID > 0 {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredAccountID, fmt.Sprint(forwardCtx.AccountID))
++	}
++	if forwardCtx.LeaseID != "" {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredLeaseID, forwardCtx.LeaseID)
++	}
++	if forwardCtx.Strict {
++		req.Header.Set(service.SubsiteRouteHeaderPreferredStrict, "1")
++	}
++	if forwardCtx.AccountID > 0 || forwardCtx.LeaseID != "" {
++		timestamp := time.Now().UTC().Format(time.RFC3339)
++		nonce := requestShapeHash(c.Request.Method, c.Request.URL.RequestURI(), fmt.Sprintf("%s:%d", subsite.SubsiteID, time.Now().UnixNano()), forwardCtx.APIKeyID, forwardCtx.UserID, forwardCtx.GroupID)
++		signature, err := f.subsiteService.SignRouteHint(c.Request.Context(), subsite.SubsiteID, c.Request.Method, c.Request.URL.RequestURI(), timestamp, nonce, forwardCtx.LeaseID, forwardCtx.AccountID)
++		if err != nil {
++			return subsiteProxyResult{}, fmt.Errorf("sign subsite route hint: %w", err)
++		}
++		req.Header.Set(service.SubsiteRouteHeaderTimestamp, timestamp)
++		req.Header.Set(service.SubsiteRouteHeaderNonce, nonce)
++		req.Header.Set(service.SubsiteRouteHeaderSignature, signature)
++	}
++
++	started := time.Now()
++	resp, err := f.client.Do(req)
++	if err != nil {
++		return subsiteProxyResult{}, err
++	}
++	defer resp.Body.Close()
++
++	if leaseID := strings.TrimSpace(resp.Header.Get(subsiteForwardLeaseHeader)); leaseID != "" {
++		forwardCtx.LeaseID = leaseID
++	}
++	if requestID := strings.TrimSpace(resp.Header.Get(subsiteForwardRequestIDHeader)); requestID != "" {
++		forwardCtx.SubsiteRequestID = requestID
++	}
++	if accountID := parseForwardAccountID(resp.Header.Get(subsiteForwardAccountHeader)); accountID > 0 {
++		forwardCtx.AccountID = accountID
++	}
++	latencyMS := time.Since(started).Milliseconds()
++	if shouldFailoverSubsiteStatus(resp.StatusCode) {
++		payload, _ := io.ReadAll(http.MaxBytesReader(c.Writer, resp.Body, 1<<20))
++		if isSubsiteAuthorizationSelectionFailure(resp.StatusCode, payload) {
++			copyResponseHeaders(c.Writer.Header(), resp.Header)
++			c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
++			c.Header(subsiteForwardReasonHeader, reason)
++			c.Header(subsiteForwardAffinityHeader, "miss")
++			c.Header("X-Sub2API-Forward-Latency-MS", fmt.Sprint(latencyMS))
++			c.Status(resp.StatusCode)
++			n, writeErr := copySubsiteResponse(c, bytes.NewReader(payload), resp.Header.Get("Content-Type"))
++			if n == 0 {
++				n = int64(len(payload))
++			}
++			return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n, ClientError: true}, writeErr
++		}
++		return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: int64(len(payload))}, &subsiteHTTPStatusError{
++			statusCode: resp.StatusCode,
++			body:       strings.TrimSpace(string(payload)),
++		}
++	}
++	copyResponseHeaders(c.Writer.Header(), resp.Header)
++	c.Header(subsiteForwardTargetHeader, subsite.SubsiteID)
++	c.Header(subsiteForwardReasonHeader, reason)
++	if reason == "affinity" || reason == "memory_affinity" || reason == "db_affinity" {
++		c.Header(subsiteForwardAffinityHeader, "hit")
++	} else {
++		c.Header(subsiteForwardAffinityHeader, "miss")
++	}
++	c.Header("X-Sub2API-Forward-Latency-MS", fmt.Sprint(latencyMS))
++	c.Status(resp.StatusCode)
++	n, err := copySubsiteResponse(c, resp.Body, resp.Header.Get("Content-Type"))
++	return subsiteProxyResult{StatusCode: resp.StatusCode, LatencyMS: latencyMS, ResponseBytes: n}, err
++}
++
++func (f *SubsiteForwarder) forwardContext(c *gin.Context, body []byte) *subsiteForwardContext {
++	apiKeyID := int64(0)
++	userID := int64(0)
++	groupID := int64(0)
++	if apiKey, ok := middleware.GetAPIKeyFromContext(c); ok && apiKey != nil {
++		apiKeyID = apiKey.ID
++		userID = apiKey.UserID
++		if apiKey.GroupID != nil {
++			groupID = *apiKey.GroupID
++		}
++	}
++	model := extractForwardModel(body)
++	session := extractForwardSession(body, c.Request.Header)
++	affinityType := "session"
++	if session == "" {
++		affinityType = "api_key"
++		session = stableModelAffinityScope(c.Request.Method, c.Request.URL.Path, model)
++	}
++	return &subsiteForwardContext{
++		Key:      fmt.Sprintf("%s:api:%d:user:%d:group:%d:model:%s:session:%s", affinityType, apiKeyID, userID, groupID, model, session),
++		Type:     affinityType,
++		Model:    model,
++		Session:  session,
++		APIKeyID: apiKeyID,
++		UserID:   userID,
++		GroupID:  groupID,
++	}
++}
++
++func (f *SubsiteForwarder) storeAffinity(ctx context.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, reason, lastError string) error {
++	if f == nil || f.subsiteService == nil || subsite == nil || forwardCtx.Key == "" {
++		return nil
++	}
++	f.affinity.Set(forwardCtx.Key, subsite.SubsiteID)
++	_, err := f.subsiteService.UpsertForwardAffinity(ctx, service.UpsertSubsiteForwardAffinityInput{
++		Key:        forwardCtx.Key,
++		Type:       forwardCtx.Type,
++		SubsiteID:  subsite.SubsiteID,
++		LeaseID:    forwardCtx.LeaseID,
++		AccountID:  forwardCtx.AccountID,
++		APIKeyID:   forwardCtx.APIKeyID,
++		UserID:     forwardCtx.UserID,
++		GroupID:    forwardCtx.GroupID,
++		Model:      forwardCtx.Model,
++		SessionID:  forwardCtx.Session,
++		Source:     "auto",
++		LastReason: reason,
++		LastError:  lastError,
++		ExpiresAt:  time.Now().Add(subsiteForwardAffinityTTL),
++	})
++	return err
++}
++
++func (f *SubsiteForwarder) recordForwardEvent(c *gin.Context, forwardCtx *subsiteForwardContext, subsite *service.Subsite, fallbackFrom, reason, outcome string, statusCode int, latencyMS int64, requestBytes int, responseBytes int64, eventErr error) error {
++	if f == nil || f.subsiteService == nil || c == nil {
++		return nil
++	}
++	if forwardCtx == nil {
++		forwardCtx = &subsiteForwardContext{}
++	}
++	subsiteID := ""
++	if subsite != nil {
++		subsiteID = subsite.SubsiteID
++	}
++	errText := ""
++	if eventErr != nil {
++		errText = eventErr.Error()
++	}
++	return f.subsiteService.RecordForwardEvent(c.Request.Context(), &service.SubsiteForwardEvent{
++		RequestID:          requestIDFromContextOrHeader(c),
++		AffinityKey:        forwardCtx.Key,
++		SubsiteID:          subsiteID,
++		AttemptedSubsiteID: subsiteID,
++		FallbackFrom:       fallbackFrom,
++		LeaseID:            forwardCtx.LeaseID,
++		AccountID:          forwardCtx.AccountID,
++		APIKeyID:           forwardCtx.APIKeyID,
++		UserID:             forwardCtx.UserID,
++		GroupID:            forwardCtx.GroupID,
++		Model:              forwardCtx.Model,
++		SessionID:          forwardCtx.Session,
++		Method:             c.Request.Method,
++		Path:               c.Request.URL.Path,
++		StatusCode:         statusCode,
++		LatencyMS:          latencyMS,
++		RequestBytes:       int64(requestBytes),
++		ResponseBytes:      responseBytes,
++		Reason:             reason,
++		Outcome:            outcome,
++		Error:              errText,
++		Metadata: map[string]any{
++			"query":              c.Request.URL.RawQuery,
++			"forward_trace":      requestIDFromContextOrHeader(c),
++			"subsite_request_id": forwardCtx.SubsiteRequestID,
++			"client_request":     c.GetHeader("X-Client-Request-ID"),
++		},
++	})
++}
++
++func requestIDFromContextOrHeader(c *gin.Context) string {
++	if c == nil {
++		return ""
++	}
++	if c.Request != nil {
++		if requestID, ok := c.Request.Context().Value(ctxkey.RequestID).(string); ok && strings.TrimSpace(requestID) != "" {
++			return strings.TrimSpace(requestID)
++		}
++	}
++	for _, key := range []string{"X-Request-ID", "X-Request-Id"} {
++		if value := strings.TrimSpace(c.GetHeader(key)); value != "" {
++			return value
++		}
++	}
++	return ""
++}
++
++func isForwardableSubsite(subsite service.Subsite, now time.Time) bool {
++	if subsite.Status != service.SubsiteStatusActive {
++		return false
++	}
++	if strings.TrimSpace(subsite.PublicURL) == "" {
++		return false
++	}
++	if subsite.LastHeartbeatAt == nil {
++		return false
++	}
++	return now.Sub(*subsite.LastHeartbeatAt) <= subsiteForwardHealthyWindow
++}
++
++func activeCircuitMaps(breakers []service.SubsiteCircuitBreaker) (map[string]struct{}, map[int64]struct{}, map[string]struct{}) {
++	blockedSubsites := make(map[string]struct{})
++	blockedAccounts := make(map[int64]struct{})
++	blockedLeases := make(map[string]struct{})
++	for _, breaker := range breakers {
++		switch breaker.Scope {
++		case "subsite":
++			targetID := strings.TrimSpace(breaker.SubsiteID)
++			if targetID == "" {
++				targetID = strings.TrimSpace(breaker.TargetID)
++			}
++			if targetID != "" {
++				blockedSubsites[targetID] = struct{}{}
++			}
++		case "account":
++			if breaker.AccountID > 0 {
++				blockedAccounts[breaker.AccountID] = struct{}{}
++				continue
++			}
++			if id := parseForwardAccountID(breaker.TargetID); id > 0 {
++				blockedAccounts[id] = struct{}{}
++			}
++		case "lease":
++			targetID := strings.TrimSpace(breaker.LeaseID)
++			if targetID == "" {
++				targetID = strings.TrimSpace(breaker.TargetID)
++			}
++			if targetID != "" {
++				blockedLeases[targetID] = struct{}{}
++			}
++		}
++	}
++	return blockedSubsites, blockedAccounts, blockedLeases
++}
++
++func forwardOutcomeForStatus(statusCode int, fallbackFrom string) string {
++	if shouldFailoverSubsiteStatus(statusCode) {
++		return "failed"
++	}
++	if statusCode >= http.StatusBadRequest {
++		return "client_error"
++	}
++	if fallbackFrom != "" {
++		return "fallback"
++	}
++	return "success"
++}
++
++func forwardOutcomeForProxyResult(result subsiteProxyResult, fallbackFrom string) string {
++	if result.ClientError {
++		return "client_error"
++	}
++	return forwardOutcomeForStatus(result.StatusCode, fallbackFrom)
++}
++
++func shouldFailoverSubsiteStatus(statusCode int) bool {
++	return statusCode == http.StatusUnauthorized ||
++		statusCode == http.StatusForbidden ||
++		statusCode == http.StatusTooManyRequests ||
++		statusCode >= http.StatusInternalServerError
++}
++
++func isSubsiteAuthorizationSelectionFailure(statusCode int, body []byte) bool {
++	if statusCode != http.StatusUnauthorized && statusCode != http.StatusForbidden {
++		return false
++	}
++	text := string(body)
++	if !strings.Contains(text, "SUBSITE_AUTHORIZE_FAILED") {
++		return false
++	}
++	for _, code := range []string{
++		"SUBSITE_NO_ACCOUNT_LEASE",
++		"SUBSITE_GROUP_REQUIRED",
++		"SUBSITE_MODEL_MISMATCH",
++		"QUOTA_RESERVATION_INSUFFICIENT_FUNDS",
++		"QUOTA_RESERVATION_COST_REQUIRED",
++		"SUBSCRIPTION_LIMIT",
++	} {
++		if strings.Contains(text, code) {
++			return true
++		}
++	}
++	return false
++}
++
++func readForwardBody(c *gin.Context) ([]byte, error) {
++	if c.Request.Body == nil {
++		return nil, nil
++	}
++	reader := http.MaxBytesReader(c.Writer, c.Request.Body, subsiteForwardMaxBodyBytes)
++	body, err := io.ReadAll(reader)
++	if err != nil {
++		return nil, err
++	}
++	return body, nil
++}
++
++func buildSubsiteForwardURL(base string, original *url.URL) (string, error) {
++	parsed, err := url.Parse(strings.TrimRight(strings.TrimSpace(base), "/"))
++	if err != nil {
++		return "", err
++	}
++	if parsed.Scheme == "" || parsed.Host == "" {
++		return "", fmt.Errorf("invalid subsite public url: %s", base)
++	}
++	parsed.Path = strings.TrimRight(parsed.Path, "/") + original.EscapedPath()
++	parsed.RawQuery = original.RawQuery
++	return parsed.String(), nil
++}
++
++func copyForwardHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipForwardHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copyResponseHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if shouldSkipResponseHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copySubsiteResponse(c *gin.Context, reader io.Reader, contentType string) (int64, error) {
++	if isForwardStreamingContent(contentType) {
++		header := c.Writer.Header()
++		if strings.TrimSpace(contentType) != "" {
++			header.Set("Content-Type", contentType)
++		}
++		header.Set("Cache-Control", "no-cache")
++		header.Set("X-Accel-Buffering", "no")
++		header.Del("Content-Length")
++		c.Writer.WriteHeaderNow()
++		c.Writer.Flush()
++		return copyWithFlush(c.Writer, reader)
++	}
++	return io.Copy(c.Writer, reader)
++}
++
++func copyWithFlush(writer gin.ResponseWriter, reader io.Reader) (int64, error) {
++	buf := make([]byte, 32*1024)
++	var written int64
++	for {
++		n, readErr := reader.Read(buf)
++		if n > 0 {
++			m, writeErr := writer.Write(buf[:n])
++			written += int64(m)
++			if writeErr != nil {
++				return written, writeErr
++			}
++			if m != n {
++				return written, io.ErrShortWrite
++			}
++			writer.Flush()
++		}
++		if readErr != nil {
++			if readErr == io.EOF {
++				return written, nil
++			}
++			return written, readErr
++		}
++	}
++}
++
++func isForwardStreamingContent(contentType string) bool {
++	return strings.Contains(strings.ToLower(contentType), "text/event-stream")
++}
++
++func shouldSkipForwardHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length",
++		"x-sub2api-preferred-account-id", "x-sub2api-preferred-lease-id", "x-sub2api-preferred-strict", "x-sub2api-route-signature", "x-sub2api-route-timestamp", "x-sub2api-route-nonce":
++		return true
++	default:
++		return false
++	}
++}
++
++func shouldSkipResponseHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length",
++		"x-sub2api-account-id", "x-sub2api-lease-id", "x-sub2api-request-id":
++		return true
++	default:
++		return false
++	}
++}
++
++func parseForwardAccountID(value string) int64 {
++	value = strings.TrimSpace(value)
++	if value == "" {
++		return 0
++	}
++	var id int64
++	if _, err := fmt.Sscan(value, &id); err != nil || id <= 0 {
++		return 0
++	}
++	return id
++}
++
++func forwardedProto(c *gin.Context) string {
++	if value := strings.TrimSpace(c.GetHeader("X-Forwarded-Proto")); value != "" {
++		return value
++	}
++	if c.Request.TLS != nil {
++		return "https"
++	}
++	return "http"
++}
++
++func extractForwardModel(body []byte) string {
++	var payload map[string]any
++	if len(body) == 0 || json.Unmarshal(body, &payload) != nil {
++		return ""
++	}
++	if model, ok := payload["model"].(string); ok {
++		return strings.TrimSpace(model)
++	}
++	return ""
++}
++
++func extractForwardSession(body []byte, header http.Header) string {
++	keys := []string{
++		"previous_response_id",
++		"conversation_id",
++		"session_id",
++		"thread_id",
++		"response_id",
++		"parent_response_id",
++		"metadata.conversation_id",
++		"metadata.session_id",
++		"metadata.thread_id",
++	}
++	var payload map[string]any
++	if len(body) > 0 && json.Unmarshal(body, &payload) == nil {
++		for _, key := range keys {
++			if value := stringFromNestedMap(payload, strings.Split(key, ".")); value != "" {
++				return key + ":" + value
++			}
++		}
++	}
++	for _, key := range []string{
++		"session_id",
++		"conversation_id",
++		"thread_id",
++		"OpenAI-Session-ID",
++		"OpenAI-Conversation-ID",
++		"x-session-id",
++		"x-conversation-id",
++		"x-thread-id",
++	} {
++		if value := strings.TrimSpace(header.Get(key)); value != "" {
++			return key + ":" + value
++		}
++	}
++	return ""
++}
++
++func stringFromNestedMap(root map[string]any, path []string) string {
++	if len(path) == 0 {
++		return ""
++	}
++	var current any = root
++	for _, part := range path {
++		obj, ok := current.(map[string]any)
++		if !ok {
++			return ""
++		}
++		current = obj[part]
++	}
++	value, ok := current.(string)
++	if !ok {
++		return ""
++	}
++	return strings.TrimSpace(value)
++}
++
++func requestShapeHash(method, path, model string, apiKeyID, userID, groupID int64) string {
++	sum := sha256.Sum256([]byte(fmt.Sprintf("%s|%s|%s|%d|%d|%d", method, path, model, apiKeyID, userID, groupID)))
++	return hex.EncodeToString(sum[:12])
++}
++
++func stableModelAffinityScope(method, path, model string) string {
++	normalizedPath := strings.TrimRight(strings.TrimSpace(path), "/")
++	if normalizedPath == "" {
++		normalizedPath = "/"
++	}
++	if model == "" {
++		model = "models"
++	}
++	return fmt.Sprintf("%s:%s:%s", strings.ToUpper(strings.TrimSpace(method)), normalizedPath, model)
++}
++
++func writeSubsiteForwardError(c *gin.Context, status int, code, message string) {
++	c.AbortWithStatusJSON(status, gin.H{"error": gin.H{"code": code, "message": message}})
++}
++
++type subsiteAffinityStore struct {
++	mu      sync.RWMutex
++	ttl     time.Duration
++	entries map[string]subsiteAffinityEntry
++}
++
++type subsiteAffinityEntry struct {
++	subsiteID string
++	expiresAt time.Time
++}
++
++func newSubsiteAffinityStore(ttl time.Duration) *subsiteAffinityStore {
++	return &subsiteAffinityStore{ttl: ttl, entries: make(map[string]subsiteAffinityEntry)}
++}
++
++func (s *subsiteAffinityStore) Get(key string) (string, bool) {
++	s.mu.RLock()
++	entry, ok := s.entries[key]
++	s.mu.RUnlock()
++	if !ok || time.Now().After(entry.expiresAt) {
++		if ok {
++			s.mu.Lock()
++			delete(s.entries, key)
++			s.mu.Unlock()
++		}
++		return "", false
++	}
++	return entry.subsiteID, true
++}
++
++func (s *subsiteAffinityStore) Set(key, subsiteID string) {
++	if key == "" || subsiteID == "" {
++		return
++	}
++	s.mu.Lock()
++	s.entries[key] = subsiteAffinityEntry{subsiteID: subsiteID, expiresAt: time.Now().Add(s.ttl)}
++	s.mu.Unlock()
++}
++
++type subsiteRouteSnapshotStore struct {
++	mu       sync.RWMutex
++	ttl      time.Duration
++	staleTTL time.Duration
++	snapshot *subsiteRouteSnapshot
++	expires  time.Time
++	staleAt  time.Time
++}
++
++type subsiteRouteSnapshot struct {
++	items         []service.Subsite
++	breakers      []service.SubsiteCircuitBreaker
++	loadBySubsite map[string]service.SubsiteForwardSiteStat
++	loadedAt      time.Time
++}
++
++func newSubsiteRouteSnapshotStore(ttl, staleTTL time.Duration) *subsiteRouteSnapshotStore {
++	return &subsiteRouteSnapshotStore{ttl: ttl, staleTTL: staleTTL}
++}
++
++func (s *subsiteRouteSnapshotStore) Get(ctx context.Context, load func(context.Context) (*subsiteRouteSnapshot, error)) (*subsiteRouteSnapshot, error) {
++	if s == nil || load == nil {
++		return nil, errors.New("subsite route snapshot store is not initialized")
++	}
++	now := time.Now()
++	s.mu.RLock()
++	if s.snapshot != nil && now.Before(s.expires) {
++		snapshot := s.snapshot
++		s.mu.RUnlock()
++		return snapshot, nil
++	}
++	s.mu.RUnlock()
++
++	s.mu.Lock()
++	defer s.mu.Unlock()
++	now = time.Now()
++	if s.snapshot != nil && now.Before(s.expires) {
++		return s.snapshot, nil
++	}
++	snapshot, err := load(ctx)
++	if err != nil {
++		if s.snapshot != nil && now.Before(s.staleAt) {
++			return s.snapshot, nil
++		}
++		return nil, err
++	}
++	if snapshot == nil {
++		return nil, errSubsiteForwardNoCandidate
++	}
++	if snapshot.loadBySubsite == nil {
++		snapshot.loadBySubsite = make(map[string]service.SubsiteForwardSiteStat)
++	}
++	if snapshot.loadedAt.IsZero() {
++		snapshot.loadedAt = now
++	}
++	s.snapshot = snapshot
++	s.expires = snapshot.loadedAt.Add(s.ttl)
++	s.staleAt = snapshot.loadedAt.Add(s.ttl + s.staleTTL)
++	return snapshot, nil
++}
+diff --git a/backend/internal/handler/wire.go b/backend/internal/handler/wire.go
+index 80bed32..c5fa486 100644
+--- a/backend/internal/handler/wire.go
++++ b/backend/internal/handler/wire.go
+@@ -111,6 +111,7 @@ func ProvideHandlers(
+ 	adminHandlers *AdminHandlers,
+ 	gatewayHandler *GatewayHandler,
+ 	openaiGatewayHandler *OpenAIGatewayHandler,
++	subsiteForwarder *SubsiteForwarder,
+ 	settingHandler *SettingHandler,
+ 	totpHandler *TotpHandler,
+ 	paymentHandler *PaymentHandler,
+@@ -137,6 +138,7 @@ func ProvideHandlers(
+ 		Admin:            adminHandlers,
+ 		Gateway:          gatewayHandler,
+ 		OpenAIGateway:    openaiGatewayHandler,
++		SubsiteForwarder: subsiteForwarder,
+ 		Setting:          settingHandler,
+ 		Totp:             totpHandler,
+ 		Payment:          paymentHandler,
+@@ -164,6 +166,7 @@ var ProviderSet = wire.NewSet(
+ 	NewChannelMonitorUserHandler,
+ 	NewGatewayHandler,
+ 	NewOpenAIGatewayHandler,
++	NewSubsiteForwarder,
+ 	NewTotpHandler,
+ 	ProvideSettingHandler,
+ 	NewPaymentHandler,
+diff --git a/backend/internal/repository/subsite_relay_repo.go b/backend/internal/repository/subsite_relay_repo.go
+new file mode 100644
+index 0000000..83c3d4f
+--- /dev/null
++++ b/backend/internal/repository/subsite_relay_repo.go
+@@ -0,0 +1,695 @@
++package repository
++
++import (
++	"context"
++	"database/sql"
++	"encoding/json"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++	"github.com/Wei-Shaw/sub2api/internal/service"
++)
++
++func (r *subsiteRepository) recordSubsiteHealthSample(ctx context.Context, heartbeat *service.SubsiteHeartbeat, metadataJSON []byte) error {
++	if heartbeat == nil {
++		return nil
++	}
++	healthScore := 100
++	if strings.EqualFold(strings.TrimSpace(heartbeat.Status), service.SubsiteStatusUnhealthy) {
++		healthScore = 0
++	}
++	sampleCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
++	defer cancel()
++	_, err := r.db.ExecContext(sampleCtx, `
++		INSERT INTO subsite_health_samples (
++			subsite_id, status, health_score, active_requests, queued_usage, qps,
++			cpu_percent, memory_bytes, version, metadata, created_at
++		)
++		VALUES (
++			$1::varchar, $2::varchar, $3::int, $4::int, $5::int, $6::double precision,
++			$7::double precision, $8::bigint, $9::varchar, $10::jsonb, $11::timestamptz
++		)
++	`, heartbeat.SubsiteID, heartbeat.Status, healthScore, heartbeat.ActiveRequests, heartbeat.QueuedUsage,
++		heartbeat.QPS, heartbeat.CPUPercent, heartbeat.MemoryBytes, heartbeat.Version, metadataJSON, heartbeat.ReportedAt)
++	return err
++}
++
++func (r *subsiteRepository) GetForwardAffinity(ctx context.Context, key string) (*service.SubsiteForwardAffinity, error) {
++	affinity, err := scanForwardAffinity(r.db.QueryRowContext(ctx, forwardAffinitySelectSQL()+`
++		WHERE affinity_key = $1
++		  AND deleted_at IS NULL
++		  AND (locked = TRUE OR expires_at > NOW())
++	`, strings.TrimSpace(key)))
++	if errors.Is(err, sql.ErrNoRows) {
++		return nil, service.ErrSubsiteNotFound
++	}
++	if err != nil {
++		return nil, fmt.Errorf("get subsite forward affinity: %w", err)
++	}
++	return affinity, nil
++}
++
++func (r *subsiteRepository) UpsertForwardAffinity(ctx context.Context, input service.UpsertSubsiteForwardAffinityInput) (*service.SubsiteForwardAffinity, error) {
++	affinity, err := scanForwardAffinity(r.db.QueryRowContext(ctx, `
++		INSERT INTO subsite_forward_affinities (
++			affinity_key, affinity_type, subsite_id, lease_id, account_id, api_key_id,
++			user_id, group_id, model, session_id, source, locked, last_reason,
++			last_error, expires_at, hits, last_used_at
++		)
++		VALUES ($1, $2, $3, NULLIF($4, ''), NULLIF($5, 0), NULLIF($6, 0),
++			NULLIF($7, 0), NULLIF($8, 0), $9, $10, $11, $12, $13, $14, $15, 1, NOW())
++		ON CONFLICT (affinity_key) DO UPDATE
++		SET affinity_type = EXCLUDED.affinity_type,
++			subsite_id = CASE WHEN subsite_forward_affinities.locked AND NOT EXCLUDED.locked THEN subsite_forward_affinities.subsite_id ELSE EXCLUDED.subsite_id END,
++			lease_id = CASE WHEN subsite_forward_affinities.locked AND NOT EXCLUDED.locked THEN subsite_forward_affinities.lease_id ELSE EXCLUDED.lease_id END,
++			account_id = CASE WHEN subsite_forward_affinities.locked AND NOT EXCLUDED.locked THEN subsite_forward_affinities.account_id ELSE EXCLUDED.account_id END,
++			api_key_id = COALESCE(EXCLUDED.api_key_id, subsite_forward_affinities.api_key_id),
++			user_id = COALESCE(EXCLUDED.user_id, subsite_forward_affinities.user_id),
++			group_id = COALESCE(EXCLUDED.group_id, subsite_forward_affinities.group_id),
++			model = EXCLUDED.model,
++			session_id = EXCLUDED.session_id,
++			source = CASE WHEN EXCLUDED.locked THEN EXCLUDED.source ELSE subsite_forward_affinities.source END,
++			locked = subsite_forward_affinities.locked OR EXCLUDED.locked,
++			hits = subsite_forward_affinities.hits + 1,
++			last_reason = EXCLUDED.last_reason,
++			last_error = EXCLUDED.last_error,
++			expires_at = CASE WHEN subsite_forward_affinities.locked THEN subsite_forward_affinities.expires_at ELSE EXCLUDED.expires_at END,
++			last_used_at = NOW(),
++			updated_at = NOW(),
++			deleted_at = NULL
++		RETURNING id, affinity_key, affinity_type, subsite_id, COALESCE(lease_id, ''),
++			COALESCE(account_id, 0), COALESCE(api_key_id, 0), COALESCE(user_id, 0),
++			COALESCE(group_id, 0), model, session_id, source, locked, hits,
++			last_reason, last_error, expires_at, last_used_at, created_at, updated_at, deleted_at
++	`,
++		input.Key,
++		input.Type,
++		input.SubsiteID,
++		input.LeaseID,
++		input.AccountID,
++		input.APIKeyID,
++		input.UserID,
++		input.GroupID,
++		input.Model,
++		input.SessionID,
++		input.Source,
++		input.Locked,
++		input.LastReason,
++		input.LastError,
++		input.ExpiresAt,
++	))
++	if err != nil {
++		return nil, fmt.Errorf("upsert subsite forward affinity: %w", err)
++	}
++	return affinity, nil
++}
++
++func (r *subsiteRepository) DeleteForwardAffinity(ctx context.Context, id int64) error {
++	res, err := r.db.ExecContext(ctx, `
++		UPDATE subsite_forward_affinities
++		SET deleted_at = NOW(), updated_at = NOW()
++		WHERE id = $1 AND deleted_at IS NULL
++	`, id)
++	if err != nil {
++		return fmt.Errorf("delete subsite forward affinity: %w", err)
++	}
++	if affected, _ := res.RowsAffected(); affected == 0 {
++		return service.ErrSubsiteNotFound
++	}
++	return nil
++}
++
++func (r *subsiteRepository) ListForwardAffinities(ctx context.Context, params pagination.PaginationParams, filter service.ListSubsiteForwardAffinitiesFilter) ([]service.SubsiteForwardAffinity, *pagination.PaginationResult, error) {
++	where, args := forwardAffinityWhere(filter)
++	var total int64
++	if err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM subsite_forward_affinities WHERE "+where, args...).Scan(&total); err != nil {
++		return nil, nil, fmt.Errorf("count subsite forward affinities: %w", err)
++	}
++	page := params.Page
++	if page < 1 {
++		page = 1
++	}
++	pageSize := params.Limit()
++	offset := (page - 1) * pageSize
++	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
++		%s
++		WHERE %s
++		ORDER BY locked DESC, last_used_at DESC
++		LIMIT $%d OFFSET $%d
++	`, forwardAffinitySelectSQL(), where, len(args)+1, len(args)+2), append(args, pageSize, offset)...)
++	if err != nil {
++		return nil, nil, fmt.Errorf("list subsite forward affinities: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteForwardAffinity, 0)
++	for rows.Next() {
++		item, err := scanForwardAffinity(rows)
++		if err != nil {
++			return nil, nil, err
++		}
++		items = append(items, *item)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, nil, err
++	}
++	pages := int((total + int64(pageSize) - 1) / int64(pageSize))
++	if pages < 1 {
++		pages = 1
++	}
++	return items, &pagination.PaginationResult{Total: total, Page: page, PageSize: pageSize, Pages: pages}, nil
++}
++
++func (r *subsiteRepository) RecordForwardEvent(ctx context.Context, event *service.SubsiteForwardEvent) error {
++	if event == nil {
++		return service.ErrSubsiteInvalidInput
++	}
++	metadataJSON, err := json.Marshal(event.Metadata)
++	if err != nil {
++		return fmt.Errorf("marshal subsite forward event metadata: %w", err)
++	}
++	err = r.db.QueryRowContext(ctx, `
++		INSERT INTO subsite_forward_events (
++			request_id, affinity_key, subsite_id, attempted_subsite_id, fallback_from,
++			lease_id, account_id, api_key_id, user_id, group_id, model, session_id,
++			method, path, status_code, latency_ms, request_bytes, response_bytes,
++			reason, outcome, error, metadata
++		)
++		VALUES ($1, $2, NULLIF($3, ''), $4, $5, NULLIF($6, ''), NULLIF($7, 0),
++			NULLIF($8, 0), NULLIF($9, 0), NULLIF($10, 0), $11, $12, $13, $14, $15,
++			$16, $17, $18, $19, $20, $21, $22)
++		RETURNING id, created_at
++	`,
++		event.RequestID,
++		event.AffinityKey,
++		event.SubsiteID,
++		event.AttemptedSubsiteID,
++		event.FallbackFrom,
++		event.LeaseID,
++		event.AccountID,
++		event.APIKeyID,
++		event.UserID,
++		event.GroupID,
++		event.Model,
++		event.SessionID,
++		event.Method,
++		event.Path,
++		event.StatusCode,
++		event.LatencyMS,
++		event.RequestBytes,
++		event.ResponseBytes,
++		event.Reason,
++		event.Outcome,
++		event.Error,
++		metadataJSON,
++	).Scan(&event.ID, &event.CreatedAt)
++	if err != nil {
++		return fmt.Errorf("insert subsite forward event: %w", err)
++	}
++	if event.Outcome == "failed" || event.Outcome == "upstream_error" || (event.Outcome == "no_candidate" && strings.TrimSpace(event.SubsiteID) != "") {
++		_ = r.upsertCircuitBreaker(ctx, event)
++	} else if event.Outcome == "success" || event.Outcome == "fallback" {
++		_ = r.clearCircuitBreaker(ctx, "subsite", event.SubsiteID)
++		if event.AccountID > 0 {
++			_ = r.clearCircuitBreaker(ctx, "account", fmt.Sprint(event.AccountID))
++		}
++		if strings.TrimSpace(event.LeaseID) != "" {
++			_ = r.clearCircuitBreaker(ctx, "lease", event.LeaseID)
++		}
++	}
++	return nil
++}
++
++func (r *subsiteRepository) ListForwardEvents(ctx context.Context, params pagination.PaginationParams, filter service.ListSubsiteForwardEventsFilter) ([]service.SubsiteForwardEvent, *pagination.PaginationResult, error) {
++	where, args := forwardEventWhere(filter)
++	var total int64
++	if err := r.db.QueryRowContext(ctx, "SELECT COUNT(*) FROM subsite_forward_events WHERE "+where, args...).Scan(&total); err != nil {
++		return nil, nil, fmt.Errorf("count subsite forward events: %w", err)
++	}
++	page := params.Page
++	if page < 1 {
++		page = 1
++	}
++	pageSize := params.Limit()
++	offset := (page - 1) * pageSize
++	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
++		%s
++		WHERE %s
++		ORDER BY created_at DESC
++		LIMIT $%d OFFSET $%d
++	`, forwardEventSelectSQL(), where, len(args)+1, len(args)+2), append(args, pageSize, offset)...)
++	if err != nil {
++		return nil, nil, fmt.Errorf("list subsite forward events: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteForwardEvent, 0)
++	for rows.Next() {
++		item, err := scanForwardEvent(rows)
++		if err != nil {
++			return nil, nil, err
++		}
++		items = append(items, *item)
++	}
++	if err := rows.Err(); err != nil {
++		return nil, nil, err
++	}
++	pages := int((total + int64(pageSize) - 1) / int64(pageSize))
++	if pages < 1 {
++		pages = 1
++	}
++	return items, &pagination.PaginationResult{Total: total, Page: page, PageSize: pageSize, Pages: pages}, nil
++}
++
++func (r *subsiteRepository) ForwardStats(ctx context.Context) (*service.SubsiteForwardStats, error) {
++	stats := &service.SubsiteForwardStats{
++		BySubsite:       []service.SubsiteForwardSiteStat{},
++		CircuitBreakers: []service.SubsiteCircuitBreaker{},
++	}
++	var cacheableInputTokens24h int64
++	if err := r.db.QueryRowContext(ctx, `
++		SELECT
++			(SELECT COUNT(*) FROM subsite_forward_affinities WHERE deleted_at IS NULL),
++			(SELECT COUNT(*) FROM subsite_forward_affinities WHERE deleted_at IS NULL AND locked = TRUE),
++			(SELECT COUNT(*) FROM subsite_forward_affinities WHERE deleted_at IS NULL AND (locked = TRUE OR expires_at > NOW())),
++			(SELECT COUNT(*) FROM subsite_forward_affinities WHERE deleted_at IS NULL AND COALESCE(account_id, 0) > 0),
++			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours'),
++			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome IN ('failed', 'no_candidate', 'client_error', 'upstream_error')),
++			(SELECT COUNT(*) FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND outcome = 'fallback'),
++			(SELECT COUNT(*) FROM subsite_circuit_breakers WHERE deleted_at IS NULL AND cooldown_until > NOW()),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes'),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND status = 'active' AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes' AND health_score < 80),
++			(SELECT COUNT(*) FROM subsites WHERE deleted_at IS NULL AND (status IN ('unhealthy', 'pending') OR (status = 'active' AND (last_heartbeat_at IS NULL OR last_heartbeat_at < NOW() - INTERVAL '3 minutes')))),
++			(SELECT COUNT(*) FROM account_leases WHERE deleted_at IS NULL AND status IN ('active', 'renewing')),
++			(SELECT COUNT(*) FROM account_leases WHERE deleted_at IS NULL AND status IN ('active', 'renewing') AND expires_at > NOW() AND expires_at <= NOW() + INTERVAL '24 hours'),
++			COALESCE((SELECT AVG(latency_ms)::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
++			COALESCE((SELECT (percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms))::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
++			COALESCE((SELECT (percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms))::float8 FROM subsite_forward_events WHERE created_at >= NOW() - INTERVAL '24 hours' AND latency_ms > 0), 0),
++			COALESCE((SELECT AVG(ul.first_token_ms)::float8 FROM usage_logs ul JOIN quota_reservations qr ON qr.request_id = ul.request_id WHERE ul.created_at >= NOW() - INTERVAL '24 hours' AND COALESCE(ul.first_token_ms, 0) > 0), 0),
++			COALESCE((SELECT SUM(ul.input_tokens + ul.output_tokens + ul.cache_creation_tokens + ul.cache_read_tokens + ul.image_output_tokens) FROM usage_logs ul JOIN quota_reservations qr ON qr.request_id = ul.request_id WHERE ul.created_at >= NOW() - INTERVAL '24 hours'), 0),
++			COALESCE((SELECT SUM(ul.actual_cost) FROM usage_logs ul JOIN quota_reservations qr ON qr.request_id = ul.request_id WHERE ul.created_at >= NOW() - INTERVAL '24 hours'), 0),
++			COALESCE((SELECT SUM(ul.cache_read_tokens) FROM usage_logs ul JOIN quota_reservations qr ON qr.request_id = ul.request_id WHERE ul.created_at >= NOW() - INTERVAL '24 hours'), 0),
++			COALESCE((SELECT SUM(ul.input_tokens + ul.cache_read_tokens) FROM usage_logs ul JOIN quota_reservations qr ON qr.request_id = ul.request_id WHERE ul.created_at >= NOW() - INTERVAL '24 hours'), 0)
++	`).Scan(
++		&stats.TotalAffinities,
++		&stats.LockedAffinity,
++		&stats.ActiveAffinity,
++		&stats.AccountAffinity,
++		&stats.Events24h,
++		&stats.Failures24h,
++		&stats.Failovers24h,
++		&stats.CircuitOpen,
++		&stats.TotalSubsites,
++		&stats.OnlineSubsites,
++		&stats.DegradedSubsites,
++		&stats.OfflineSubsites,
++		&stats.ActiveLeases,
++		&stats.ExpiringLeases24h,
++		&stats.AvgLatencyMS24h,
++		&stats.P95LatencyMS24h,
++		&stats.P99LatencyMS24h,
++		&stats.AvgFirstTokenMS24h,
++		&stats.ForwardedTokens24h,
++		&stats.ForwardedCost24h,
++		&stats.CacheReadTokens24h,
++		&cacheableInputTokens24h,
++	); err != nil {
++		return nil, fmt.Errorf("get subsite forward stats: %w", err)
++	}
++	if stats.Events24h > 0 {
++		stats.SuccessRate24h = float64(stats.Events24h-stats.Failures24h) / float64(stats.Events24h)
++	}
++	if cacheableInputTokens24h > 0 {
++		stats.CacheHitRatio24h = float64(stats.CacheReadTokens24h) / float64(cacheableInputTokens24h)
++	}
++	bySubsite, err := r.forwardSiteStats(ctx, true)
++	if err != nil {
++		return nil, err
++	}
++	stats.BySubsite = bySubsite
++	breakers, err := r.ListActiveCircuitBreakers(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.CircuitBreakers = breakers
++	return stats, nil
++}
++
++func (r *subsiteRepository) ForwardRouteStats(ctx context.Context) ([]service.SubsiteForwardSiteStat, error) {
++	return r.forwardSiteStats(ctx, false)
++}
++
++func (r *subsiteRepository) forwardSiteStats(ctx context.Context, includeUsage bool) ([]service.SubsiteForwardSiteStat, error) {
++	usageJoin := ""
++	usageSelect := `
++		0::bigint AS forwarded_tokens,
++		0::float8 AS forwarded_cost,
++		0::bigint AS cache_read_tokens,
++		0::bigint AS cacheable_input_tokens,
++		0::float8 AS avg_first_token_ms`
++	if includeUsage {
++		usageJoin = `
++		usage_stats AS (
++			SELECT qr.subsite_id,
++				COALESCE(SUM(ul.input_tokens + ul.output_tokens + ul.cache_creation_tokens + ul.cache_read_tokens + ul.image_output_tokens), 0) AS forwarded_tokens,
++				COALESCE(SUM(ul.actual_cost), 0)::float8 AS forwarded_cost,
++				COALESCE(SUM(ul.cache_read_tokens), 0) AS cache_read_tokens,
++				COALESCE(SUM(ul.input_tokens + ul.cache_read_tokens), 0) AS cacheable_input_tokens,
++				COALESCE(AVG(ul.first_token_ms) FILTER (WHERE ul.first_token_ms > 0), 0)::float8 AS avg_first_token_ms
++			FROM usage_logs ul
++			JOIN quota_reservations qr ON qr.request_id = ul.request_id
++			WHERE ul.created_at >= NOW() - INTERVAL '24 hours'
++			GROUP BY qr.subsite_id
++		),`
++		usageSelect = `
++			COALESCE(us.forwarded_tokens, 0),
++			COALESCE(us.forwarded_cost, 0),
++			COALESCE(us.cache_read_tokens, 0),
++			COALESCE(us.cacheable_input_tokens, 0),
++			COALESCE(us.avg_first_token_ms, 0)`
++	}
++	usageLeftJoin := ""
++	if includeUsage {
++		usageLeftJoin = "LEFT JOIN usage_stats us ON us.subsite_id = s.subsite_id"
++	}
++	rows, err := r.db.QueryContext(ctx, fmt.Sprintf(`
++		WITH latest_hb AS (
++			SELECT DISTINCT ON (subsite_id)
++				subsite_id, active_requests, queued_usage, qps, cpu_percent, memory_bytes
++			FROM subsite_heartbeats
++			ORDER BY subsite_id, created_at DESC
++		),
++		event_stats AS (
++			SELECT subsite_id,
++				COUNT(*) AS events_24h,
++				COUNT(*) FILTER (WHERE outcome IN ('failed', 'no_candidate', 'client_error', 'upstream_error')) AS failures_24h,
++				COALESCE(AVG(latency_ms) FILTER (WHERE latency_ms > 0), 0)::float8 AS avg_latency_ms,
++				COALESCE(percentile_disc(0.95) WITHIN GROUP (ORDER BY latency_ms) FILTER (WHERE latency_ms > 0), 0)::float8 AS p95_latency_ms,
++				COALESCE(percentile_disc(0.99) WITHIN GROUP (ORDER BY latency_ms) FILTER (WHERE latency_ms > 0), 0)::float8 AS p99_latency_ms
++			FROM subsite_forward_events
++			WHERE created_at >= NOW() - INTERVAL '24 hours'
++			GROUP BY subsite_id
++		),
++		%s
++		affinity_stats AS (
++			SELECT subsite_id,
++				COUNT(*) AS affinities,
++				COUNT(*) FILTER (WHERE locked = TRUE) AS locked_affinities
++			FROM subsite_forward_affinities
++			WHERE deleted_at IS NULL
++			GROUP BY subsite_id
++		),
++		circuit_stats AS (
++			SELECT DISTINCT ON (subsite_id)
++				subsite_id, reason, cooldown_until
++			FROM subsite_circuit_breakers
++			WHERE deleted_at IS NULL
++			  AND cooldown_until > NOW()
++			  AND scope = 'subsite'
++			ORDER BY subsite_id, updated_at DESC
++		),
++		lease_stats AS (
++			SELECT subsite_id,
++				COUNT(*) FILTER (WHERE status IN ('active', 'renewing')) AS active_leases,
++				COUNT(*) FILTER (WHERE status IN ('active', 'renewing') AND expires_at > NOW() AND expires_at <= NOW() + INTERVAL '24 hours') AS expiring_leases_24h
++			FROM account_leases
++			WHERE deleted_at IS NULL
++			GROUP BY subsite_id
++		)
++		SELECT s.subsite_id, s.name, s.status, s.health_score, s.last_heartbeat_at,
++			COALESCE(h.active_requests, 0), COALESCE(h.queued_usage, 0),
++			COALESCE(h.qps, 0), COALESCE(h.cpu_percent, 0), COALESCE(h.memory_bytes, 0),
++			COALESCE(ls.active_leases, 0), COALESCE(ls.expiring_leases_24h, 0),
++			COALESCE(es.events_24h, 0), COALESCE(es.failures_24h, 0), COALESCE(es.avg_latency_ms, 0),
++			COALESCE(es.p95_latency_ms, 0), COALESCE(es.p99_latency_ms, 0),
++			%s,
++			COALESCE(afs.affinities, 0), COALESCE(afs.locked_affinities, 0),
++			cs.subsite_id IS NOT NULL, COALESCE(cs.reason, ''), cs.cooldown_until
++		FROM subsites s
++		LEFT JOIN latest_hb h ON h.subsite_id = s.subsite_id
++		LEFT JOIN event_stats es ON es.subsite_id = s.subsite_id
++		%s
++		LEFT JOIN affinity_stats afs ON afs.subsite_id = s.subsite_id
++		LEFT JOIN circuit_stats cs ON cs.subsite_id = s.subsite_id
++		LEFT JOIN lease_stats ls ON ls.subsite_id = s.subsite_id
++		WHERE s.deleted_at IS NULL
++		ORDER BY s.status = 'active' DESC, s.health_score DESC, s.name ASC
++	`, usageJoin, usageSelect, usageLeftJoin))
++	if err != nil {
++		return nil, fmt.Errorf("list subsite forward site stats: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteForwardSiteStat, 0)
++	now := time.Now()
++	for rows.Next() {
++		var item service.SubsiteForwardSiteStat
++		var cacheableInputTokens int64
++		if err := rows.Scan(
++			&item.SubsiteID,
++			&item.Name,
++			&item.Status,
++			&item.HealthScore,
++			&item.LastHeartbeatAt,
++			&item.ActiveRequests,
++			&item.QueuedUsage,
++			&item.QPS,
++			&item.CPUPercent,
++			&item.MemoryBytes,
++			&item.ActiveLeases,
++			&item.ExpiringLeases24h,
++			&item.Events24h,
++			&item.Failures24h,
++			&item.AvgLatencyMS24h,
++			&item.P95LatencyMS24h,
++			&item.P99LatencyMS24h,
++			&item.ForwardedTokens24h,
++			&item.ForwardedCost24h,
++			&item.CacheReadTokens24h,
++			&cacheableInputTokens,
++			&item.AvgFirstTokenMS24h,
++			&item.Affinities,
++			&item.LockedAffinity,
++			&item.CircuitOpen,
++			&item.CircuitReason,
++			&item.CooldownUntil,
++		); err != nil {
++			return nil, err
++		}
++		if item.Events24h > 0 {
++			item.SuccessRate24h = float64(item.Events24h-item.Failures24h) / float64(item.Events24h)
++		}
++		if cacheableInputTokens > 0 {
++			item.CacheHitRatio24h = float64(item.CacheReadTokens24h) / float64(cacheableInputTokens)
++		}
++		item.EffectiveStatus = service.SubsiteEffectiveStatusForStats(item, now)
++		item.LoadLevel = service.SubsiteLoadLevelForStats(item)
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *subsiteRepository) ListActiveCircuitBreakers(ctx context.Context) ([]service.SubsiteCircuitBreaker, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		SELECT id, scope, target_id, COALESCE(subsite_id, ''), COALESCE(account_id, 0),
++			COALESCE(lease_id, ''), reason, failures, cooldown_until, last_error, created_at, updated_at
++		FROM subsite_circuit_breakers
++		WHERE deleted_at IS NULL
++		  AND cooldown_until > NOW()
++		ORDER BY cooldown_until DESC, updated_at DESC
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list active subsite circuit breakers: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteCircuitBreaker, 0)
++	for rows.Next() {
++		var item service.SubsiteCircuitBreaker
++		if err := rows.Scan(
++			&item.ID,
++			&item.Scope,
++			&item.TargetID,
++			&item.SubsiteID,
++			&item.AccountID,
++			&item.LeaseID,
++			&item.Reason,
++			&item.Failures,
++			&item.CooldownUntil,
++			&item.LastError,
++			&item.CreatedAt,
++			&item.UpdatedAt,
++		); err != nil {
++			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *subsiteRepository) upsertCircuitBreaker(ctx context.Context, event *service.SubsiteForwardEvent) error {
++	if event == nil {
++		return nil
++	}
++	scope := "subsite"
++	targetID := strings.TrimSpace(event.AttemptedSubsiteID)
++	if targetID == "" {
++		targetID = strings.TrimSpace(event.SubsiteID)
++	}
++	accountID := int64(0)
++	leaseID := ""
++	if event.AccountID > 0 {
++		scope = "account"
++		targetID = fmt.Sprint(event.AccountID)
++		accountID = event.AccountID
++	}
++	if strings.TrimSpace(event.LeaseID) != "" {
++		scope = "lease"
++		targetID = strings.TrimSpace(event.LeaseID)
++		leaseID = targetID
++		accountID = event.AccountID
++	}
++	if targetID == "" {
++		return nil
++	}
++	reason := strings.TrimSpace(event.Reason)
++	if reason == "" {
++		reason = event.Outcome
++	}
++	cooldown := time.Now().Add(2 * time.Minute)
++	_, err := r.db.ExecContext(ctx, `
++		INSERT INTO subsite_circuit_breakers (
++			scope, target_id, subsite_id, account_id, lease_id, reason,
++			failures, cooldown_until, last_error
++		)
++		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, 0), NULLIF($5, ''), $6, 1, $7, $8)
++		ON CONFLICT (scope, target_id) DO UPDATE
++		SET subsite_id = COALESCE(EXCLUDED.subsite_id, subsite_circuit_breakers.subsite_id),
++			account_id = COALESCE(EXCLUDED.account_id, subsite_circuit_breakers.account_id),
++			lease_id = COALESCE(EXCLUDED.lease_id, subsite_circuit_breakers.lease_id),
++			reason = EXCLUDED.reason,
++			failures = subsite_circuit_breakers.failures + 1,
++			cooldown_until = GREATEST(subsite_circuit_breakers.cooldown_until, EXCLUDED.cooldown_until),
++			last_error = EXCLUDED.last_error,
++			updated_at = NOW(),
++			deleted_at = NULL
++	`, scope, targetID, event.SubsiteID, accountID, leaseID, reason, cooldown, event.Error)
++	if err != nil {
++		return fmt.Errorf("upsert subsite circuit breaker: %w", err)
++	}
++	return nil
++}
++
++func (r *subsiteRepository) clearCircuitBreaker(ctx context.Context, scope, targetID string) error {
++	targetID = strings.TrimSpace(targetID)
++	if targetID == "" {
++		return nil
++	}
++	_, err := r.db.ExecContext(ctx, `
++		UPDATE subsite_circuit_breakers
++		SET deleted_at = NOW(), updated_at = NOW()
++		WHERE scope = $1 AND target_id = $2 AND deleted_at IS NULL
++	`, scope, targetID)
++	if err != nil {
++		return fmt.Errorf("clear subsite circuit breaker: %w", err)
++	}
++	return nil
++}
++
++func forwardAffinitySelectSQL() string {
++	return `
++		SELECT id, affinity_key, affinity_type, subsite_id, COALESCE(lease_id, ''),
++			COALESCE(account_id, 0), COALESCE(api_key_id, 0), COALESCE(user_id, 0),
++			COALESCE(group_id, 0), model, session_id, source, locked, hits,
++			last_reason, last_error, expires_at, last_used_at, created_at, updated_at, deleted_at
++		FROM subsite_forward_affinities
++	`
++}
++
++func scanForwardAffinity(row subsiteRowScanner) (*service.SubsiteForwardAffinity, error) {
++	item := &service.SubsiteForwardAffinity{}
++	err := row.Scan(
++		&item.ID, &item.Key, &item.Type, &item.SubsiteID, &item.LeaseID,
++		&item.AccountID, &item.APIKeyID, &item.UserID, &item.GroupID,
++		&item.Model, &item.SessionID, &item.Source, &item.Locked, &item.Hits,
++		&item.LastReason, &item.LastError, &item.ExpiresAt, &item.LastUsedAt,
++		&item.CreatedAt, &item.UpdatedAt, &item.DeletedAt,
++	)
++	if err != nil {
++		return nil, err
++	}
++	return item, nil
++}
++
++func forwardAffinityWhere(filter service.ListSubsiteForwardAffinitiesFilter) (string, []any) {
++	where := []string{"deleted_at IS NULL"}
++	args := []any{}
++	if strings.TrimSpace(filter.SubsiteID) != "" {
++		args = append(args, strings.TrimSpace(filter.SubsiteID))
++		where = append(where, fmt.Sprintf("subsite_id = $%d", len(args)))
++	}
++	if filter.APIKeyID > 0 {
++		args = append(args, filter.APIKeyID)
++		where = append(where, fmt.Sprintf("api_key_id = $%d", len(args)))
++	}
++	if filter.AccountID > 0 {
++		args = append(args, filter.AccountID)
++		where = append(where, fmt.Sprintf("account_id = $%d", len(args)))
++	}
++	if filter.Locked != nil {
++		args = append(args, *filter.Locked)
++		where = append(where, fmt.Sprintf("locked = $%d", len(args)))
++	}
++	if strings.TrimSpace(filter.Search) != "" {
++		args = append(args, "%"+escapeLike(strings.TrimSpace(filter.Search))+"%")
++		where = append(where, fmt.Sprintf("(affinity_key ILIKE $%d OR model ILIKE $%d OR session_id ILIKE $%d)", len(args), len(args), len(args)))
++	}
++	return strings.Join(where, " AND "), args
++}
++
++func forwardEventSelectSQL() string {
++	return `
++		SELECT id, request_id, affinity_key, COALESCE(subsite_id, ''), attempted_subsite_id,
++			fallback_from, COALESCE(lease_id, ''), COALESCE(account_id, 0),
++			COALESCE(api_key_id, 0), COALESCE(user_id, 0), COALESCE(group_id, 0),
++			model, session_id, method, path, status_code, latency_ms, request_bytes,
++			response_bytes, reason, outcome, error, metadata, created_at
++		FROM subsite_forward_events
++	`
++}
++
++func scanForwardEvent(row subsiteRowScanner) (*service.SubsiteForwardEvent, error) {
++	item := &service.SubsiteForwardEvent{}
++	var metadataRaw []byte
++	err := row.Scan(
++		&item.ID, &item.RequestID, &item.AffinityKey, &item.SubsiteID, &item.AttemptedSubsiteID,
++		&item.FallbackFrom, &item.LeaseID, &item.AccountID, &item.APIKeyID,
++		&item.UserID, &item.GroupID, &item.Model, &item.SessionID, &item.Method,
++		&item.Path, &item.StatusCode, &item.LatencyMS, &item.RequestBytes,
++		&item.ResponseBytes, &item.Reason, &item.Outcome, &item.Error,
++		&metadataRaw, &item.CreatedAt,
++	)
++	if err != nil {
++		return nil, err
++	}
++	item.Metadata = decodeJSONMap(metadataRaw)
++	return item, nil
++}
++
++func forwardEventWhere(filter service.ListSubsiteForwardEventsFilter) (string, []any) {
++	where := []string{"TRUE"}
++	args := []any{}
++	if strings.TrimSpace(filter.SubsiteID) != "" {
++		args = append(args, strings.TrimSpace(filter.SubsiteID))
++		where = append(where, fmt.Sprintf("subsite_id = $%d", len(args)))
++	}
++	if strings.TrimSpace(filter.Outcome) != "" {
++		args = append(args, strings.TrimSpace(filter.Outcome))
++		where = append(where, fmt.Sprintf("outcome = $%d", len(args)))
++	}
++	if strings.TrimSpace(filter.Search) != "" {
++		args = append(args, "%"+escapeLike(strings.TrimSpace(filter.Search))+"%")
++		where = append(where, fmt.Sprintf("(request_id ILIKE $%d OR affinity_key ILIKE $%d OR model ILIKE $%d OR error ILIKE $%d)", len(args), len(args), len(args), len(args)))
++	}
++	return strings.Join(where, " AND "), args
++}
+diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
+index 782fff0..bf55dd2 100644
+--- a/backend/internal/repository/subsite_repo.go
++++ b/backend/internal/repository/subsite_repo.go
+@@ -281,7 +281,11 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
+ 	if affected, _ := res.RowsAffected(); affected == 0 {
+ 		return service.ErrSubsiteNotFound
+ 	}
+-	return tx.Commit()
++	if err := tx.Commit(); err != nil {
++		return err
++	}
++	_ = r.recordSubsiteHealthSample(ctx, heartbeat, metadataJSON)
++	return nil
+ }
+ 
+ func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error) {
+diff --git a/backend/internal/server/routes/admin.go b/backend/internal/server/routes/admin.go
+index edb14b6..960be07 100644
+--- a/backend/internal/server/routes/admin.go
++++ b/backend/internal/server/routes/admin.go
+@@ -190,6 +190,12 @@ func registerSubsiteRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
+ 	{
+ 		subsites.GET("", h.Admin.Subsite.List)
+ 		subsites.POST("", h.Admin.Subsite.Create)
++		subsites.GET("/forward-stats", h.Admin.Subsite.ForwardStats)
++		subsites.PUT("/forward-mode", h.Admin.Subsite.UpdateForwardMode)
++		subsites.GET("/forward-affinities", h.Admin.Subsite.ListForwardAffinities)
++		subsites.POST("/forward-affinities", h.Admin.Subsite.UpsertForwardAffinity)
++		subsites.DELETE("/forward-affinities/:affinity_id", h.Admin.Subsite.DeleteForwardAffinity)
++		subsites.GET("/forward-events", h.Admin.Subsite.ListForwardEvents)
+ 		subsites.PATCH("/:id", h.Admin.Subsite.Update)
+ 		subsites.POST("/:id/activate", h.Admin.Subsite.Activate)
+ 		subsites.POST("/:id/pause", h.Admin.Subsite.Pause)
+diff --git a/backend/internal/server/routes/gateway.go b/backend/internal/server/routes/gateway.go
+index 2302ae5..d3b4100 100644
+--- a/backend/internal/server/routes/gateway.go
++++ b/backend/internal/server/routes/gateway.go
+@@ -2,6 +2,8 @@ package routes
+ 
+ import (
+ 	"net/http"
++	"os"
++	"strings"
+ 
+ 	"github.com/Wei-Shaw/sub2api/internal/config"
+ 	"github.com/Wei-Shaw/sub2api/internal/handler"
+@@ -27,6 +29,26 @@ func RegisterGatewayRoutes(
+ 	opsErrorLogger := handler.OpsErrorLoggerMiddleware(opsService)
+ 	endpointNorm := handler.InboundEndpointMiddleware()
+ 	masterDataPlaneGuard := middleware.MasterDataPlaneGuard(settingService)
++	masterDataPlaneOrSubsiteForward := func(c *gin.Context) {
++		mode := subsiteForwardMode(c, h)
++		if mode == "direct" {
++			abortDirectSubsiteOnly(c)
++			return
++		}
++		if mode == "local" {
++			c.Next()
++			return
++		}
++		if mode == "forward" && h != nil && h.SubsiteForwarder != nil && h.SubsiteForwarder.ForwardGatewayRequest(c) {
++			c.Abort()
++			return
++		}
++		if mode == "forward" && subsiteForwardLocalFallbackEnabled() && (settingService == nil || settingService.IsMasterDataPlaneEnabled(c.Request.Context())) {
++			c.Next()
++			return
++		}
++		masterDataPlaneGuard(c)
++	}
+ 
+ 	// 未分组 Key 拦截中间件（按协议格式区分错误响应）
+ 	requireGroupAnthropic := middleware.RequireGroupAssignment(settingService, middleware.AnthropicErrorWriter)
+@@ -34,7 +56,6 @@ func RegisterGatewayRoutes(
+ 
+ 	// API网关（Claude API兼容）
+ 	gateway := r.Group("/v1")
+-	gateway.Use(masterDataPlaneGuard)
+ 	gateway.Use(bodyLimit)
+ 	gateway.Use(clientRequestID)
+ 	gateway.Use(opsErrorLogger)
+@@ -44,6 +65,10 @@ func RegisterGatewayRoutes(
+ 	{
+ 		// /v1/messages: auto-route based on group platform
+ 		gateway.POST("/messages", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Messages(c)
+ 				return
+@@ -52,6 +77,10 @@ func RegisterGatewayRoutes(
+ 		})
+ 		// /v1/messages/count_tokens: OpenAI groups get 404
+ 		gateway.POST("/messages/count_tokens", func(c *gin.Context) {
++			masterDataPlaneGuard(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"type": "error",
+@@ -64,10 +93,20 @@ func RegisterGatewayRoutes(
+ 			}
+ 			h.Gateway.CountTokens(c)
+ 		})
+-		gateway.GET("/models", h.Gateway.Models)
++		gateway.GET("/models", func(c *gin.Context) {
++			masterDataPlaneGuard(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.Models(c)
++		})
+ 		gateway.GET("/usage", h.Gateway.Usage)
+ 		// OpenAI Responses API: auto-route based on group platform
+ 		gateway.POST("/responses", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+@@ -75,15 +114,23 @@ func RegisterGatewayRoutes(
+ 			h.Gateway.Responses(c)
+ 		})
+ 		gateway.POST("/responses/*subpath", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.Responses(c)
+ 				return
+ 			}
+ 			h.Gateway.Responses(c)
+ 		})
+-		gateway.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
++		gateway.GET("/responses", masterDataPlaneGuard, h.OpenAIGateway.ResponsesWebSocket)
+ 		// OpenAI Chat Completions API: auto-route based on group platform
+ 		gateway.POST("/chat/completions", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) == service.PlatformOpenAI {
+ 				h.OpenAIGateway.ChatCompletions(c)
+ 				return
+@@ -91,6 +138,10 @@ func RegisterGatewayRoutes(
+ 			h.Gateway.ChatCompletions(c)
+ 		})
+ 		gateway.POST("/images/generations", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) != service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"error": gin.H{
+@@ -103,6 +154,10 @@ func RegisterGatewayRoutes(
+ 			h.OpenAIGateway.Images(c)
+ 		})
+ 		gateway.POST("/images/edits", func(c *gin.Context) {
++			masterDataPlaneOrSubsiteForward(c)
++			if c.IsAborted() {
++				return
++			}
+ 			if getGroupPlatform(c) != service.PlatformOpenAI {
+ 				c.JSON(http.StatusNotFound, gin.H{
+ 					"error": gin.H{
+@@ -118,7 +173,6 @@ func RegisterGatewayRoutes(
+ 
+ 	// Gemini 原生 API 兼容层（Gemini SDK/CLI 直连）
+ 	gemini := r.Group("/v1beta")
+-	gemini.Use(masterDataPlaneGuard)
+ 	gemini.Use(bodyLimit)
+ 	gemini.Use(clientRequestID)
+ 	gemini.Use(opsErrorLogger)
+@@ -126,39 +180,63 @@ func RegisterGatewayRoutes(
+ 	gemini.Use(middleware.APIKeyAuthWithSubscriptionGoogle(apiKeyService, subscriptionService, cfg))
+ 	gemini.Use(requireGroupGoogle)
+ 	{
+-		gemini.GET("/models", h.Gateway.GeminiV1BetaListModels)
+-		gemini.GET("/models/:model", h.Gateway.GeminiV1BetaGetModel)
++		gemini.GET("/models", func(c *gin.Context) {
++			masterDataPlaneGuard(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.GeminiV1BetaListModels(c)
++		})
++		gemini.GET("/models/:model", func(c *gin.Context) {
++			masterDataPlaneGuard(c)
++			if c.IsAborted() {
++				return
++			}
++			h.Gateway.GeminiV1BetaGetModel(c)
++		})
+ 		// Gin treats ":" as a param marker, but Gemini uses "{model}:{action}" in the same segment.
+-		gemini.POST("/models/*modelAction", h.Gateway.GeminiV1BetaModels)
++		gemini.POST("/models/*modelAction", masterDataPlaneOrSubsiteForward, h.Gateway.GeminiV1BetaModels)
+ 	}
+ 
+ 	// OpenAI Responses API（不带v1前缀的别名）— auto-route based on group platform
+ 	responsesHandler := func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) == service.PlatformOpenAI {
+ 			h.OpenAIGateway.Responses(c)
+ 			return
+ 		}
+ 		h.Gateway.Responses(c)
+ 	}
+-	r.POST("/responses", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+-	r.POST("/responses/*subpath", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
++	r.POST("/responses", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
++	r.POST("/responses/*subpath", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, responsesHandler)
+ 	r.GET("/responses", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, h.OpenAIGateway.ResponsesWebSocket)
+ 	codexDirect := r.Group("/backend-api/codex")
+-	codexDirect.Use(masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic)
++	codexDirect.Use(bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic)
+ 	{
+ 		codexDirect.POST("/responses", responsesHandler)
+ 		codexDirect.POST("/responses/*subpath", responsesHandler)
+-		codexDirect.GET("/responses", h.OpenAIGateway.ResponsesWebSocket)
++		codexDirect.GET("/responses", masterDataPlaneGuard, h.OpenAIGateway.ResponsesWebSocket)
+ 	}
+ 	// OpenAI Chat Completions API（不带v1前缀的别名）— auto-route based on group platform
+-	r.POST("/chat/completions", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/chat/completions", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) == service.PlatformOpenAI {
+ 			h.OpenAIGateway.ChatCompletions(c)
+ 			return
+ 		}
+ 		h.Gateway.ChatCompletions(c)
+ 	})
+-	r.POST("/images/generations", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/images/generations", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) != service.PlatformOpenAI {
+ 			c.JSON(http.StatusNotFound, gin.H{
+ 				"error": gin.H{
+@@ -170,7 +248,11 @@ func RegisterGatewayRoutes(
+ 		}
+ 		h.OpenAIGateway.Images(c)
+ 	})
+-	r.POST("/images/edits", masterDataPlaneGuard, bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++	r.POST("/images/edits", bodyLimit, clientRequestID, opsErrorLogger, endpointNorm, gin.HandlerFunc(apiKeyAuth), requireGroupAnthropic, func(c *gin.Context) {
++		masterDataPlaneOrSubsiteForward(c)
++		if c.IsAborted() {
++			return
++		}
+ 		if getGroupPlatform(c) != service.PlatformOpenAI {
+ 			c.JSON(http.StatusNotFound, gin.H{
+ 				"error": gin.H{
+@@ -220,6 +302,33 @@ func RegisterGatewayRoutes(
+ 
+ }
+ 
++func subsiteForwardMode(c *gin.Context, h *handler.Handlers) string {
++	fallback := os.Getenv("SUBSITE_FORWARD_MODE")
++	if h != nil && h.SubsiteForwarder != nil && c != nil && c.Request != nil {
++		return h.SubsiteForwarder.Mode(c.Request.Context(), fallback)
++	}
++	return service.NormalizeSubsiteForwardMode(fallback)
++}
++
++func subsiteForwardLocalFallbackEnabled() bool {
++	switch strings.ToLower(strings.TrimSpace(os.Getenv("SUBSITE_FORWARD_LOCAL_FALLBACK"))) {
++	case "1", "true", "yes", "on":
++		return true
++	default:
++		return false
++	}
++}
++
++func abortDirectSubsiteOnly(c *gin.Context) {
++	c.AbortWithStatusJSON(http.StatusServiceUnavailable, gin.H{
++		"error": gin.H{
++			"type":    "subsite_direct_only",
++			"code":    "SUBSITE_DIRECT_ONLY",
++			"message": "master is in direct-subsite-only mode; send model requests through a subsite endpoint or switch forwarding mode",
++		},
++	})
++}
++
+ // getGroupPlatform extracts the group platform from the API Key stored in context.
+ func getGroupPlatform(c *gin.Context) string {
+ 	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+diff --git a/backend/internal/service/domain_constants.go b/backend/internal/service/domain_constants.go
+index 92cbd62..001117d 100644
+--- a/backend/internal/service/domain_constants.go
++++ b/backend/internal/service/domain_constants.go
+@@ -380,6 +380,9 @@ const (
+ 	// SettingKeySubsiteOnlyGatewayEnabled legacy inverse of master_data_plane_enabled.
+ 	SettingKeySubsiteOnlyGatewayEnabled = "subsite_only_gateway_enabled"
+ 
++	// SettingKeySubsiteForwardMode controls master data-plane behavior for model requests.
++	SettingKeySubsiteForwardMode = "subsite_forward_mode"
++
+ 	// Gateway Forwarding Behavior
+ 	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
+ 	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
+diff --git a/backend/internal/service/setting_subsite_relay.go b/backend/internal/service/setting_subsite_relay.go
+new file mode 100644
+index 0000000..d730f7d
+--- /dev/null
++++ b/backend/internal/service/setting_subsite_relay.go
+@@ -0,0 +1,95 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"log/slog"
++	"strings"
++	"sync/atomic"
++	"time"
++
++	"golang.org/x/sync/singleflight"
++)
++
++type cachedSubsiteForwardMode struct {
++	value     string
++	expiresAt int64
++}
++
++var subsiteForwardModeCache atomic.Value
++var subsiteForwardModeSF singleflight.Group
++
++const subsiteForwardModeCacheTTL = 60 * time.Second
++const subsiteForwardModeErrorTTL = 5 * time.Second
++const subsiteForwardModeDBTimeout = 5 * time.Second
++
++func NormalizeSubsiteForwardMode(mode string) string {
++	switch strings.ToLower(strings.TrimSpace(mode)) {
++	case "local", "master", "master_local":
++		return "local"
++	case "direct", "subsite", "subsite_direct":
++		return "direct"
++	case "forward", "subsite_forward", "":
++		return "forward"
++	default:
++		return "forward"
++	}
++}
++
++func (s *SettingService) GetSubsiteForwardMode(ctx context.Context, fallback string) string {
++	if cached, ok := subsiteForwardModeCache.Load().(*cachedSubsiteForwardMode); ok && cached != nil {
++		if time.Now().UnixNano() < cached.expiresAt {
++			return cached.value
++		}
++	}
++	result, _, _ := subsiteForwardModeSF.Do("subsite_forward_mode", func() (any, error) {
++		if cached, ok := subsiteForwardModeCache.Load().(*cachedSubsiteForwardMode); ok && cached != nil {
++			if time.Now().UnixNano() < cached.expiresAt {
++				return cached.value, nil
++			}
++		}
++		if s == nil || s.settingRepo == nil {
++			return NormalizeSubsiteForwardMode(fallback), nil
++		}
++		dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), subsiteForwardModeDBTimeout)
++		defer cancel()
++		value, err := s.settingRepo.GetValue(dbCtx, SettingKeySubsiteForwardMode)
++		if err != nil {
++			if !errors.Is(err, ErrSettingNotFound) {
++				slog.Warn("failed to get subsite forward mode setting", "error", err)
++			}
++			mode := NormalizeSubsiteForwardMode(fallback)
++			subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++				value:     mode,
++				expiresAt: time.Now().Add(subsiteForwardModeErrorTTL).UnixNano(),
++			})
++			return mode, nil
++		}
++		mode := NormalizeSubsiteForwardMode(firstNonEmptyString(value, fallback))
++		subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++			value:     mode,
++			expiresAt: time.Now().Add(subsiteForwardModeCacheTTL).UnixNano(),
++		})
++		return mode, nil
++	})
++	if mode, ok := result.(string); ok {
++		return NormalizeSubsiteForwardMode(mode)
++	}
++	return NormalizeSubsiteForwardMode(fallback)
++}
++
++func (s *SettingService) SetSubsiteForwardMode(ctx context.Context, mode string) (string, error) {
++	normalized := NormalizeSubsiteForwardMode(mode)
++	if s == nil || s.settingRepo == nil {
++		return normalized, ErrSettingNotFound
++	}
++	if err := s.settingRepo.Set(ctx, SettingKeySubsiteForwardMode, normalized); err != nil {
++		return "", err
++	}
++	subsiteForwardModeSF.Forget("subsite_forward_mode")
++	subsiteForwardModeCache.Store(&cachedSubsiteForwardMode{
++		value:     normalized,
++		expiresAt: time.Now().Add(subsiteForwardModeCacheTTL).UnixNano(),
++	})
++	return normalized, nil
++}
+diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
+index 8cfa424..7731bf1 100644
+--- a/backend/internal/service/subsite.go
++++ b/backend/internal/service/subsite.go
+@@ -48,6 +48,13 @@ const (
+ 	SubsiteAuthHeaderBodySHA   = "X-Subsite-Body-SHA256"
+ 	SubsiteAuthHeaderSignature = "X-Subsite-Signature"
+ 
++	SubsiteRouteHeaderPreferredLeaseID   = "X-Sub2API-Preferred-Lease-ID"
++	SubsiteRouteHeaderPreferredAccountID = "X-Sub2API-Preferred-Account-ID"
++	SubsiteRouteHeaderPreferredStrict    = "X-Sub2API-Preferred-Strict"
++	SubsiteRouteHeaderTimestamp          = "X-Sub2API-Route-Timestamp"
++	SubsiteRouteHeaderNonce              = "X-Sub2API-Route-Nonce"
++	SubsiteRouteHeaderSignature          = "X-Sub2API-Route-Signature"
++
+ 	DefaultSubsiteHeartbeatTimeout       = 45 * time.Second
+ 	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
+ 	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
+@@ -265,6 +272,7 @@ type AuthorizeSubsiteRequestInput struct {
+ 	InboundEndpoint                string   `json:"inbound_endpoint"`
+ 	PreferredLeaseID               string   `json:"preferred_lease_id,omitempty"`
+ 	PreferredAccountID             int64    `json:"preferred_account_id,omitempty"`
++	PreferredStrict                bool     `json:"preferred_strict,omitempty"`
+ 	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
+ 	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
+ }
+@@ -436,12 +444,17 @@ type SubsiteNonceStore interface {
+ }
+ 
+ type SubsiteService struct {
+-	repo      SubsiteRepository
+-	encryptor SecretEncryptor
++	repo        SubsiteRepository
++	forwardRepo SubsiteForwardRepository
++	encryptor   SecretEncryptor
+ }
+ 
+ func NewSubsiteService(repo SubsiteRepository, encryptor SecretEncryptor) *SubsiteService {
+-	return &SubsiteService{repo: repo, encryptor: encryptor}
++	s := &SubsiteService{repo: repo, encryptor: encryptor}
++	if forwardRepo, ok := repo.(SubsiteForwardRepository); ok {
++		s.forwardRepo = forwardRepo
++	}
++	return s
+ }
+ 
+ func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
+diff --git a/backend/internal/service/subsite_relay.go b/backend/internal/service/subsite_relay.go
+new file mode 100644
+index 0000000..37c8d96
+--- /dev/null
++++ b/backend/internal/service/subsite_relay.go
+@@ -0,0 +1,377 @@
++package service
++
++import (
++	"context"
++	"crypto/hmac"
++	"crypto/sha256"
++	"encoding/hex"
++	"errors"
++	"fmt"
++	"strings"
++	"time"
++
++	"github.com/Wei-Shaw/sub2api/internal/pkg/pagination"
++)
++
++type SubsiteForwardAffinity struct {
++	ID         int64      `json:"id"`
++	Key        string     `json:"affinity_key"`
++	Type       string     `json:"affinity_type"`
++	SubsiteID  string     `json:"subsite_id"`
++	LeaseID    string     `json:"lease_id,omitempty"`
++	AccountID  int64      `json:"account_id,omitempty"`
++	APIKeyID   int64      `json:"api_key_id,omitempty"`
++	UserID     int64      `json:"user_id,omitempty"`
++	GroupID    int64      `json:"group_id,omitempty"`
++	Model      string     `json:"model"`
++	SessionID  string     `json:"session_id"`
++	Source     string     `json:"source"`
++	Locked     bool       `json:"locked"`
++	Hits       int64      `json:"hits"`
++	LastReason string     `json:"last_reason"`
++	LastError  string     `json:"last_error"`
++	ExpiresAt  time.Time  `json:"expires_at"`
++	LastUsedAt time.Time  `json:"last_used_at"`
++	CreatedAt  time.Time  `json:"created_at"`
++	UpdatedAt  time.Time  `json:"updated_at"`
++	DeletedAt  *time.Time `json:"deleted_at,omitempty"`
++}
++
++type SubsiteForwardEvent struct {
++	ID                 int64          `json:"id"`
++	RequestID          string         `json:"request_id"`
++	AffinityKey        string         `json:"affinity_key"`
++	SubsiteID          string         `json:"subsite_id"`
++	AttemptedSubsiteID string         `json:"attempted_subsite_id"`
++	FallbackFrom       string         `json:"fallback_from"`
++	LeaseID            string         `json:"lease_id,omitempty"`
++	AccountID          int64          `json:"account_id,omitempty"`
++	APIKeyID           int64          `json:"api_key_id,omitempty"`
++	UserID             int64          `json:"user_id,omitempty"`
++	GroupID            int64          `json:"group_id,omitempty"`
++	Model              string         `json:"model"`
++	SessionID          string         `json:"session_id"`
++	Method             string         `json:"method"`
++	Path               string         `json:"path"`
++	StatusCode         int            `json:"status_code"`
++	LatencyMS          int64          `json:"latency_ms"`
++	RequestBytes       int64          `json:"request_bytes"`
++	ResponseBytes      int64          `json:"response_bytes"`
++	Reason             string         `json:"reason"`
++	Outcome            string         `json:"outcome"`
++	Error              string         `json:"error"`
++	Metadata           map[string]any `json:"metadata"`
++	CreatedAt          time.Time      `json:"created_at"`
++}
++
++type SubsiteForwardStats struct {
++	TotalAffinities    int64                    `json:"total_affinities"`
++	LockedAffinity     int64                    `json:"locked_affinities"`
++	ActiveAffinity     int64                    `json:"active_affinities"`
++	AccountAffinity    int64                    `json:"account_affinities"`
++	Events24h          int64                    `json:"events_24h"`
++	Failures24h        int64                    `json:"failures_24h"`
++	Failovers24h       int64                    `json:"failovers_24h"`
++	CircuitOpen        int64                    `json:"circuit_open"`
++	TotalSubsites      int64                    `json:"total_subsites"`
++	OnlineSubsites     int64                    `json:"online_subsites"`
++	DegradedSubsites   int64                    `json:"degraded_subsites"`
++	OfflineSubsites    int64                    `json:"offline_subsites"`
++	ActiveLeases       int64                    `json:"active_leases"`
++	ExpiringLeases24h  int64                    `json:"expiring_leases_24h"`
++	AvgLatencyMS24h    float64                  `json:"avg_latency_ms_24h"`
++	P95LatencyMS24h    float64                  `json:"p95_latency_ms_24h"`
++	P99LatencyMS24h    float64                  `json:"p99_latency_ms_24h"`
++	SuccessRate24h     float64                  `json:"success_rate_24h"`
++	ForwardedTokens24h int64                    `json:"forwarded_tokens_24h"`
++	ForwardedCost24h   float64                  `json:"forwarded_cost_24h"`
++	CacheReadTokens24h int64                    `json:"cache_read_tokens_24h"`
++	CacheHitRatio24h   float64                  `json:"cache_hit_ratio_24h"`
++	AvgFirstTokenMS24h float64                  `json:"avg_first_token_ms_24h"`
++	Mode               string                   `json:"mode"`
++	BySubsite          []SubsiteForwardSiteStat `json:"by_subsite"`
++	CircuitBreakers    []SubsiteCircuitBreaker  `json:"circuit_breakers"`
++}
++
++type SubsiteForwardSiteStat struct {
++	SubsiteID          string     `json:"subsite_id"`
++	Name               string     `json:"name"`
++	Status             string     `json:"status"`
++	EffectiveStatus    string     `json:"effective_status"`
++	LoadLevel          string     `json:"load_level"`
++	HealthScore        int        `json:"health_score"`
++	LastHeartbeatAt    *time.Time `json:"last_heartbeat_at,omitempty"`
++	ActiveRequests     int        `json:"active_requests"`
++	QueuedUsage        int        `json:"queued_usage"`
++	QPS                float64    `json:"qps"`
++	CPUPercent         float64    `json:"cpu_percent"`
++	MemoryBytes        int64      `json:"memory_bytes"`
++	ActiveLeases       int64      `json:"active_leases"`
++	ExpiringLeases24h  int64      `json:"expiring_leases_24h"`
++	Events24h          int64      `json:"events_24h"`
++	Failures24h        int64      `json:"failures_24h"`
++	AvgLatencyMS24h    float64    `json:"avg_latency_ms_24h"`
++	P95LatencyMS24h    float64    `json:"p95_latency_ms_24h"`
++	P99LatencyMS24h    float64    `json:"p99_latency_ms_24h"`
++	SuccessRate24h     float64    `json:"success_rate_24h"`
++	ForwardedTokens24h int64      `json:"forwarded_tokens_24h"`
++	ForwardedCost24h   float64    `json:"forwarded_cost_24h"`
++	CacheReadTokens24h int64      `json:"cache_read_tokens_24h"`
++	CacheHitRatio24h   float64    `json:"cache_hit_ratio_24h"`
++	AvgFirstTokenMS24h float64    `json:"avg_first_token_ms_24h"`
++	Affinities         int64      `json:"affinities"`
++	LockedAffinity     int64      `json:"locked_affinities"`
++	CircuitOpen        bool       `json:"circuit_open"`
++	CircuitReason      string     `json:"circuit_reason"`
++	CooldownUntil      *time.Time `json:"cooldown_until,omitempty"`
++}
++
++type SubsiteCircuitBreaker struct {
++	ID            int64     `json:"id"`
++	Scope         string    `json:"scope"`
++	TargetID      string    `json:"target_id"`
++	SubsiteID     string    `json:"subsite_id"`
++	AccountID     int64     `json:"account_id,omitempty"`
++	LeaseID       string    `json:"lease_id,omitempty"`
++	Reason        string    `json:"reason"`
++	Failures      int       `json:"failures"`
++	CooldownUntil time.Time `json:"cooldown_until"`
++	LastError     string    `json:"last_error"`
++	CreatedAt     time.Time `json:"created_at"`
++	UpdatedAt     time.Time `json:"updated_at"`
++}
++
++type UpsertSubsiteForwardAffinityInput struct {
++	Key        string
++	Type       string
++	SubsiteID  string
++	LeaseID    string
++	AccountID  int64
++	APIKeyID   int64
++	UserID     int64
++	GroupID    int64
++	Model      string
++	SessionID  string
++	Source     string
++	Locked     bool
++	LastReason string
++	LastError  string
++	ExpiresAt  time.Time
++}
++
++type ListSubsiteForwardAffinitiesFilter struct {
++	SubsiteID string
++	APIKeyID  int64
++	AccountID int64
++	Search    string
++	Locked    *bool
++}
++
++type ListSubsiteForwardEventsFilter struct {
++	SubsiteID string
++	Outcome   string
++	Search    string
++}
++
++type SubsiteForwardRepository interface {
++	GetForwardAffinity(ctx context.Context, key string) (*SubsiteForwardAffinity, error)
++	UpsertForwardAffinity(ctx context.Context, input UpsertSubsiteForwardAffinityInput) (*SubsiteForwardAffinity, error)
++	DeleteForwardAffinity(ctx context.Context, id int64) error
++	ListForwardAffinities(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardAffinitiesFilter) ([]SubsiteForwardAffinity, *pagination.PaginationResult, error)
++	RecordForwardEvent(ctx context.Context, event *SubsiteForwardEvent) error
++	ListForwardEvents(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardEventsFilter) ([]SubsiteForwardEvent, *pagination.PaginationResult, error)
++	ForwardStats(ctx context.Context) (*SubsiteForwardStats, error)
++	ForwardRouteStats(ctx context.Context) ([]SubsiteForwardSiteStat, error)
++	ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error)
++}
++
++func (s *SubsiteService) GetForwardAffinity(ctx context.Context, key string) (*SubsiteForwardAffinity, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite forward repository is not initialized")
++	}
++	key = strings.TrimSpace(key)
++	if key == "" {
++		return nil, ErrSubsiteInvalidInput
++	}
++	return s.forwardRepo.GetForwardAffinity(ctx, key)
++}
++
++func (s *SubsiteService) UpsertForwardAffinity(ctx context.Context, input UpsertSubsiteForwardAffinityInput) (*SubsiteForwardAffinity, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite forward repository is not initialized")
++	}
++	input.Key = strings.TrimSpace(input.Key)
++	input.SubsiteID = strings.TrimSpace(input.SubsiteID)
++	input.LeaseID = strings.TrimSpace(input.LeaseID)
++	input.Model = strings.TrimSpace(input.Model)
++	input.SessionID = strings.TrimSpace(input.SessionID)
++	input.LastReason = strings.TrimSpace(input.LastReason)
++	input.LastError = strings.TrimSpace(input.LastError)
++	input.Type = normalizeForwardAffinityType(input.Type)
++	input.Source = normalizeForwardAffinitySource(input.Source)
++	if input.Key == "" || input.SubsiteID == "" {
++		return nil, ErrSubsiteInvalidInput
++	}
++	if input.ExpiresAt.IsZero() {
++		input.ExpiresAt = time.Now().Add(12 * time.Hour)
++	}
++	return s.forwardRepo.UpsertForwardAffinity(ctx, input)
++}
++
++func (s *SubsiteService) DeleteForwardAffinity(ctx context.Context, id int64) error {
++	if s == nil || s.forwardRepo == nil {
++		return errors.New("subsite forward repository is not initialized")
++	}
++	if id <= 0 {
++		return ErrSubsiteInvalidInput
++	}
++	return s.forwardRepo.DeleteForwardAffinity(ctx, id)
++}
++
++func (s *SubsiteService) ListForwardAffinities(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardAffinitiesFilter) ([]SubsiteForwardAffinity, *pagination.PaginationResult, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, nil, errors.New("subsite forward repository is not initialized")
++	}
++	filter.SubsiteID = strings.TrimSpace(filter.SubsiteID)
++	filter.Search = strings.TrimSpace(filter.Search)
++	return s.forwardRepo.ListForwardAffinities(ctx, params, filter)
++}
++
++func (s *SubsiteService) RecordForwardEvent(ctx context.Context, event *SubsiteForwardEvent) error {
++	if s == nil || s.forwardRepo == nil {
++		return errors.New("subsite forward repository is not initialized")
++	}
++	if event == nil {
++		return ErrSubsiteInvalidInput
++	}
++	event.RequestID = strings.TrimSpace(event.RequestID)
++	event.AffinityKey = strings.TrimSpace(event.AffinityKey)
++	event.SubsiteID = strings.TrimSpace(event.SubsiteID)
++	event.AttemptedSubsiteID = strings.TrimSpace(event.AttemptedSubsiteID)
++	event.FallbackFrom = strings.TrimSpace(event.FallbackFrom)
++	event.LeaseID = strings.TrimSpace(event.LeaseID)
++	event.Model = strings.TrimSpace(event.Model)
++	event.SessionID = strings.TrimSpace(event.SessionID)
++	event.Method = strings.ToUpper(strings.TrimSpace(event.Method))
++	event.Path = strings.TrimSpace(event.Path)
++	event.Reason = strings.TrimSpace(event.Reason)
++	event.Outcome = normalizeForwardOutcome(event.Outcome)
++	event.Error = strings.TrimSpace(event.Error)
++	event.Metadata = normalizeSubsiteMap(event.Metadata)
++	return s.forwardRepo.RecordForwardEvent(ctx, event)
++}
++
++func (s *SubsiteService) ListForwardEvents(ctx context.Context, params pagination.PaginationParams, filter ListSubsiteForwardEventsFilter) ([]SubsiteForwardEvent, *pagination.PaginationResult, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, nil, errors.New("subsite forward repository is not initialized")
++	}
++	filter.SubsiteID = strings.TrimSpace(filter.SubsiteID)
++	filter.Outcome = strings.TrimSpace(filter.Outcome)
++	filter.Search = strings.TrimSpace(filter.Search)
++	return s.forwardRepo.ListForwardEvents(ctx, params, filter)
++}
++
++func (s *SubsiteService) ForwardStats(ctx context.Context) (*SubsiteForwardStats, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite forward repository is not initialized")
++	}
++	return s.forwardRepo.ForwardStats(ctx)
++}
++
++func (s *SubsiteService) ForwardRouteStats(ctx context.Context) ([]SubsiteForwardSiteStat, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite forward repository is not initialized")
++	}
++	return s.forwardRepo.ForwardRouteStats(ctx)
++}
++
++func (s *SubsiteService) ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error) {
++	if s == nil || s.forwardRepo == nil {
++		return nil, errors.New("subsite forward repository is not initialized")
++	}
++	return s.forwardRepo.ListActiveCircuitBreakers(ctx)
++}
++
++func (s *SubsiteService) SignRouteHint(ctx context.Context, subsiteID, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) (string, error) {
++	if s == nil || s.repo == nil || s.encryptor == nil {
++		return "", errors.New("subsite service dependencies are nil")
++	}
++	secret, err := s.decryptSecret(ctx, subsiteID)
++	if err != nil {
++		return "", err
++	}
++	return SignSubsiteRouteHint(secret, method, path, timestamp, nonce, preferredLeaseID, preferredAccountID), nil
++}
++
++func SignSubsiteRouteHint(secret, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) string {
++	canonical := strings.Join([]string{
++		strings.ToUpper(strings.TrimSpace(method)),
++		strings.TrimSpace(path),
++		strings.TrimSpace(timestamp),
++		strings.TrimSpace(nonce),
++		strings.TrimSpace(preferredLeaseID),
++		fmt.Sprint(preferredAccountID),
++	}, "\n")
++	mac := hmac.New(sha256.New, []byte(secret))
++	_, _ = mac.Write([]byte(canonical))
++	return hex.EncodeToString(mac.Sum(nil))
++}
++
++func normalizeForwardAffinityType(value string) string {
++	switch strings.ToLower(strings.TrimSpace(value)) {
++	case "api_key", "account", "manual":
++		return strings.ToLower(strings.TrimSpace(value))
++	default:
++		return "session"
++	}
++}
++
++func normalizeForwardAffinitySource(value string) string {
++	switch strings.ToLower(strings.TrimSpace(value)) {
++	case "manual", "fallback", "imported":
++		return strings.ToLower(strings.TrimSpace(value))
++	default:
++		return "auto"
++	}
++}
++
++func normalizeForwardOutcome(value string) string {
++	switch strings.ToLower(strings.TrimSpace(value)) {
++	case "failed", "no_candidate", "fallback", "client_error", "upstream_error":
++		return strings.ToLower(strings.TrimSpace(value))
++	default:
++		return "success"
++	}
++}
++
++func SubsiteLoadLevelForStats(stat SubsiteForwardSiteStat) string {
++	if stat.CircuitOpen || stat.EffectiveStatus == "offline" {
++		return "offline"
++	}
++	if stat.ActiveRequests >= 100 || stat.QueuedUsage >= 100 || stat.CPUPercent >= 90 || stat.HealthScore < 50 {
++		return "critical"
++	}
++	if stat.ActiveRequests >= 50 || stat.QueuedUsage >= 50 || stat.CPUPercent >= 75 || stat.HealthScore < 80 {
++		return "high"
++	}
++	if stat.ActiveRequests >= 15 || stat.QueuedUsage >= 15 || stat.CPUPercent >= 55 {
++		return "medium"
++	}
++	return "low"
++}
++
++func SubsiteEffectiveStatusForStats(stat SubsiteForwardSiteStat, now time.Time) string {
++	if stat.CircuitOpen {
++		return "circuit_open"
++	}
++	if stat.Status != SubsiteStatusActive {
++		return stat.Status
++	}
++	if stat.LastHeartbeatAt == nil || now.Sub(*stat.LastHeartbeatAt) > 3*time.Minute {
++		return "offline"
++	}
++	if stat.HealthScore < 80 {
++		return "degraded"
++	}
++	return "online"
++}
+diff --git a/backend/internal/subsite/agent/server.go b/backend/internal/subsite/agent/server.go
+index fe0842b..e2c38e6 100644
+--- a/backend/internal/subsite/agent/server.go
++++ b/backend/internal/subsite/agent/server.go
+@@ -4,16 +4,18 @@ import (
+ 	"bytes"
+ 	"context"
+ 	"crypto/sha256"
++	"crypto/subtle"
+ 	"encoding/hex"
+ 	"encoding/json"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+ 	"net/http"
++	"net/url"
++	"strconv"
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+ 	"github.com/Wei-Shaw/sub2api/internal/service"
+ 	masterclient "github.com/Wei-Shaw/sub2api/internal/subsite/client"
+ 	"github.com/Wei-Shaw/sub2api/internal/subsite/queue"
+@@ -140,6 +142,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
+ 		})
+ 		return
+ 	}
++	setAuthorizationRouteHeaders(c, authorization)
+ 	s.credentials.Set(authorization)
+ 
+ 	result, err := s.proxyAuthorizedRequest(c, authorization, body)
+@@ -151,6 +154,7 @@ func (s *Server) handleDataPlane(c *gin.Context) {
+ 			s.credentials.Set(retryAuthorization)
+ 			result, err = s.proxyAuthorizedRequest(c, retryAuthorization, body)
+ 			authorization = retryAuthorization
++			setAuthorizationRouteHeaders(c, authorization)
+ 			if err == nil {
+ 				goto enqueue
+ 			}
+@@ -198,6 +202,21 @@ enqueue:
+ 	}
+ }
+ 
++func setAuthorizationRouteHeaders(c *gin.Context, authorization *service.AuthorizeSubsiteResponse) {
++	if c == nil || authorization == nil {
++		return
++	}
++	if strings.TrimSpace(authorization.LeaseID) != "" {
++		c.Header("X-Sub2API-Lease-ID", authorization.LeaseID)
++	}
++	if authorization.AccountID > 0 {
++		c.Header("X-Sub2API-Account-ID", fmt.Sprint(authorization.AccountID))
++	}
++	if strings.TrimSpace(authorization.RequestID) != "" {
++		c.Header("X-Sub2API-Request-ID", authorization.RequestID)
++	}
++}
++
+ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResponse, []byte, error) {
+ 	body, err := io.ReadAll(c.Request.Body)
+ 	if err != nil {
+@@ -209,6 +228,7 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+ 		return nil, nil, fmt.Errorf("api key is required")
+ 	}
+ 	requestedModel := extractRequestedModel(c, body)
++	preferredLeaseID, preferredAccountID := s.verifiedRouteHint(c)
+ 	input := service.AuthorizeSubsiteRequestInput{
+ 		SubsiteID:          s.cfg.Subsite.ID,
+ 		APIKey:             apiKey,
+@@ -219,6 +239,9 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+ 		ClientIP:           clientIP(c),
+ 		UserAgent:          c.GetHeader("User-Agent"),
+ 		InboundEndpoint:    c.Request.URL.Path,
++		PreferredLeaseID:   preferredLeaseID,
++		PreferredAccountID: preferredAccountID,
++		PreferredStrict:    (preferredLeaseID != "" || preferredAccountID > 0) && strings.EqualFold(strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderPreferredStrict)), "1"),
+ 	}
+ 	if err := populateAuthorizeCostHints(&input, c, body); err != nil {
+ 		return nil, nil, err
+@@ -230,6 +253,36 @@ func (s *Server) authorizeRequest(c *gin.Context) (*service.AuthorizeSubsiteResp
+ 	return authorization, body, nil
+ }
+ 
++func (s *Server) verifiedRouteHint(c *gin.Context) (string, int64) {
++	if s == nil || s.cfg == nil {
++		return "", 0
++	}
++	leaseID := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderPreferredLeaseID))
++	accountID := parsePreferredAccountID(c.GetHeader(service.SubsiteRouteHeaderPreferredAccountID))
++	if leaseID == "" && accountID <= 0 {
++		return "", 0
++	}
++	timestamp := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderTimestamp))
++	nonce := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderNonce))
++	signature := strings.TrimSpace(c.GetHeader(service.SubsiteRouteHeaderSignature))
++	if timestamp == "" || nonce == "" || signature == "" {
++		return "", 0
++	}
++	ts, err := time.Parse(time.RFC3339, timestamp)
++	if err != nil {
++		return "", 0
++	}
++	now := time.Now()
++	if ts.Before(now.Add(-5*time.Minute)) || ts.After(now.Add(5*time.Minute)) {
++		return "", 0
++	}
++	expected := service.SignSubsiteRouteHint(s.cfg.Master.Secret, c.Request.Method, c.Request.URL.RequestURI(), timestamp, nonce, leaseID, accountID)
++	if subtle.ConstantTimeCompare([]byte(expected), []byte(signature)) != 1 {
++		return "", 0
++	}
++	return leaseID, accountID
++}
++
+ func (s *Server) cancelReservation(ctx context.Context, requestID string) error {
+ 	payload := map[string]string{"request_id": requestID}
+ 	return s.master.PostRaw(ctx, "/api/internal/requests/cancel", payload, nil)
+@@ -287,6 +340,14 @@ func extractClientAPIKey(c *gin.Context) string {
+ 	return ""
+ }
+ 
++func parsePreferredAccountID(value string) int64 {
++	id, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64)
++	if err != nil || id < 0 {
++		return 0
++	}
++	return id
++}
++
+ func populateAuthorizeCostHints(input *service.AuthorizeSubsiteRequestInput, c *gin.Context, body []byte) error {
+ 	if input == nil {
+ 		return fmt.Errorf("authorize input is required")
+@@ -470,10 +531,88 @@ func (s *Server) handleOpenAIModels(c *gin.Context) {
+ 		})
+ 		return
+ 	}
+-	c.JSON(http.StatusOK, gin.H{
+-		"object": "list",
+-		"data":   openai.DefaultModels,
+-	})
++	target, err := s.masterModelListURL(c.Request.URL)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	req, err := http.NewRequestWithContext(c.Request.Context(), http.MethodGet, target, nil)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	copyClientModelHeaders(req.Header, c.Request.Header)
++	resp, err := http.DefaultClient.Do(req)
++	if err != nil {
++		c.JSON(http.StatusBadGateway, gin.H{"error": gin.H{"code": "SUBSITE_MODELS_PROXY_FAILED", "message": err.Error()}})
++		return
++	}
++	defer resp.Body.Close()
++	copyModelResponseHeaders(c.Writer.Header(), resp.Header)
++	c.Status(resp.StatusCode)
++	_, _ = io.Copy(c.Writer, resp.Body)
++}
++
++func (s *Server) masterModelListURL(original *url.URL) (string, error) {
++	if s == nil || s.cfg == nil {
++		return "", fmt.Errorf("subsite config is not initialized")
++	}
++	base, err := url.Parse(strings.TrimRight(strings.TrimSpace(s.cfg.Master.BaseURL), "/"))
++	if err != nil {
++		return "", err
++	}
++	if base.Scheme == "" || base.Host == "" {
++		return "", fmt.Errorf("invalid master base url")
++	}
++	path := "/v1/models"
++	if original != nil && strings.TrimSpace(original.Path) == "/models" {
++		path = "/models"
++	}
++	base.Path = strings.TrimRight(base.Path, "/") + path
++	if original != nil {
++		base.RawQuery = original.RawQuery
++	}
++	return base.String(), nil
++}
++
++func copyClientModelHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if skipModelProxyRequestHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func copyModelResponseHeaders(dst, src http.Header) {
++	for key, values := range src {
++		if skipModelProxyResponseHeader(key) {
++			continue
++		}
++		for _, value := range values {
++			dst.Add(key, value)
++		}
++	}
++}
++
++func skipModelProxyRequestHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "host", "content-length":
++		return true
++	default:
++		return false
++	}
++}
++
++func skipModelProxyResponseHeader(key string) bool {
++	switch strings.ToLower(key) {
++	case "connection", "keep-alive", "proxy-authenticate", "proxy-authorization", "te", "trailer", "transfer-encoding", "upgrade", "content-length":
++		return true
++	default:
++		return false
++	}
+ }
+ 
+ func hasUsagePayload(item service.UsageIngestItem) bool {
+diff --git a/backend/migrations/168_subsite_relay_observability.sql b/backend/migrations/168_subsite_relay_observability.sql
+new file mode 100644
+index 0000000..17bacaf
+--- /dev/null
++++ b/backend/migrations/168_subsite_relay_observability.sql
+@@ -0,0 +1,120 @@
++-- Subsite Relay: observability, sticky routing, health samples, and circuit breakers.
++CREATE TABLE IF NOT EXISTS subsite_forward_affinities (
++    id                   BIGSERIAL PRIMARY KEY,
++    affinity_key         VARCHAR(256) NOT NULL UNIQUE,
++    affinity_type        VARCHAR(32) NOT NULL DEFAULT 'session',
++    subsite_id           VARCHAR(64) NOT NULL REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    lease_id             VARCHAR(80),
++    account_id           BIGINT,
++    api_key_id           BIGINT,
++    user_id              BIGINT,
++    group_id             BIGINT,
++    model                VARCHAR(160) NOT NULL DEFAULT '',
++    session_id           VARCHAR(256) NOT NULL DEFAULT '',
++    source               VARCHAR(32) NOT NULL DEFAULT 'auto',
++    locked               BOOLEAN NOT NULL DEFAULT FALSE,
++    hits                 BIGINT NOT NULL DEFAULT 0,
++    last_reason          VARCHAR(64) NOT NULL DEFAULT '',
++    last_error           TEXT NOT NULL DEFAULT '',
++    expires_at           TIMESTAMPTZ NOT NULL,
++    last_used_at         TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    deleted_at           TIMESTAMPTZ,
++    CONSTRAINT subsite_forward_affinities_type_check CHECK (affinity_type IN ('session', 'api_key', 'account', 'manual')),
++    CONSTRAINT subsite_forward_affinities_source_check CHECK (source IN ('auto', 'manual', 'fallback', 'imported'))
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_subsite
++    ON subsite_forward_affinities (subsite_id, last_used_at DESC)
++    WHERE deleted_at IS NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_api_key
++    ON subsite_forward_affinities (api_key_id, last_used_at DESC)
++    WHERE deleted_at IS NULL AND api_key_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_account
++    ON subsite_forward_affinities (account_id, last_used_at DESC)
++    WHERE deleted_at IS NULL AND account_id IS NOT NULL;
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_affinities_expires
++    ON subsite_forward_affinities (expires_at)
++    WHERE deleted_at IS NULL AND locked = FALSE;
++
++CREATE TABLE IF NOT EXISTS subsite_forward_events (
++    id                   BIGSERIAL PRIMARY KEY,
++    request_id           VARCHAR(128) NOT NULL DEFAULT '',
++    affinity_key         VARCHAR(256) NOT NULL DEFAULT '',
++    subsite_id           VARCHAR(64) REFERENCES subsites(subsite_id) ON DELETE SET NULL,
++    attempted_subsite_id VARCHAR(64) NOT NULL DEFAULT '',
++    fallback_from        VARCHAR(64) NOT NULL DEFAULT '',
++    lease_id             VARCHAR(80),
++    account_id           BIGINT,
++    api_key_id           BIGINT,
++    user_id              BIGINT,
++    group_id             BIGINT,
++    model                VARCHAR(160) NOT NULL DEFAULT '',
++    session_id           VARCHAR(256) NOT NULL DEFAULT '',
++    method               VARCHAR(16) NOT NULL DEFAULT '',
++    path                 TEXT NOT NULL DEFAULT '',
++    status_code          INT NOT NULL DEFAULT 0,
++    latency_ms           BIGINT NOT NULL DEFAULT 0,
++    request_bytes        BIGINT NOT NULL DEFAULT 0,
++    response_bytes       BIGINT NOT NULL DEFAULT 0,
++    reason               VARCHAR(64) NOT NULL DEFAULT '',
++    outcome              VARCHAR(32) NOT NULL DEFAULT '',
++    error                TEXT NOT NULL DEFAULT '',
++    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    CONSTRAINT subsite_forward_events_outcome_check CHECK (outcome IN ('success', 'failed', 'no_candidate', 'fallback', 'client_error', 'upstream_error'))
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_created
++    ON subsite_forward_events (created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_subsite_created
++    ON subsite_forward_events (subsite_id, created_at DESC);
++CREATE INDEX IF NOT EXISTS idx_subsite_forward_events_affinity_created
++    ON subsite_forward_events (affinity_key, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS subsite_health_samples (
++    id                   BIGSERIAL PRIMARY KEY,
++    subsite_id           VARCHAR(64) NOT NULL REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    status               VARCHAR(32) NOT NULL DEFAULT '',
++    health_score         INT NOT NULL DEFAULT 0,
++    active_requests      INT NOT NULL DEFAULT 0,
++    queued_usage         INT NOT NULL DEFAULT 0,
++    qps                  DOUBLE PRECISION NOT NULL DEFAULT 0,
++    cpu_percent          DOUBLE PRECISION NOT NULL DEFAULT 0,
++    memory_bytes         BIGINT NOT NULL DEFAULT 0,
++    latency_ms           BIGINT NOT NULL DEFAULT 0,
++    error_rate           DOUBLE PRECISION NOT NULL DEFAULT 0,
++    version              VARCHAR(64) NOT NULL DEFAULT '',
++    metadata             JSONB NOT NULL DEFAULT '{}'::jsonb,
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW()
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_health_samples_subsite_created
++    ON subsite_health_samples (subsite_id, created_at DESC);
++
++CREATE TABLE IF NOT EXISTS subsite_circuit_breakers (
++    id                   BIGSERIAL PRIMARY KEY,
++    scope                VARCHAR(32) NOT NULL,
++    target_id            VARCHAR(128) NOT NULL,
++    subsite_id           VARCHAR(64) REFERENCES subsites(subsite_id) ON DELETE CASCADE,
++    account_id           BIGINT,
++    lease_id             VARCHAR(80),
++    reason               TEXT NOT NULL DEFAULT '',
++    failures             INT NOT NULL DEFAULT 0,
++    cooldown_until       TIMESTAMPTZ NOT NULL,
++    last_error           TEXT NOT NULL DEFAULT '',
++    created_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    updated_at           TIMESTAMPTZ NOT NULL DEFAULT NOW(),
++    deleted_at           TIMESTAMPTZ,
++    CONSTRAINT subsite_circuit_breakers_scope_check CHECK (scope IN ('subsite', 'account', 'lease')),
++    CONSTRAINT subsite_circuit_breakers_target_unique UNIQUE (scope, target_id)
++);
++
++CREATE INDEX IF NOT EXISTS idx_subsite_circuit_breakers_active
++    ON subsite_circuit_breakers (cooldown_until DESC)
++    WHERE deleted_at IS NULL;
++
++INSERT INTO settings (key, value, updated_at)
++VALUES ('subsite_forward_mode', 'forward', NOW())
++ON CONFLICT (key) DO NOTHING;
+diff --git a/frontend/src/api/admin/index.ts b/frontend/src/api/admin/index.ts
+index 40896f8..d53ce81 100644
+--- a/frontend/src/api/admin/index.ts
++++ b/frontend/src/api/admin/index.ts
+@@ -118,4 +118,12 @@ export type { BackupAgentHealth, DataManagementConfig } from './dataManagement'
+ export type { TLSFingerprintProfile, CreateProfileRequest, UpdateProfileRequest } from './tlsFingerprintProfile'
+ export type { RevenueSummary, RevenueSummaryParams } from './revenue'
+ export type { AccountSharePolicy } from './accountSharePolicies'
+-export type { Subsite, AccountLease, ResetSubsiteSecretResult } from './subsites'
++export type {
++  AccountLease,
++  ResetSubsiteSecretResult,
++  Subsite,
++  SubsiteForwardAffinity,
++  SubsiteForwardEvent,
++  SubsiteForwardMode,
++  SubsiteForwardStats
++} from './subsites'
+diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
+index 1faa4eb..df63a27 100644
+--- a/frontend/src/api/admin/subsites.ts
++++ b/frontend/src/api/admin/subsites.ts
+@@ -43,6 +43,150 @@ export interface AccountLease {
+   updated_at: string
+ }
+ 
++export interface SubsiteForwardSiteStat {
++  subsite_id: string
++  name: string
++  status: string
++  effective_status: string
++  load_level: string
++  health_score: number
++  last_heartbeat_at?: string
++  active_requests: number
++  queued_usage: number
++  qps: number
++  cpu_percent: number
++  memory_bytes: number
++  active_leases: number
++  expiring_leases_24h: number
++  events_24h: number
++  failures_24h: number
++  avg_latency_ms_24h: number
++  p95_latency_ms_24h: number
++  p99_latency_ms_24h: number
++  success_rate_24h: number
++  forwarded_tokens_24h: number
++  forwarded_cost_24h: number
++  cache_read_tokens_24h: number
++  cache_hit_ratio_24h: number
++  avg_first_token_ms_24h: number
++  affinities: number
++  locked_affinities: number
++  circuit_open: boolean
++  circuit_reason: string
++  cooldown_until?: string
++}
++
++export interface SubsiteCircuitBreaker {
++  id: number
++  scope: string
++  target_id: string
++  subsite_id: string
++  account_id?: number
++  lease_id?: string
++  reason: string
++  failures: number
++  cooldown_until: string
++  last_error: string
++  created_at: string
++  updated_at: string
++}
++
++export interface SubsiteForwardStats {
++  total_affinities: number
++  locked_affinities: number
++  active_affinities: number
++  account_affinities: number
++  events_24h: number
++  failures_24h: number
++  failovers_24h: number
++  circuit_open: number
++  total_subsites: number
++  online_subsites: number
++  degraded_subsites: number
++  offline_subsites: number
++  active_leases: number
++  expiring_leases_24h: number
++  avg_latency_ms_24h: number
++  p95_latency_ms_24h: number
++  p99_latency_ms_24h: number
++  success_rate_24h: number
++  forwarded_tokens_24h: number
++  forwarded_cost_24h: number
++  cache_read_tokens_24h: number
++  cache_hit_ratio_24h: number
++  avg_first_token_ms_24h: number
++  mode: SubsiteForwardMode
++  by_subsite: SubsiteForwardSiteStat[]
++  circuit_breakers: SubsiteCircuitBreaker[]
++}
++
++export type SubsiteForwardMode = 'local' | 'forward' | 'direct'
++
++export interface SubsiteForwardAffinity {
++  id: number
++  affinity_key: string
++  affinity_type: string
++  subsite_id: string
++  lease_id?: string
++  account_id?: number
++  api_key_id?: number
++  user_id?: number
++  group_id?: number
++  model: string
++  session_id: string
++  source: string
++  locked: boolean
++  hits: number
++  last_reason: string
++  last_error: string
++  expires_at: string
++  last_used_at: string
++  created_at: string
++  updated_at: string
++}
++
++export interface SubsiteForwardEvent {
++  id: number
++  request_id: string
++  affinity_key: string
++  subsite_id: string
++  attempted_subsite_id: string
++  fallback_from: string
++  lease_id?: string
++  account_id?: number
++  api_key_id?: number
++  user_id?: number
++  group_id?: number
++  model: string
++  session_id: string
++  method: string
++  path: string
++  status_code: number
++  latency_ms: number
++  request_bytes: number
++  response_bytes: number
++  reason: string
++  outcome: string
++  error: string
++  metadata?: Record<string, unknown>
++  created_at: string
++}
++
++export interface UpsertForwardAffinityRequest {
++  affinity_key: string
++  affinity_type?: string
++  subsite_id: string
++  lease_id?: string
++  account_id?: number
++  api_key_id?: number
++  user_id?: number
++  group_id?: number
++  model?: string
++  session_id?: string
++  ttl_seconds?: number
++  locked?: boolean
++}
++
+ export interface CreateSubsiteRequest {
+   subsite_id?: string
+   name: string
+@@ -187,6 +331,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+   await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
+ }
+ 
++export async function forwardStats(): Promise<SubsiteForwardStats> {
++  const { data } = await apiClient.get<SubsiteForwardStats>('/admin/subsites/forward-stats')
++  return data
++}
++
++export async function updateForwardMode(mode: SubsiteForwardMode): Promise<{ mode: SubsiteForwardMode }> {
++  const { data } = await apiClient.put<{ mode: SubsiteForwardMode }>('/admin/subsites/forward-mode', { mode })
++  return data
++}
++
++export async function listForwardAffinities(
++  page = 1,
++  pageSize = 20,
++  filters?: { subsite_id?: string; search?: string; locked?: boolean; api_key_id?: number; account_id?: number }
++): Promise<PaginatedResponse<SubsiteForwardAffinity>> {
++  const { data } = await apiClient.get<PaginatedResponse<SubsiteForwardAffinity>>('/admin/subsites/forward-affinities', {
++    params: {
++      page,
++      page_size: pageSize,
++      ...filters
++    }
++  })
++  return data
++}
++
++export async function upsertForwardAffinity(payload: UpsertForwardAffinityRequest): Promise<SubsiteForwardAffinity> {
++  const { data } = await apiClient.post<SubsiteForwardAffinity>('/admin/subsites/forward-affinities', payload)
++  return data
++}
++
++export async function deleteForwardAffinity(affinityID: number): Promise<void> {
++  await apiClient.delete(`/admin/subsites/forward-affinities/${affinityID}`)
++}
++
++export async function listForwardEvents(
++  page = 1,
++  pageSize = 20,
++  filters?: { subsite_id?: string; outcome?: string; search?: string }
++): Promise<PaginatedResponse<SubsiteForwardEvent>> {
++  const { data } = await apiClient.get<PaginatedResponse<SubsiteForwardEvent>>('/admin/subsites/forward-events', {
++    params: {
++      page,
++      page_size: pageSize,
++      ...filters
++    }
++  })
++  return data
++}
++
+ export default {
+   list,
+   create,
+@@ -202,5 +395,11 @@ export default {
+   releaseLease,
+   renewLease,
+   updateLease,
+-  deleteLease
++  deleteLease,
++  forwardStats,
++  updateForwardMode,
++  listForwardAffinities,
++  upsertForwardAffinity,
++  deleteForwardAffinity,
++  listForwardEvents
+ }
+diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
+index cb5d3f8..545ebe5 100644
+--- a/frontend/src/views/admin/SubsitesView.vue
++++ b/frontend/src/views/admin/SubsitesView.vue
+@@ -1,5 +1,213 @@
+ <template>
+   <AppLayout>
++    <section class="mb-6 space-y-4">
++      <div class="grid gap-4 md:grid-cols-2 xl:grid-cols-5">
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">Relay 请求 24h</p>
++          <p class="mt-2 text-2xl font-semibold text-gray-900 dark:text-white">{{ formatCompact(forwardStats?.events_24h || 0) }}</p>
++          <p class="mt-1 text-xs text-gray-500">成功率 {{ formatPercent(forwardStats?.success_rate_24h || 0) }}</p>
++        </div>
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">延迟质量</p>
++          <p class="mt-2 text-2xl font-semibold text-gray-900 dark:text-white">{{ Math.round(forwardStats?.p95_latency_ms_24h || 0) }} ms</p>
++          <p class="mt-1 text-xs text-gray-500">avg {{ Math.round(forwardStats?.avg_latency_ms_24h || 0) }} ms / p99 {{ Math.round(forwardStats?.p99_latency_ms_24h || 0) }} ms</p>
++        </div>
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">缓存命中</p>
++          <p class="mt-2 text-2xl font-semibold text-emerald-600">{{ formatPercent(forwardStats?.cache_hit_ratio_24h || 0) }}</p>
++          <p class="mt-1 text-xs text-gray-500">读缓存 {{ formatCompact(forwardStats?.cache_read_tokens_24h || 0) }} tokens</p>
++        </div>
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">转发用量</p>
++          <p class="mt-2 text-2xl font-semibold text-gray-900 dark:text-white">{{ formatCompact(forwardStats?.forwarded_tokens_24h || 0) }}</p>
++          <p class="mt-1 text-xs text-gray-500">成本 {{ formatCost(forwardStats?.forwarded_cost_24h || 0) }}</p>
++        </div>
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <p class="text-xs font-medium uppercase tracking-wide text-gray-500">Relay 模式</p>
++          <p class="mt-2 text-sm font-semibold text-gray-900 dark:text-white">{{ forwardModeLabel(forwardStats?.mode) }}</p>
++          <div class="mt-3 flex gap-2">
++            <select v-model="forwardModeForm" class="input min-h-[36px] flex-1 text-sm">
++              <option value="local">主站本地</option>
++              <option value="forward">主站转发子站</option>
++              <option value="direct">仅子站直连</option>
++            </select>
++            <button class="btn btn-sm btn-secondary" :disabled="forwardModeSaving || forwardModeForm === (forwardStats?.mode || 'forward')" @click="saveForwardMode">
++              保存
++            </button>
++          </div>
++          <p class="mt-2 text-xs text-gray-500">当前熔断 {{ forwardStats?.circuit_open || 0 }} 个</p>
++        </div>
++      </div>
++
++      <div class="grid gap-4 xl:grid-cols-[minmax(0,1fr)_26rem]">
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between gap-3">
++            <div>
++              <h2 class="text-base font-semibold text-gray-900 dark:text-white">Subsite Relay 负载面板</h2>
++              <p class="text-xs text-gray-500">根据心跳、租约、最近请求和熔断状态选择转发目标。</p>
++            </div>
++            <button class="btn btn-sm btn-secondary" :disabled="forwardLoading" @click="loadForwardConsole">
++              <Icon name="refresh" size="sm" :class="forwardLoading ? 'animate-spin' : ''" />
++            </button>
++          </div>
++          <div class="overflow-x-auto">
++            <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-600">
++              <thead class="text-left text-xs uppercase tracking-wide text-gray-500">
++                <tr>
++                  <th class="py-2 pr-4">子站</th>
++                  <th class="py-2 pr-4">负载</th>
++                  <th class="py-2 pr-4">24h 质量</th>
++                  <th class="py-2 pr-4">缓存</th>
++                  <th class="py-2 pr-4">粘性路由</th>
++                  <th class="py-2">健康</th>
++                </tr>
++              </thead>
++              <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
++                <tr v-for="site in forwardStats?.by_subsite || []" :key="site.subsite_id">
++                  <td class="py-3 pr-4">
++                    <div class="font-medium text-gray-900 dark:text-white">{{ site.name || site.subsite_id }}</div>
++                    <code class="text-xs text-gray-500">{{ site.subsite_id }}</code>
++                  </td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    <span :class="['badge', loadLevelClass(site.load_level)]">{{ loadLevelLabel(site.load_level) }}</span><br />
++                    活跃 {{ site.active_requests }} / 队列 {{ site.queued_usage }}<br />
++                    QPS {{ site.qps.toFixed(2) }} / CPU {{ site.cpu_percent.toFixed(1) }}%
++                  </td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    请求 {{ formatCompact(site.events_24h) }}<br />
++                    <span :class="site.failures_24h > 0 ? 'text-red-600' : 'text-emerald-600'">成功率 {{ formatPercent(site.success_rate_24h || 0) }}</span><br />
++                    P95 {{ Math.round(site.p95_latency_ms_24h || 0) }} ms
++                  </td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    <span class="font-medium text-emerald-600">{{ formatPercent(site.cache_hit_ratio_24h || 0) }}</span><br />
++                    {{ formatCompact(site.cache_read_tokens_24h || 0) }} tokens
++                  </td>
++                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                    {{ site.affinities }} 条<br />
++                    锁定 {{ site.locked_affinities }} 条<br />
++                    租约 {{ site.active_leases || 0 }} 个
++                  </td>
++                  <td class="py-3">
++                    <span :class="['badge', statusClass(site.effective_status || site.status)]">{{ site.health_score }}%</span>
++                    <span v-if="site.circuit_open" class="ml-1 badge badge-danger">熔断</span>
++                    <div class="mt-1 text-xs text-gray-500">{{ formatDate(site.last_heartbeat_at) }}</div>
++                    <div v-if="site.circuit_open" class="mt-1 text-xs text-red-500">{{ site.circuit_reason || '-' }}</div>
++                  </td>
++                </tr>
++              </tbody>
++            </table>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <h2 class="text-base font-semibold text-gray-900 dark:text-white">手动粘性路由</h2>
++          <p class="mt-1 text-xs text-gray-500">用于把某个 API Key、账号或会话固定到指定子站。</p>
++          <div class="mt-4 space-y-3">
++            <input v-model.trim="forwardLockForm.affinity_key" class="input" placeholder="粘性 Key，例如 api-key:123 或 session:abc" />
++            <select v-model="forwardLockForm.subsite_id" class="input">
++              <option value="">选择子站</option>
++              <option v-for="site in subsites" :key="site.subsite_id" :value="site.subsite_id">{{ site.name }} / {{ site.subsite_id }}</option>
++            </select>
++            <div class="grid grid-cols-2 gap-3">
++              <input v-model.trim="forwardLockForm.lease_id" class="input" placeholder="租约 ID，可选" />
++              <input v-model.number="forwardLockForm.account_id" type="number" min="0" class="input" placeholder="账号 ID，可选" />
++            </div>
++            <div class="grid grid-cols-2 gap-3">
++              <input v-model.number="forwardLockForm.api_key_id" type="number" min="0" class="input" placeholder="API Key ID，可选" />
++              <input v-model.number="forwardLockForm.ttl_hours" type="number" min="1" class="input" placeholder="TTL 小时" />
++            </div>
++            <label class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-300">
++              <input v-model="forwardLockForm.locked" type="checkbox" class="h-4 w-4 rounded border-gray-300 text-primary-600" />
++              强制锁定，不随负载自动迁移
++            </label>
++            <button class="btn btn-primary w-full" :disabled="forwardSaving" @click="saveForwardLock">保存粘性路由</button>
++          </div>
++        </div>
++      </div>
++
++      <div class="grid gap-4 xl:grid-cols-3">
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between">
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">粘性路由</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardAffinities">刷新</button>
++          </div>
++          <div class="space-y-2">
++            <div v-for="item in forwardAffinities" :key="item.id" class="rounded-xl border border-gray-100 p-3 text-sm dark:border-dark-700">
++              <div class="flex items-start justify-between gap-3">
++                <div class="min-w-0">
++                  <div class="truncate font-medium text-gray-900 dark:text-white">{{ item.model || '-' }} / {{ item.subsite_id }}</div>
++                  <code class="block truncate text-xs text-gray-500">{{ item.affinity_key }}</code>
++                </div>
++                <button class="btn btn-sm btn-secondary" @click="deleteForwardAffinity(item.id)">删除</button>
++              </div>
++              <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-500">
++                <span>命中 {{ item.hits }}</span>
++                <span>{{ item.locked ? '锁定' : item.source }}</span>
++                <span>账号 {{ item.account_id || '-' }}</span>
++                <span>租约 {{ item.lease_id || '-' }}</span>
++              </div>
++            </div>
++            <p v-if="!forwardAffinities.length" class="text-sm text-gray-500">暂无粘性路由。</p>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between">
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">熔断</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardStats">刷新</button>
++          </div>
++          <div class="space-y-2">
++            <div v-for="breaker in forwardStats?.circuit_breakers || []" :key="breaker.id" class="rounded-xl border border-red-100 bg-red-50/50 p-3 text-sm dark:border-red-900/40 dark:bg-red-950/20">
++              <div class="flex items-start justify-between gap-3">
++                <div class="min-w-0">
++                  <div class="truncate font-medium text-red-700 dark:text-red-200">{{ breaker.scope }} / {{ breaker.target_id }}</div>
++                  <div class="truncate text-xs text-red-500 dark:text-red-300">{{ breaker.subsite_id || '-' }}</div>
++                </div>
++                <span class="badge badge-danger">{{ breaker.failures }} 次</span>
++              </div>
++              <div class="mt-2 grid grid-cols-2 gap-2 text-xs text-gray-600 dark:text-gray-300">
++                <span>账号 {{ breaker.account_id || '-' }}</span>
++                <span>租约 {{ breaker.lease_id || '-' }}</span>
++                <span>{{ breaker.reason || '-' }}</span>
++                <span>{{ formatDate(breaker.cooldown_until) }}</span>
++              </div>
++              <p v-if="breaker.last_error" class="mt-2 break-all text-xs text-red-600 dark:text-red-300">{{ breaker.last_error }}</p>
++            </div>
++            <p v-if="!(forwardStats?.circuit_breakers || []).length" class="text-sm text-gray-500">暂无熔断。</p>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between">
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">最近转发事件</h2>
++            <button class="btn btn-sm btn-secondary" @click="loadForwardEvents">刷新</button>
++          </div>
++          <div class="space-y-2">
++            <div v-for="event in forwardEvents" :key="event.id" class="rounded-xl border border-gray-100 p-3 text-sm dark:border-dark-700">
++              <div class="flex items-start justify-between gap-3">
++                <div class="min-w-0">
++                  <div class="truncate font-medium text-gray-900 dark:text-white">{{ event.method }} {{ event.path }}</div>
++                  <div class="text-xs text-gray-500">{{ event.subsite_id || event.attempted_subsite_id || '-' }} / {{ event.model || '-' }}</div>
++                </div>
++                <span :class="['badge', event.outcome === 'success' ? 'badge-success' : 'badge-danger']">{{ event.outcome }}</span>
++              </div>
++              <div class="mt-2 grid grid-cols-3 gap-2 text-xs text-gray-500">
++                <span>{{ event.status_code || '-' }}</span>
++                <span>{{ event.latency_ms }} ms</span>
++                <span>{{ formatDate(event.created_at) }}</span>
++                <span>{{ event.reason || '-' }}</span>
++                <span>账号 {{ event.account_id || '-' }}</span>
++                <span>租约 {{ event.lease_id || '-' }}</span>
++              </div>
++              <div v-if="event.fallback_from" class="mt-2 text-xs text-amber-600 dark:text-amber-300">从 {{ event.fallback_from }} 回退</div>
++              <p v-if="event.error" class="mt-2 break-all text-xs text-red-600">{{ event.error }}</p>
++            </div>
++            <p v-if="!forwardEvents.length" class="text-sm text-gray-500">暂无事件。</p>
++          </div>
++        </div>
++      </div>
++    </section>
++
+     <TablePageLayout>
+       <template #filters>
+         <div class="flex flex-wrap items-center gap-3">
+@@ -370,7 +578,15 @@
+ <script setup lang="ts">
+ import { computed, onMounted, reactive, ref } from 'vue'
+ import { adminAPI } from '@/api/admin'
+-import type { AccountLease, ResetSubsiteSecretResult, Subsite } from '@/api/admin'
++import type {
++  AccountLease,
++  ResetSubsiteSecretResult,
++  Subsite,
++  SubsiteForwardAffinity,
++  SubsiteForwardEvent,
++  SubsiteForwardMode,
++  SubsiteForwardStats
++} from '@/api/admin'
+ import type { Account, AdminGroup } from '@/types'
+ import AppLayout from '@/components/layout/AppLayout.vue'
+ import TablePageLayout from '@/components/layout/TablePageLayout.vue'
+@@ -382,6 +598,9 @@ import type { Column } from '@/components/common/types'
+ import { useClipboard } from '@/composables/useClipboard'
+ 
+ const subsites = ref<Subsite[]>([])
++const forwardStats = ref<SubsiteForwardStats | null>(null)
++const forwardAffinities = ref<SubsiteForwardAffinity[]>([])
++const forwardEvents = ref<SubsiteForwardEvent[]>([])
+ const leases = ref<AccountLease[]>([])
+ const leaseAccounts = ref<Account[]>([])
+ const leaseGroups = ref<AdminGroup[]>([])
+@@ -394,6 +613,10 @@ const leaseBulkSaving = ref(false)
+ const leaseBulkUpdating = ref(false)
+ const leaseAccountsLoading = ref(false)
+ const resettingSecret = ref(false)
++const forwardLoading = ref(false)
++const forwardSaving = ref(false)
++const forwardModeSaving = ref(false)
++const forwardModeForm = ref<SubsiteForwardMode>('forward')
+ const search = ref('')
+ const status = ref('')
+ const leaseAccountSearch = ref('')
+@@ -442,6 +665,15 @@ const leaseBulkEditForm = reactive({
+   max_requests: 0,
+   max_tokens: 0
+ })
++const forwardLockForm = reactive({
++  affinity_key: '',
++  subsite_id: '',
++  lease_id: '',
++  account_id: 0,
++  api_key_id: 0,
++  ttl_hours: 168,
++  locked: true
++})
+ const selectedLeaseIDs = ref<Set<string>>(new Set())
+ 
+ const leaseGroupOptions = computed(() => leaseGroups.value
+@@ -520,11 +752,84 @@ async function reload(): Promise<void> {
+     })
+     subsites.value = result.items
+     pagination.total = result.total
++    if (!forwardLockForm.subsite_id && result.items.length > 0) {
++      forwardLockForm.subsite_id = result.items[0].subsite_id
++    }
+   } finally {
+     loading.value = false
+   }
+ }
+ 
++async function loadForwardConsole(): Promise<void> {
++  forwardLoading.value = true
++  try {
++    await Promise.all([
++      loadForwardStats(),
++      loadForwardAffinities(),
++      loadForwardEvents()
++    ])
++  } finally {
++    forwardLoading.value = false
++  }
++}
++
++async function loadForwardStats(): Promise<void> {
++  forwardStats.value = await adminAPI.subsites.forwardStats()
++  forwardModeForm.value = forwardStats.value.mode || 'forward'
++}
++
++async function loadForwardAffinities(): Promise<void> {
++  const result = await adminAPI.subsites.listForwardAffinities(1, 8)
++  forwardAffinities.value = result.items
++}
++
++async function loadForwardEvents(): Promise<void> {
++  const result = await adminAPI.subsites.listForwardEvents(1, 8)
++  forwardEvents.value = result.items
++}
++
++async function saveForwardMode(): Promise<void> {
++  forwardModeSaving.value = true
++  try {
++    const result = await adminAPI.subsites.updateForwardMode(forwardModeForm.value)
++    forwardModeForm.value = result.mode
++    await loadForwardStats()
++  } finally {
++    forwardModeSaving.value = false
++  }
++}
++
++async function saveForwardLock(): Promise<void> {
++  if (!forwardLockForm.affinity_key || !forwardLockForm.subsite_id) return
++  forwardSaving.value = true
++  try {
++    await adminAPI.subsites.upsertForwardAffinity({
++      affinity_key: forwardLockForm.affinity_key,
++      affinity_type: forwardLockForm.account_id > 0 ? 'account' : 'manual',
++      subsite_id: forwardLockForm.subsite_id,
++      lease_id: forwardLockForm.lease_id || undefined,
++      account_id: forwardLockForm.account_id || undefined,
++      api_key_id: forwardLockForm.api_key_id || undefined,
++      ttl_seconds: Math.max(1, normalizeNonNegativeNumber(forwardLockForm.ttl_hours || 168)) * 3600,
++      locked: forwardLockForm.locked
++    })
++    forwardLockForm.affinity_key = ''
++    forwardLockForm.lease_id = ''
++    forwardLockForm.account_id = 0
++    forwardLockForm.api_key_id = 0
++    await loadForwardConsole()
++  } finally {
++    forwardSaving.value = false
++  }
++}
++
++async function deleteForwardAffinity(id: number): Promise<void> {
++  const confirmed = window.confirm('确认删除这条粘性路由？')
++  if (!confirmed) return
++  await adminAPI.subsites.deleteForwardAffinity(id)
++  await loadForwardConsole()
++}
++
+ function handleSearch(): void {
+   window.clearTimeout(searchTimer.value)
+   searchTimer.value = window.setTimeout(() => {
+@@ -1027,7 +1332,50 @@ function formatDate(value?: string): string {
+   return new Date(value).toLocaleString()
+ }
+ 
++function formatCompact(value: number): string {
++  return new Intl.NumberFormat(undefined, {
++    notation: 'compact',
++    maximumFractionDigits: 1
++  }).format(value || 0)
++}
++
++function formatPercent(value: number): string {
++  const normalized = value > 1 ? value / 100 : value
++  return `${(normalized * 100).toFixed(1)}%`
++}
++
++function formatCost(value: number): string {
++  return `$${(value || 0).toFixed(4)}`
++}
++
++function forwardModeLabel(value?: string): string {
++  if (value === 'local') return '主站本地'
++  if (value === 'direct') return '仅子站直连'
++  return '主站转发子站'
++}
++
++function loadLevelLabel(value?: string): string {
++  return ({
++    idle: '空闲',
++    warm: '正常',
++    busy: '繁忙',
++    critical: '高压',
++    blocked: '阻断'
++  } as Record<string, string>)[value || ''] || (value || '-')
++}
++
++function loadLevelClass(value?: string): string {
++  return ({
++    idle: 'badge-success',
++    warm: 'badge-primary',
++    busy: 'badge-warning',
++    critical: 'badge-danger',
++    blocked: 'badge-danger'
++  } as Record<string, string>)[value || ''] || 'badge-gray'
++}
++
+ onMounted(() => {
+   void reload()
++  void loadForwardConsole()
+ })
+ </script>
