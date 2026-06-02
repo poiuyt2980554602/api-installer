@@ -1,10 +1,10 @@
 diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
-index 8955a01..6c48a46 100644
+index 8955a01..beb482e 100644
 --- a/backend/cmd/server/VERSION
 +++ b/backend/cmd/server/VERSION
 @@ -1 +1 @@
 -1.0.26
-+1.0.26.7
++1.0.26.9
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index 526ea32..ca4822c 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -229,6 +229,50 @@ index f83507c..6201a5a 100644
  func (h *SubsiteHandler) Create(c *gin.Context) {
  	var input service.CreateSubsiteInput
  	if err := c.ShouldBindJSON(&input); err != nil {
+diff --git a/backend/internal/handler/gateway_helper.go b/backend/internal/handler/gateway_helper.go
+index 09e6c09..93ffcf4 100644
+--- a/backend/internal/handler/gateway_helper.go
++++ b/backend/internal/handler/gateway_helper.go
+@@ -87,11 +87,6 @@ func claudeCodeBodyMapFromContextCache(c *gin.Context) map[string]any {
+ 	if c == nil {
+ 		return nil
+ 	}
+-	if cached, ok := c.Get(service.OpenAIParsedRequestBodyKey); ok {
+-		if bodyMap, ok := cached.(map[string]any); ok {
+-			return bodyMap
+-		}
+-	}
+ 	if cached, ok := c.Get(claudeCodeParsedRequestContextKey); ok {
+ 		switch v := cached.(type) {
+ 		case *service.ParsedRequest:
+diff --git a/backend/internal/handler/gateway_helper_hotpath_test.go b/backend/internal/handler/gateway_helper_hotpath_test.go
+index 4a67719..b3786bc 100644
+--- a/backend/internal/handler/gateway_helper_hotpath_test.go
++++ b/backend/internal/handler/gateway_helper_hotpath_test.go
+@@ -198,18 +198,18 @@ func TestSetClaudeCodeClientContext_ReuseParsedRequestAndContextCache(t *testing
+ 		require.True(t, service.IsClaudeCodeClient(c.Request.Context()))
+ 	})
+ 
+-	t.Run("reuse context cache without body unmarshal", func(t *testing.T) {
++	t.Run("reuse parsed request context without body unmarshal", func(t *testing.T) {
+ 		c, _ := newHelperTestContext(http.MethodPost, "/v1/messages")
+ 		c.Request.Header.Set("User-Agent", "claude-cli/1.0.1")
+ 		c.Request.Header.Set("X-App", "claude-code")
+ 		c.Request.Header.Set("anthropic-beta", "message-batches-2024-09-24")
+ 		c.Request.Header.Set("anthropic-version", "2023-06-01")
+-		c.Set(service.OpenAIParsedRequestBodyKey, map[string]any{
+-			"model": "claude-3-5-sonnet-20241022",
+-			"system": []any{
++		c.Set(claudeCodeParsedRequestContextKey, &service.ParsedRequest{
++			Model: "claude-3-5-sonnet-20241022",
++			System: []any{
+ 				map[string]any{"text": "You are Claude Code, Anthropic's official CLI for Claude."},
+ 			},
+-			"metadata": map[string]any{"user_id": "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account__session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"},
++			MetadataUserID: "user_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa_account__session_aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+ 		})
+ 
+ 		SetClaudeCodeClientContext(c, []byte(`{invalid`), nil)
 diff --git a/backend/internal/handler/handler.go b/backend/internal/handler/handler.go
 index e545f4b..5eb7dfd 100644
 --- a/backend/internal/handler/handler.go
@@ -241,6 +285,139 @@ index e545f4b..5eb7dfd 100644
  	Setting          *SettingHandler
  	Totp             *TotpHandler
  	Payment          *PaymentHandler
+diff --git a/backend/internal/handler/openai_gateway_handler.go b/backend/internal/handler/openai_gateway_handler.go
+index 98c55c5..a772a41 100644
+--- a/backend/internal/handler/openai_gateway_handler.go
++++ b/backend/internal/handler/openai_gateway_handler.go
+@@ -975,7 +975,6 @@ func (h *OpenAIGatewayHandler) validateFunctionCallOutputRequest(c *gin.Context,
+ 		return true
+ 	}
+ 
+-	c.Set(service.OpenAIParsedRequestBodyKey, reqBody)
+ 	validation := service.ValidateFunctionCallOutputContext(reqBody)
+ 	if !validation.HasFunctionCallOutput {
+ 		return true
+diff --git a/backend/internal/handler/ops_error_logger.go b/backend/internal/handler/ops_error_logger.go
+index 9355491..958cfee 100644
+--- a/backend/internal/handler/ops_error_logger.go
++++ b/backend/internal/handler/ops_error_logger.go
+@@ -59,8 +59,15 @@ const (
+ 	opsErrorLogMinQueueSize       = 256
+ 	opsErrorLogMaxQueueSize       = 8192
+ 	opsErrorLogBatchSize          = 32
++	opsRequestBodyContextMaxBytes = 256 * 1024
+ )
+ 
++type opsRequestBodySnapshot struct {
++	raw       []byte
++	bytes     int
++	truncated bool
++}
++
+ type opsErrorLogJob struct {
+ 	ops   *service.OpsService
+ 	entry *service.OpsInsertErrorLogInput
+@@ -340,7 +347,13 @@ func setOpsRequestContext(c *gin.Context, model string, stream bool, requestBody
+ 	c.Set(opsModelKey, model)
+ 	c.Set(opsStreamKey, stream)
+ 	if len(requestBody) > 0 {
+-		c.Set(opsRequestBodyKey, requestBody)
++		snapshot := opsRequestBodySnapshot{bytes: len(requestBody)}
++		if len(requestBody) <= opsRequestBodyContextMaxBytes {
++			snapshot.raw = bytes.Clone(requestBody)
++		} else {
++			snapshot.truncated = true
++		}
++		c.Set(opsRequestBodyKey, snapshot)
+ 	}
+ 	if c.Request != nil && model != "" {
+ 		ctx := context.WithValue(c.Request.Context(), ctxkey.Model, model)
+@@ -368,11 +381,32 @@ func attachOpsRequestBodyToEntry(c *gin.Context, entry *service.OpsInsertErrorLo
+ 	if !ok {
+ 		return
+ 	}
+-	raw, ok := v.([]byte)
+-	if !ok || len(raw) == 0 {
++	var raw []byte
++	var bytesLen int
++	var truncated bool
++	switch snapshot := v.(type) {
++	case opsRequestBodySnapshot:
++		raw = snapshot.raw
++		bytesLen = snapshot.bytes
++		truncated = snapshot.truncated
++	case []byte:
++		raw = snapshot
++		bytesLen = len(snapshot)
++	default:
++		return
++	}
++	if bytesLen > 0 {
++		n := bytesLen
++		entry.RequestBodyBytes = &n
++	}
++	if len(raw) == 0 {
++		entry.RequestBodyTruncated = truncated
+ 		return
+ 	}
+ 	entry.RequestBodyJSON, entry.RequestBodyTruncated, entry.RequestBodyBytes = service.PrepareOpsRequestBodyForQueue(raw)
++	if truncated {
++		entry.RequestBodyTruncated = true
++	}
+ 	opsErrorLogSanitized.Add(1)
+ }
+ 
+diff --git a/backend/internal/handler/ops_error_logger_test.go b/backend/internal/handler/ops_error_logger_test.go
+index 6ae4511..f4c428d 100644
+--- a/backend/internal/handler/ops_error_logger_test.go
++++ b/backend/internal/handler/ops_error_logger_test.go
+@@ -1,6 +1,7 @@
+ package handler
+ 
+ import (
++	"bytes"
+ 	"net/http"
+ 	"net/http/httptest"
+ 	"sync"
+@@ -87,6 +88,27 @@ func TestAttachOpsRequestBodyToEntry_InvalidJSONKeepsSize(t *testing.T) {
+ 	require.Equal(t, int64(1), OpsErrorLogSanitizedTotal())
+ }
+ 
++func TestAttachOpsRequestBodyToEntry_LargeSnapshotKeepsSizeOnly(t *testing.T) {
++	resetOpsErrorLoggerStateForTest(t)
++	gin.SetMode(gin.TestMode)
++
++	rec := httptest.NewRecorder()
++	c, _ := gin.CreateTestContext(rec)
++	c.Request = httptest.NewRequest(http.MethodPost, "/v1/messages", nil)
++
++	raw := bytes.Repeat([]byte("x"), opsRequestBodyContextMaxBytes+1)
++	setOpsRequestContext(c, "claude-3", false, raw)
++
++	entry := &service.OpsInsertErrorLogInput{}
++	attachOpsRequestBodyToEntry(c, entry)
++
++	require.Nil(t, entry.RequestBodyJSON)
++	require.NotNil(t, entry.RequestBodyBytes)
++	require.Equal(t, len(raw), *entry.RequestBodyBytes)
++	require.True(t, entry.RequestBodyTruncated)
++	require.Equal(t, int64(0), OpsErrorLogSanitizedTotal())
++}
++
+ func TestEnqueueOpsErrorLog_QueueFullDrop(t *testing.T) {
+ 	resetOpsErrorLoggerStateForTest(t)
+ 
+@@ -132,8 +154,8 @@ func TestAttachOpsRequestBodyToEntry_EarlyReturnBranches(t *testing.T) {
+ 	require.Nil(t, entry.RequestBodyJSON)
+ 	require.Nil(t, entry.RequestBodyBytes)
+ 
+-	// 空 bytes
+-	c.Set(opsRequestBodyKey, []byte{})
++	// empty snapshot
++	c.Set(opsRequestBodyKey, opsRequestBodySnapshot{})
+ 	attachOpsRequestBodyToEntry(c, entry)
+ 	require.Nil(t, entry.RequestBodyJSON)
+ 	require.Nil(t, entry.RequestBodyBytes)
 diff --git a/backend/internal/handler/subsite_forwarder.go b/backend/internal/handler/subsite_forwarder.go
 new file mode 100644
 index 0000000..9e08633
@@ -1480,10 +1657,10 @@ index 80bed32..c5fa486 100644
  	NewPaymentHandler,
 diff --git a/backend/internal/repository/subsite_relay_repo.go b/backend/internal/repository/subsite_relay_repo.go
 new file mode 100644
-index 0000000..7f59e82
+index 0000000..0cbabd5
 --- /dev/null
 +++ b/backend/internal/repository/subsite_relay_repo.go
-@@ -0,0 +1,1358 @@
+@@ -0,0 +1,1359 @@
 +package repository
 +
 +import (
@@ -1956,6 +2133,7 @@ index 0000000..7f59e82
 +			COUNT(DISTINCT a.id) FILTER (
 +				WHERE g.platform = 'openai'
 +				  AND COALESCE(g.required_account_level, '') <> ''
++				  AND COALESCE(a.account_level, 'unknown') <> 'unknown'
 +				  AND CASE WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus' ELSE COALESCE(a.account_level, 'unknown') END <>
 +					  CASE WHEN g.required_account_level = 'team' THEN 'plus' ELSE g.required_account_level END
 +			) AS level_mismatch_accounts,
@@ -2843,7 +3021,7 @@ index 0000000..7f59e82
 +	return strings.Join(where, " AND "), args
 +}
 diff --git a/backend/internal/repository/subsite_repo.go b/backend/internal/repository/subsite_repo.go
-index 782fff0..e0f4c72 100644
+index 782fff0..0f4f1fb 100644
 --- a/backend/internal/repository/subsite_repo.go
 +++ b/backend/internal/repository/subsite_repo.go
 @@ -281,7 +281,11 @@ func (r *subsiteRepository) RecordHeartbeat(ctx context.Context, heartbeat *serv
@@ -2859,7 +3037,63 @@ index 782fff0..e0f4c72 100644
  }
  
  func (r *subsiteRepository) MarkHeartbeatTimeouts(ctx context.Context, before time.Time) (int64, error) {
-@@ -639,6 +643,73 @@ func (r *accountLeaseRepository) ExpireStale(ctx context.Context, now time.Time)
+@@ -492,7 +496,7 @@ func (r *accountLeaseRepository) UpdateLimitsForSubsite(ctx context.Context, sub
+ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+-		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
++		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+ 		WHERE lease_id = $2 AND deleted_at IS NULL AND status IN ('active', 'renewing')
+ 	`, expiresAt, strings.TrimSpace(leaseID))
+ }
+@@ -500,7 +504,7 @@ func (r *accountLeaseRepository) Renew(ctx context.Context, leaseID string, expi
+ func (r *accountLeaseRepository) RenewForSubsite(ctx context.Context, subsiteID, leaseID string, expiresAt time.Time) (*service.AccountLease, error) {
+ 	return r.updateLease(ctx, `
+ 		UPDATE account_leases
+-		SET status = 'renewing', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
++		SET status = 'active', expires_at = $1, renewed_at = NOW(), updated_at = NOW()
+ 		WHERE lease_id = $2 AND subsite_id = $3 AND deleted_at IS NULL AND status IN ('active', 'renewing')
+ 	`, expiresAt, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID))
+ }
+@@ -557,7 +561,7 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+ 		WHERE al.lease_id = $1
+ 		  AND al.subsite_id = $2
+ 		  AND al.deleted_at IS NULL
+-		FOR UPDATE
++		FOR UPDATE OF al
+ 	`, strings.TrimSpace(leaseID), strings.TrimSpace(subsiteID)))
+ 	if errors.Is(err, sql.ErrNoRows) {
+ 		return nil, service.ErrAccountLeaseNotFound
+@@ -566,21 +570,17 @@ func (r *accountLeaseRepository) DeleteForSubsite(ctx context.Context, subsiteID
+ 		return nil, fmt.Errorf("lock account lease for delete: %w", err)
+ 	}
+ 
+-	var activeReservations int64
+-	if err := tx.QueryRowContext(ctx, `
+-		SELECT COUNT(*)
+-		FROM quota_reservations
++	now := time.Now()
++	if _, err := tx.ExecContext(ctx, `
++		UPDATE quota_reservations
++		SET status = 'canceled',
++			updated_at = $2
+ 		WHERE lease_id = $1
+ 		  AND status = 'reserved'
+-		  AND expires_at > NOW()
+-	`, lease.LeaseID).Scan(&activeReservations); err != nil {
+-		return nil, fmt.Errorf("count active lease reservations: %w", err)
+-	}
+-	if activeReservations > 0 {
+-		return nil, service.ErrAccountLeaseInUse
++	`, lease.LeaseID, now); err != nil {
++		return nil, fmt.Errorf("cancel active lease reservations before delete: %w", err)
+ 	}
+ 
+-	now := time.Now()
+ 	res, err := tx.ExecContext(ctx, `
+ 		UPDATE account_leases
+ 		SET status = 'revoked',
+@@ -639,6 +639,190 @@ func (r *accountLeaseRepository) ExpireStale(ctx context.Context, now time.Time)
  	return res.RowsAffected()
  }
  
@@ -2928,6 +3162,123 @@ index 782fff0..e0f4c72 100644
 +		return 0, fmt.Errorf("release invalid relay account leases: %w", err)
 +	}
 +	return res.RowsAffected()
++}
++
++func (r *accountLeaseRepository) AutoRenewExpiringHealthy(ctx context.Context, now time.Time, renewBefore time.Duration, renewTTL time.Duration) (int64, error) {
++	if renewBefore <= 0 || renewTTL <= 0 {
++		return 0, service.ErrSubsiteInvalidInput
++	}
++	renewThreshold := now.Add(renewBefore)
++	newExpiresAt := now.Add(renewTTL)
++	res, err := r.db.ExecContext(ctx, `
++		UPDATE account_leases al
++		SET status = 'active',
++			expires_at = $3,
++			renewed_at = $1,
++			updated_at = $1
++		FROM accounts a, groups g
++		WHERE al.account_id = a.id
++		  AND al.group_id = g.id
++		  AND al.deleted_at IS NULL
++		  AND al.status IN ('active', 'renewing')
++		  AND al.expires_at > $1
++		  AND al.expires_at <= $2
++		  AND a.deleted_at IS NULL
++		  AND a.status = 'active'
++		  AND a.schedulable = TRUE
++		  AND (a.auto_pause_on_expired = FALSE OR a.expires_at IS NULL OR a.expires_at > $1)
++		  AND (a.overload_until IS NULL OR a.overload_until <= $1)
++		  AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= $1)
++		  AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= $1)
++		  AND (al.max_requests <= 0 OR al.used_requests < al.max_requests)
++		  AND (al.max_tokens <= 0 OR al.used_tokens < al.max_tokens)
++		  AND g.deleted_at IS NULL
++		  AND g.status = 'active'
++		  AND g.platform = a.platform
++		  AND al.platform = a.platform
++		  AND EXISTS (
++			SELECT 1
++			FROM account_groups ag
++			WHERE ag.account_id = al.account_id
++			  AND ag.group_id = al.group_id
++		  )
++		  AND (
++			(
++				COALESCE(g.scope, 'public') = 'user_private'
++				AND a.owner_user_id IS NOT NULL
++				AND g.owner_user_id IS NOT NULL
++				AND a.owner_user_id = g.owner_user_id
++				AND COALESCE(a.share_mode, 'private') = 'private'
++			)
++			OR (
++				COALESCE(g.scope, 'public') <> 'user_private'
++				AND (
++					a.owner_user_id IS NULL
++					OR (
++						COALESCE(a.share_mode, 'private') = 'public'
++						AND COALESCE(a.share_status, 'approved') = 'approved'
++					)
++				)
++			)
++		  )
++		  AND (
++			g.platform <> 'openai'
++			OR COALESCE(g.required_account_level, '') = ''
++			OR CASE
++				WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus'
++				ELSE COALESCE(a.account_level, 'unknown')
++			END = CASE
++				WHEN g.required_account_level = 'team' THEN 'plus'
++				ELSE g.required_account_level
++			END
++		  )
++	`, now, renewThreshold, newExpiresAt)
++	if err != nil {
++		return 0, fmt.Errorf("auto renew expiring healthy account leases: %w", err)
++	}
++	return res.RowsAffected()
++}
++
++func (r *accountLeaseRepository) DeleteTerminalLeases(ctx context.Context, now time.Time, retention time.Duration) (int64, error) {
++	if retention < 0 {
++		return 0, service.ErrSubsiteInvalidInput
++	}
++	cutoff := now.Add(-retention)
++	tx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
++	if err != nil {
++		return 0, fmt.Errorf("begin delete terminal account leases tx: %w", err)
++	}
++	defer func() { _ = tx.Rollback() }()
++
++	if _, err := tx.ExecContext(ctx, `
++		DELETE FROM quota_reservations qr
++		USING account_leases al
++		WHERE qr.lease_id = al.lease_id
++		  AND al.status IN ('released', 'expired', 'revoked')
++		  AND al.updated_at <= $1
++		  AND qr.status IN ('canceled', 'expired')
++	`, cutoff); err != nil {
++		return 0, fmt.Errorf("delete terminal lease reservations: %w", err)
++	}
++
++	res, err := tx.ExecContext(ctx, `
++		DELETE FROM account_leases al
++		WHERE al.status IN ('released', 'expired', 'revoked')
++		  AND al.updated_at <= $1
++		  AND NOT EXISTS (
++			SELECT 1
++			FROM quota_reservations qr
++			WHERE qr.lease_id = al.lease_id
++		  )
++	`, cutoff)
++	if err != nil {
++		return 0, fmt.Errorf("delete terminal account leases: %w", err)
++	}
++	deleted, _ := res.RowsAffected()
++	if err := tx.Commit(); err != nil {
++		return 0, err
++	}
++	return deleted, nil
 +}
 +
  func (r *accountLeaseRepository) list(ctx context.Context, query string, args ...any) ([]service.AccountLease, error) {
@@ -3218,6 +3569,82 @@ index 2302ae5..d3b4100 100644
  // getGroupPlatform extracts the group platform from the API Key stored in context.
  func getGroupPlatform(c *gin.Context) string {
  	apiKey, ok := middleware.GetAPIKeyFromContext(c)
+diff --git a/backend/internal/service/account_service.go b/backend/internal/service/account_service.go
+index 0ef61f1..c053be3 100644
+--- a/backend/internal/service/account_service.go
++++ b/backend/internal/service/account_service.go
+@@ -1698,6 +1698,9 @@ func (s *AccountService) notifyAccountDeleted(ctx context.Context, account *Acco
+ }
+ 
+ func (s *AccountService) notifyAccountChanged(ctx context.Context, before, after *Account) {
++	if ShouldReconcileSubsiteRelayForAccountChange(before, after) {
++		TriggerSubsiteRelayReconcile("account_changed")
++	}
+ 	if s == nil || s.systemNoticeService == nil {
+ 		return
+ 	}
+diff --git a/backend/internal/service/admin_service.go b/backend/internal/service/admin_service.go
+index c74e909..e8b38b1 100644
+--- a/backend/internal/service/admin_service.go
++++ b/backend/internal/service/admin_service.go
+@@ -2958,6 +2958,9 @@ func (s *adminServiceImpl) notifyAccountDeleted(ctx context.Context, account *Ac
+ }
+ 
+ func (s *adminServiceImpl) notifyAccountChanged(ctx context.Context, before, after *Account) {
++	if ShouldReconcileSubsiteRelayForAccountChange(before, after) {
++		TriggerSubsiteRelayReconcile("admin_account_changed")
++	}
+ 	if s == nil || s.systemNoticeService == nil {
+ 		return
+ 	}
+diff --git a/backend/internal/service/antigravity_gateway_service.go b/backend/internal/service/antigravity_gateway_service.go
+index a76e59f..4e0356a 100644
+--- a/backend/internal/service/antigravity_gateway_service.go
++++ b/backend/internal/service/antigravity_gateway_service.go
+@@ -629,9 +629,7 @@ urlFallbackLoop:
+ 			}
+ 
+ 			// Capture upstream request body for ops retry of this attempt.
+-			if p.c != nil && len(p.body) > 0 {
+-				p.c.Set(OpsUpstreamRequestBodyKey, string(p.body))
+-			}
++			setOpsUpstreamRequestBody(p.c, p.body)
+ 
+ 			resp, err = p.httpUpstream.Do(upstreamReq, p.proxyURL, p.account.ID, p.account.Concurrency)
+ 			if err == nil && resp == nil {
+@@ -1740,6 +1738,10 @@ func (s *AntigravityGatewayService) Forward(ctx context.Context, c *gin.Context,
+ 	var firstTokenMs *int
+ 	var clientDisconnect bool
+ 	if claudeReq.Stream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		// 客户端要求流式，直接透传转换
+ 		streamRes, err := s.handleClaudeStreamingResponse(c, resp, startTime, originalModel)
+ 		if err != nil {
+@@ -2423,6 +2425,10 @@ handleSuccess:
+ 	var clientDisconnect bool
+ 
+ 	if stream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		// 客户端要求流式，直接透传
+ 		streamRes, err := s.handleGeminiStreamingResponse(c, resp, startTime)
+ 		if err != nil {
+@@ -4288,6 +4294,10 @@ func (s *AntigravityGatewayService) ForwardUpstream(ctx context.Context, c *gin.
+ 	var clientDisconnect bool
+ 
+ 	if claudeReq.Stream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		// 流式响应：透传
+ 		c.Header("Content-Type", "text/event-stream")
+ 		c.Header("Cache-Control", "no-cache")
 diff --git a/backend/internal/service/api_key_auth_cache.go b/backend/internal/service/api_key_auth_cache.go
 index 997ff4e..6bcdfa0 100644
 --- a/backend/internal/service/api_key_auth_cache.go
@@ -3281,6 +3708,496 @@ index 92cbd62..001117d 100644
  	// Gateway Forwarding Behavior
  	// SettingKeyEnableFingerprintUnification 是否统一 OAuth 账号的 X-Stainless-* 指纹头（默认 true）
  	SettingKeyEnableFingerprintUnification = "enable_fingerprint_unification"
+diff --git a/backend/internal/service/gateway_service.go b/backend/internal/service/gateway_service.go
+index 29f767a..36f30ad 100644
+--- a/backend/internal/service/gateway_service.go
++++ b/backend/internal/service/gateway_service.go
+@@ -5202,6 +5202,10 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
+ 	var firstTokenMs *int
+ 	var clientDisconnect bool
+ 	if reqStream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, reqModel, shouldMimicClaudeCode)
+ 		if err != nil {
+ 			if err.Error() == "have error in stream" {
+@@ -5462,6 +5466,10 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
+ 	var firstTokenMs *int
+ 	var clientDisconnect bool
+ 	if input.RequestStream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		input.Body = nil
+ 		streamResult, err := s.handleStreamingResponseAnthropicAPIKeyPassthrough(ctx, resp, c, account, input.StartTime, input.RequestModel)
+ 		if err != nil {
+ 			return nil, err
+diff --git a/backend/internal/service/gemini_messages_compat_service.go b/backend/internal/service/gemini_messages_compat_service.go
+index 6d7058f..d0a231a 100644
+--- a/backend/internal/service/gemini_messages_compat_service.go
++++ b/backend/internal/service/gemini_messages_compat_service.go
+@@ -805,10 +805,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
+ 		requestIDHeader = idHeader
+ 
+ 		// Capture upstream request body for ops retry of this attempt.
+-		if c != nil {
+-			// In this code path `body` is already the JSON sent to upstream.
+-			c.Set(OpsUpstreamRequestBodyKey, string(body))
+-		}
++		setOpsUpstreamRequestBody(c, body)
+ 
+ 		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+ 		if err != nil {
+@@ -1080,7 +1077,12 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
+ 
+ 	var usage *ClaudeUsage
+ 	var firstTokenMs *int
++	imageSize := s.extractImageSize(body)
+ 	if req.Stream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		streamRes, err := s.handleStreamingResponse(c, resp, startTime, originalModel)
+ 		if err != nil {
+ 			return nil, err
+@@ -1110,7 +1112,6 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
+ 
+ 	// 图片生成计费
+ 	imageCount := 0
+-	imageSize := s.extractImageSize(body)
+ 	if isImageGenerationModel(originalModel) {
+ 		imageCount = 1
+ 	}
+@@ -1330,10 +1331,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+ 		requestIDHeader = idHeader
+ 
+ 		// Capture upstream request body for ops retry of this attempt.
+-		if c != nil {
+-			// In this code path `body` is already the JSON sent to upstream.
+-			c.Set(OpsUpstreamRequestBodyKey, string(body))
+-		}
++		setOpsUpstreamRequestBody(c, body)
+ 
+ 		resp, err = s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
+ 		if err != nil {
+@@ -1606,8 +1604,13 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+ 
+ 	var usage *ClaudeUsage
+ 	var firstTokenMs *int
++	imageSize := s.extractImageSize(body)
+ 
+ 	if stream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		streamRes, err := s.handleNativeStreamingResponse(c, resp, startTime, isOAuth)
+ 		if err != nil {
+ 			return nil, err
+@@ -1638,7 +1641,6 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
+ 
+ 	// 图片生成计费
+ 	imageCount := 0
+-	imageSize := s.extractImageSize(body)
+ 	if isImageGenerationModel(originalModel) {
+ 		imageCount = 1
+ 	}
+diff --git a/backend/internal/service/openai_gateway_service.go b/backend/internal/service/openai_gateway_service.go
+index f6bec83..2c3ec9b 100644
+--- a/backend/internal/service/openai_gateway_service.go
++++ b/backend/internal/service/openai_gateway_service.go
+@@ -45,8 +45,6 @@ const (
+ 	// codex_cli_only rejected request header values are truncated for diagnostics.
+ 	codexCLIOnlyHeaderValueMaxBytes = 256
+ 
+-	// OpenAIParsedRequestBodyKey caches the request body parsed by handler.
+-	OpenAIParsedRequestBodyKey = "openai_parsed_request_body"
+ 	// OpenAI WS Mode reconnect retry limit after the first failed attempt.
+ 	openAIWSReconnectRetryLimit = 5
+ 	// OpenAI WS Mode default retry backoff values.
+@@ -2497,6 +2495,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 	//      缁村害涓嶅悓鑰屽嚭鐜?whitelist 鍛戒腑宸紓銆?	//   2. action=pass 鏃朵篃瑕佹妸 raw "fast" 褰掍竴鍖栦负 "priority" 鍐欏洖 body锛?	//      鍚﹀垯 native /responses 鍏ュ彛閫忎紶 "fast" 缁欎笂娓镐細琚嫆銆俢hat-
+ 	//      completions 鍏ュ彛鐢?normalizeResponsesBodyServiceTier 瀹屾垚鍚屼竴
+ 	//      琛屼负锛岃繖閲屾墜宸ュ疄鐜扮瓑鏁堥€昏緫銆?
++	reasoningEffort := extractOpenAIReasoningEffort(reqBody, originalModel)
++	serviceTier := extractOpenAIServiceTier(reqBody)
++
+ 	if rawTier, ok := reqBody["service_tier"].(string); ok {
+ 		if normTier := normalizedOpenAIServiceTierValue(rawTier); normTier != "" {
+ 			action, errMsg := s.evaluateOpenAIFastPolicy(ctx, account, upstreamModel, normTier)
+@@ -2511,6 +2512,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 				return nil, blocked
+ 			case BetaPolicyActionFilter:
+ 				delete(reqBody, "service_tier")
++				serviceTier = nil
+ 				bodyModified = true
+ 				disablePatch()
+ 			default:
+@@ -2518,6 +2520,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 				// 鍚庡啓鍥?body锛岀‘淇濅笂娓告敹鍒扮殑鏄叾鑳借瘑鍒殑瑙勮寖鍊笺€?
+ 				if normTier != rawTier {
+ 					reqBody["service_tier"] = normTier
++					serviceTier = &normTier
+ 					bodyModified = true
+ 					markPatchSet("service_tier", normTier)
+ 				}
+@@ -2550,6 +2553,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			}
+ 		}
+ 	}
++	openAIReqBody := reqBody
++	if !reqStream && wsDecision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
++		reqBody = nil
++	}
+ 
+ 	// Get access token
+ 	token, _, err := s.GetAccessToken(ctx, account)
+@@ -2562,10 +2569,10 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 
+ 	// 鍛戒腑 WS 鏃朵粎璧?WebSocket Mode锛涗笉鍐嶈嚜鍔ㄥ洖閫€ HTTP銆?
+ 	if wsDecision.Transport == OpenAIUpstreamTransportResponsesWebsocketV2 {
+-		wsReqBody := reqBody
+-		if len(reqBody) > 0 {
+-			wsReqBody = make(map[string]any, len(reqBody))
+-			for k, v := range reqBody {
++		wsReqBody := openAIReqBody
++		if len(openAIReqBody) > 0 {
++			wsReqBody = make(map[string]any, len(openAIReqBody))
++			for k, v := range openAIReqBody {
+ 				wsReqBody[k] = v
+ 			}
+ 		}
+@@ -2773,6 +2780,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 		s.writeOpenAIWSFallbackErrorResponse(c, account, wsErr)
+ 		return nil, wsErr
+ 	}
++	if reqStream {
++		reqBody = nil
++	}
+ 
+ 	httpInvalidEncryptedContentRetryTried := false
+ 	for {
+@@ -2824,9 +2834,9 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			upstreamMsg := strings.TrimSpace(extractUpstreamErrorMessage(respBody))
+ 			upstreamMsg = sanitizeUpstreamErrorMessage(upstreamMsg)
+ 			upstreamCode := extractUpstreamErrorCode(respBody)
+-			if !httpInvalidEncryptedContentRetryTried && resp.StatusCode == http.StatusBadRequest && upstreamCode == "invalid_encrypted_content" {
+-				if trimOpenAIEncryptedReasoningItems(reqBody) {
+-					body, err = json.Marshal(reqBody)
++			if !httpInvalidEncryptedContentRetryTried && openAIReqBody != nil && resp.StatusCode == http.StatusBadRequest && upstreamCode == "invalid_encrypted_content" {
++				if trimOpenAIEncryptedReasoningItems(openAIReqBody) {
++					body, err = json.Marshal(openAIReqBody)
+ 					if err != nil {
+ 						return nil, fmt.Errorf("serialize invalid_encrypted_content retry body: %w", err)
+ 					}
+@@ -2872,6 +2882,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 		var usage *OpenAIUsage
+ 		var firstTokenMs *int
+ 		if reqStream {
++			if resp != nil {
++				resp.Request = nil
++			}
++			body = nil
++			openAIReqBody = nil
+ 			streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
+ 			if err != nil {
+ 				return nil, err
+@@ -2879,8 +2894,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			usage = streamResult.usage
+ 			firstTokenMs = streamResult.firstTokenMs
+ 			if streamResult != nil {
+-				if serviceTier := extractOpenAIServiceTierFromResponses(streamResult.responseServiceTier); serviceTier != nil {
+-					reqBody["service_tier"] = *serviceTier
++				if responseServiceTier := extractOpenAIServiceTierFromResponses(streamResult.responseServiceTier); responseServiceTier != nil {
++					serviceTier = responseServiceTier
+ 				}
+ 			}
+ 		} else {
+@@ -2889,8 +2904,8 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 				return nil, err
+ 			}
+ 			if usage != nil {
+-				if serviceTier := extractOpenAIServiceTierFromResponses(usage.ResponseServiceTier); serviceTier != nil {
+-					reqBody["service_tier"] = *serviceTier
++				if responseServiceTier := extractOpenAIServiceTierFromResponses(usage.ResponseServiceTier); responseServiceTier != nil {
++					serviceTier = responseServiceTier
+ 				}
+ 			}
+ 		}
+@@ -2906,9 +2921,6 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
+ 			usage = &OpenAIUsage{}
+ 		}
+ 
+-		reasoningEffort := extractOpenAIReasoningEffort(reqBody, originalModel)
+-		serviceTier := extractOpenAIServiceTier(reqBody)
+-
+ 		result := &OpenAIForwardResult{
+ 			RequestID:       resp.Header.Get("x-request-id"),
+ 			Usage:           *usage,
+@@ -3098,7 +3110,12 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 
+ 	var usage *OpenAIUsage
+ 	var firstTokenMs *int
++	serviceTier := extractOpenAIServiceTierFromBody(body)
+ 	if reqStream {
++		if resp != nil {
++			resp.Request = nil
++		}
++		body = nil
+ 		result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
+ 		if err != nil {
+ 			return nil, err
+@@ -3106,10 +3123,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 		usage = result.usage
+ 		firstTokenMs = result.firstTokenMs
+ 		if result != nil {
+-			if serviceTier := extractOpenAIServiceTierFromResponses(result.responseServiceTier); serviceTier != nil {
+-				if updated, serr := sjson.SetBytes(body, "service_tier", *serviceTier); serr == nil {
+-					body = updated
+-				}
++			if responseServiceTier := extractOpenAIServiceTierFromResponses(result.responseServiceTier); responseServiceTier != nil {
++				serviceTier = responseServiceTier
+ 			}
+ 		}
+ 	} else {
+@@ -3118,10 +3133,8 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 			return nil, err
+ 		}
+ 		if usage != nil {
+-			if serviceTier := extractOpenAIServiceTierFromResponses(usage.ResponseServiceTier); serviceTier != nil {
+-				if updated, serr := sjson.SetBytes(body, "service_tier", *serviceTier); serr == nil {
+-					body = updated
+-				}
++			if responseServiceTier := extractOpenAIServiceTierFromResponses(usage.ResponseServiceTier); responseServiceTier != nil {
++				serviceTier = responseServiceTier
+ 			}
+ 		}
+ 	}
+@@ -3139,7 +3152,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
+ 		Usage:           *usage,
+ 		Model:           reqModel,
+ 		UpstreamModel:   upstreamPassthroughModel,
+-		ServiceTier:     extractOpenAIServiceTierFromBody(body),
++		ServiceTier:     serviceTier,
+ 		ReasoningEffort: reasoningEffort,
+ 		Stream:          reqStream,
+ 		OpenAIWSMode:    false,
+@@ -6411,22 +6424,11 @@ func isEmptyBase64DataURI(raw string) bool {
+ 	return strings.TrimSpace(strings.TrimPrefix(rest, "base64,")) == ""
+ }
+ 
+-func getOpenAIRequestBodyMap(c *gin.Context, body []byte) (map[string]any, error) {
+-	if c != nil {
+-		if cached, ok := c.Get(OpenAIParsedRequestBodyKey); ok {
+-			if reqBody, ok := cached.(map[string]any); ok && reqBody != nil {
+-				return reqBody, nil
+-			}
+-		}
+-	}
+-
++func getOpenAIRequestBodyMap(_ *gin.Context, body []byte) (map[string]any, error) {
+ 	var reqBody map[string]any
+ 	if err := json.Unmarshal(body, &reqBody); err != nil {
+ 		return nil, fmt.Errorf("parse request: %w", err)
+ 	}
+-	if c != nil {
+-		c.Set(OpenAIParsedRequestBodyKey, reqBody)
+-	}
+ 	return reqBody, nil
+ }
+ 
+diff --git a/backend/internal/service/openai_gateway_service_hotpath_test.go b/backend/internal/service/openai_gateway_service_hotpath_test.go
+index 234dee0..d1a8b1e 100644
+--- a/backend/internal/service/openai_gateway_service_hotpath_test.go
++++ b/backend/internal/service/openai_gateway_service_hotpath_test.go
+@@ -106,17 +106,18 @@ func TestExtractOpenAIReasoningEffortFromBody(t *testing.T) {
+ 	}
+ }
+ 
+-func TestGetOpenAIRequestBodyMap_UsesContextCache(t *testing.T) {
++func TestGetOpenAIRequestBodyMap_IgnoresContextCache(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 	rec := httptest.NewRecorder()
+ 	c, _ := gin.CreateTestContext(rec)
+ 
+ 	cached := map[string]any{"model": "cached-model", "stream": true}
+-	c.Set(OpenAIParsedRequestBodyKey, cached)
++	c.Set("openai_parsed_request_body", cached)
+ 
+ 	got, err := getOpenAIRequestBodyMap(c, []byte(`{invalid-json`))
+-	require.NoError(t, err)
+-	require.Equal(t, cached, got)
++	require.Error(t, err)
++	require.Nil(t, got)
++	require.Contains(t, err.Error(), "parse request")
+ }
+ 
+ func TestGetOpenAIRequestBodyMap_ParseErrorWithoutCache(t *testing.T) {
+@@ -125,7 +126,7 @@ func TestGetOpenAIRequestBodyMap_ParseErrorWithoutCache(t *testing.T) {
+ 	require.Contains(t, err.Error(), "parse request")
+ }
+ 
+-func TestGetOpenAIRequestBodyMap_WriteBackContextCache(t *testing.T) {
++func TestGetOpenAIRequestBodyMap_DoesNotWriteBackContextCache(t *testing.T) {
+ 	gin.SetMode(gin.TestMode)
+ 	rec := httptest.NewRecorder()
+ 	c, _ := gin.CreateTestContext(rec)
+@@ -134,11 +135,8 @@ func TestGetOpenAIRequestBodyMap_WriteBackContextCache(t *testing.T) {
+ 	require.NoError(t, err)
+ 	require.Equal(t, "gpt-5", got["model"])
+ 
+-	cached, ok := c.Get(OpenAIParsedRequestBodyKey)
+-	require.True(t, ok)
+-	cachedMap, ok := cached.(map[string]any)
+-	require.True(t, ok)
+-	require.Equal(t, got, cachedMap)
++	_, ok := c.Get("openai_parsed_request_body")
++	require.False(t, ok)
+ }
+ 
+ func TestSanitizeEmptyBase64InputImagesInOpenAIRequestBodyMap(t *testing.T) {
+diff --git a/backend/internal/service/openai_ws_forwarder.go b/backend/internal/service/openai_ws_forwarder.go
+index 6188074..5ecd569 100644
+--- a/backend/internal/service/openai_ws_forwarder.go
++++ b/backend/internal/service/openai_ws_forwarder.go
+@@ -1923,6 +1923,9 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
+ 
+ 	payload := s.buildOpenAIWSCreatePayload(reqBody, account)
+ 	imageBillingConfig := resolveOpenAIResponseImageBillingConfig(openAIResponsesEndpoint, originalModel, payload)
++	serviceTier := extractOpenAIServiceTier(payload)
++	reasoningEffort := extractOpenAIReasoningEffort(payload, originalModel)
++	needsToolContinuation := NeedsToolContinuation(reqBody)
+ 	payloadStrategy, removedKeys := applyOpenAIWSRetryPayloadStrategy(payload, attempt)
+ 	previousResponseID := openAIWSPayloadString(payload, "previous_response_id")
+ 	previousResponseIDKind := ClassifyOpenAIPreviousResponseIDKind(previousResponseID)
+@@ -2152,7 +2155,7 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
+ 		decision,
+ 		payload,
+ 		previousResponseID,
+-		reqBody,
++		needsToolContinuation,
+ 		account,
+ 		stateStore,
+ 		groupID,
+@@ -2556,8 +2559,8 @@ func (s *OpenAIGatewayService) forwardOpenAIWSV2(
+ 		Usage:           *usage,
+ 		Model:           originalModel,
+ 		UpstreamModel:   mappedModel,
+-		ServiceTier:     extractOpenAIServiceTier(reqBody),
+-		ReasoningEffort: extractOpenAIReasoningEffort(reqBody, originalModel),
++		ServiceTier:     serviceTier,
++		ReasoningEffort: reasoningEffort,
+ 		Stream:          reqStream,
+ 		OpenAIWSMode:    true,
+ 		ResponseHeaders: lease.HandshakeHeaders(),
+@@ -3905,7 +3908,7 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
+ 	decision OpenAIWSProtocolDecision,
+ 	payload map[string]any,
+ 	previousResponseID string,
+-	reqBody map[string]any,
++	needsToolContinuation bool,
+ 	account *Account,
+ 	stateStore OpenAIWSStateStore,
+ 	groupID int64,
+@@ -3943,7 +3946,7 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
+ 		logOpenAIWSModeInfo("prewarm_skip account_id=%d conn_id=%s reason=already_prewarmed", account.ID, connID)
+ 		return nil
+ 	}
+-	if NeedsToolContinuation(reqBody) {
++	if needsToolContinuation {
+ 		logOpenAIWSModeInfo("prewarm_skip account_id=%d conn_id=%s reason=tool_continuation", account.ID, connID)
+ 		return nil
+ 	}
+diff --git a/backend/internal/service/openai_ws_forwarder_success_test.go b/backend/internal/service/openai_ws_forwarder_success_test.go
+index 7576186..48e1a17 100644
+--- a/backend/internal/service/openai_ws_forwarder_success_test.go
++++ b/backend/internal/service/openai_ws_forwarder_success_test.go
+@@ -896,7 +896,7 @@ func TestOpenAIGatewayService_GeneratePrewarmResponseFailedCapacityTempUnscheds(
+ 		OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+ 		payload,
+ 		"",
+-		map[string]any{"model": "gpt-5.1"},
++		false,
+ 		account,
+ 		nil,
+ 		0,
+@@ -949,7 +949,7 @@ func TestOpenAIGatewayService_PrewarmReadHonorsParentContext(t *testing.T) {
+ 		OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+ 		payload,
+ 		"",
+-		map[string]any{"model": "gpt-5.1"},
++		false,
+ 		account,
+ 		nil,
+ 		0,
+diff --git a/backend/internal/service/ops_upstream_context.go b/backend/internal/service/ops_upstream_context.go
+index 05d444e..f28cabb 100644
+--- a/backend/internal/service/ops_upstream_context.go
++++ b/backend/internal/service/ops_upstream_context.go
+@@ -1,6 +1,7 @@
+ package service
+ 
+ import (
++	"bytes"
+ 	"encoding/json"
+ 	"strings"
+ 	"time"
+@@ -27,23 +28,27 @@ const (
+ 	OpsUpstreamLatencyMsKey  = "ops_upstream_latency_ms"
+ 	OpsResponseLatencyMsKey  = "ops_response_latency_ms"
+ 	OpsTimeToFirstTokenMsKey = "ops_time_to_first_token_ms"
+-	// OpenAI WS 关键观测字段
++	// OpenAI WS observation fields.
+ 	OpsOpenAIWSQueueWaitMsKey = "ops_openai_ws_queue_wait_ms"
+ 	OpsOpenAIWSConnPickMsKey  = "ops_openai_ws_conn_pick_ms"
+ 	OpsOpenAIWSConnReusedKey  = "ops_openai_ws_conn_reused"
+ 	OpsOpenAIWSConnIDKey      = "ops_openai_ws_conn_id"
+ 
+-	// OpsSkipPassthroughKey 由 applyErrorPassthroughRule 在命中 skip_monitoring=true 的规则时设置。
+-	// ops_error_logger 中间件检查此 key，为 true 时跳过错误记录。
++	// OpsSkipPassthroughKey skips ops error persistence when passthrough rules request it.
+ 	OpsSkipPassthroughKey = "ops_skip_passthrough"
+ )
+ 
++const opsUpstreamRequestBodyContextMaxBytes = opsMaxStoredRequestBodyBytes
++
+ func setOpsUpstreamRequestBody(c *gin.Context, body []byte) {
+-	if c == nil || len(body) == 0 {
++	if c == nil {
++		return
++	}
++	if len(body) == 0 || len(body) > opsUpstreamRequestBodyContextMaxBytes {
++		c.Set(OpsUpstreamRequestBodyKey, nil)
+ 		return
+ 	}
+-	// 热路径避免 string(body) 额外分配，按需在落库前再转换。
+-	c.Set(OpsUpstreamRequestBodyKey, body)
++	c.Set(OpsUpstreamRequestBodyKey, bytes.Clone(body))
+ }
+ 
+ func SetOpsLatencyMs(c *gin.Context, key string, value int64) {
+@@ -80,8 +85,7 @@ func setOpsUpstreamError(c *gin.Context, upstreamStatusCode int, upstreamMessage
+ type OpsUpstreamErrorEvent struct {
+ 	AtUnixMs int64 `json:"at_unix_ms,omitempty"`
+ 
+-	// Passthrough 表示本次请求是否命中“原样透传（仅替换认证）”分支。
+-	// 该字段用于排障与灰度评估；存入 JSON，不涉及 DB schema 变更。
++	// Passthrough marks requests that only replace upstream authentication.
+ 	Passthrough bool `json:"passthrough,omitempty"`
+ 
+ 	// Context
+@@ -159,7 +163,7 @@ func appendOpsUpstreamError(c *gin.Context, ev OpsUpstreamErrorEvent) {
+ 
+ // checkSkipMonitoringForUpstreamEvent checks whether the upstream error event
+ // matches a passthrough rule with skip_monitoring=true and, if so, sets the
+-// OpsSkipPassthroughKey on the context.  This ensures intermediate retry /
++// OpsSkipPassthroughKey on the context. This ensures intermediate retry /
+ // failover errors (which never go through the final applyErrorPassthroughRule
+ // path) can still suppress ops_error_logs recording.
+ func checkSkipMonitoringForUpstreamEvent(c *gin.Context, ev *OpsUpstreamErrorEvent) {
 diff --git a/backend/internal/service/setting_subsite_relay.go b/backend/internal/service/setting_subsite_relay.go
 new file mode 100644
 index 0000000..d730f7d
@@ -3383,7 +4300,7 @@ index 0000000..d730f7d
 +	return normalized, nil
 +}
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..ec45274 100644
+index 8cfa424..1606500 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -12,6 +12,7 @@ import (
@@ -3394,7 +4311,7 @@ index 8cfa424..ec45274 100644
  	"strings"
  	"sync"
  	"time"
-@@ -48,6 +49,13 @@ const (
+@@ -48,10 +49,22 @@ const (
  	SubsiteAuthHeaderBodySHA   = "X-Subsite-Body-SHA256"
  	SubsiteAuthHeaderSignature = "X-Subsite-Signature"
  
@@ -3408,7 +4325,16 @@ index 8cfa424..ec45274 100644
  	DefaultSubsiteHeartbeatTimeout       = 45 * time.Second
  	DefaultSubsiteMaintenanceInterval    = 15 * time.Second
  	DefaultSubsiteMaintenanceRunTimeout  = 10 * time.Second
-@@ -265,6 +273,7 @@ type AuthorizeSubsiteRequestInput struct {
+ 	DefaultSubsiteReservationExpiryGrace = 24 * time.Hour
++	DefaultSubsiteRelayReconcileInterval = 60 * time.Second
++	DefaultSubsiteRelayReconcileDebounce = 10 * time.Second
++	DefaultSubsiteLeaseAutoRenewBefore   = 5 * time.Hour
++	DefaultSubsiteLeaseAutoRenewTTL      = 24 * time.Hour
++	DefaultSubsiteLeaseCleanupRetention  = time.Hour
+ 
+ 	DefaultSubsiteEstimatedInputTokens           = 4096
+ 	DefaultSubsiteEstimatedOutputTokens          = 8192
+@@ -265,6 +278,7 @@ type AuthorizeSubsiteRequestInput struct {
  	InboundEndpoint                string   `json:"inbound_endpoint"`
  	PreferredLeaseID               string   `json:"preferred_lease_id,omitempty"`
  	PreferredAccountID             int64    `json:"preferred_account_id,omitempty"`
@@ -3416,7 +4342,7 @@ index 8cfa424..ec45274 100644
  	ExcludedLeaseIDs               []string `json:"excluded_lease_ids,omitempty"`
  	ExcludedAccountIDs             []int64  `json:"excluded_account_ids,omitempty"`
  }
-@@ -378,8 +387,13 @@ type SubsiteMaintenanceInput struct {
+@@ -378,8 +392,18 @@ type SubsiteMaintenanceInput struct {
  
  type SubsiteMaintenanceResult struct {
  	ExpiredLeases              int64 `json:"expired_leases"`
@@ -3427,15 +4353,36 @@ index 8cfa424..ec45274 100644
 +	ExpiredCircuitBreakers     int64 `json:"expired_circuit_breakers"`
 +	DeletedForwardEvents       int64 `json:"deleted_forward_events"`
 +	DeletedHealthSamples       int64 `json:"deleted_health_samples"`
++	AutoRenewedLeases          int64 `json:"auto_renewed_leases"`
++	DeletedTerminalLeases      int64 `json:"deleted_terminal_leases"`
++	RelayCreatedLeases         int   `json:"relay_created_leases"`
++	RelaySkippedAccounts       int   `json:"relay_skipped_accounts"`
++	RelayOnlineSubsites        int   `json:"relay_online_subsites"`
  	HeartbeatTimeoutSecs       int64 `json:"heartbeat_timeout_secs"`
  	ReservationExpiryGraceSecs int64 `json:"reservation_expiry_grace_secs"`
  }
-@@ -431,17 +445,30 @@ type QuotaReservationRepository interface {
+@@ -414,6 +438,10 @@ type AccountLeaseRepository interface {
+ 	ExpireStale(ctx context.Context, now time.Time) (int64, error)
+ }
+ 
++type subsiteRelayReconciler interface {
++	TriggerSubsiteRelayReconcile(reason string)
++}
++
+ type SubsiteSubscriptionAuthorizer interface {
+ 	GetActiveSubscription(ctx context.Context, userID, groupID int64) (*UserSubscription, error)
+ 	CheckUsageLimits(ctx context.Context, sub *UserSubscription, group *Group, additionalCost float64) error
+@@ -431,17 +459,35 @@ type QuotaReservationRepository interface {
  	ExpireStale(ctx context.Context, now time.Time) (int64, error)
  }
  
 +type subsiteRelayLeaseMaintenanceRepository interface {
 +	ReleaseInvalidAssignments(ctx context.Context, now time.Time) (int64, error)
++}
++
++type subsiteLeaseLifecycleMaintenanceRepository interface {
++	AutoRenewExpiringHealthy(ctx context.Context, now time.Time, renewBefore time.Duration, renewTTL time.Duration) (int64, error)
++	DeleteTerminalLeases(ctx context.Context, now time.Time, retention time.Duration) (int64, error)
 +}
 +
 +type subsiteRelayForwardMaintenanceRepository interface {
@@ -3464,7 +4411,46 @@ index 8cfa424..ec45274 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -749,6 +776,18 @@ func (s *AccountLeaseService) Create(ctx context.Context, input CreateAccountLea
+@@ -706,19 +752,29 @@ func SignSubsiteRequest(secret, method, path, timestamp, nonce, bodySHA256 strin
+ }
+ 
+ type AccountLeaseService struct {
+-	leaseRepo   AccountLeaseRepository
+-	subsiteRepo SubsiteRepository
+-	accountRepo AccountRepository
+-	groupRepo   GroupRepository
++	leaseRepo          AccountLeaseRepository
++	subsiteRepo        SubsiteRepository
++	accountRepo        AccountRepository
++	groupRepo          GroupRepository
++	reconcileCh        chan string
++	reconcileStopCh    chan struct{}
++	reconcileStartOnce sync.Once
++	reconcileStopOnce  sync.Once
++	reconcileWG        sync.WaitGroup
+ }
+ 
+ func NewAccountLeaseService(leaseRepo AccountLeaseRepository, subsiteRepo SubsiteRepository, accountRepo AccountRepository, groupRepo GroupRepository) *AccountLeaseService {
+-	return &AccountLeaseService{
+-		leaseRepo:   leaseRepo,
+-		subsiteRepo: subsiteRepo,
+-		accountRepo: accountRepo,
+-		groupRepo:   groupRepo,
++	svc := &AccountLeaseService{
++		leaseRepo:       leaseRepo,
++		subsiteRepo:     subsiteRepo,
++		accountRepo:     accountRepo,
++		groupRepo:       groupRepo,
++		reconcileCh:     make(chan string, 1),
++		reconcileStopCh: make(chan struct{}),
+ 	}
++	RegisterSubsiteRelayReconciler(svc)
++	svc.StartSubsiteRelayReconciler()
++	return svc
+ }
+ 
+ func (s *AccountLeaseService) Create(ctx context.Context, input CreateAccountLeaseInput) (*AccountLease, error) {
+@@ -749,6 +805,18 @@ func (s *AccountLeaseService) Create(ctx context.Context, input CreateAccountLea
  	if !containsInt64(account.GroupIDs, group.ID) {
  		return nil, ErrSubsiteInvalidInput
  	}
@@ -3483,7 +4469,7 @@ index 8cfa424..ec45274 100644
  	expiresAt := time.Now().Add(30 * time.Minute)
  	if input.ExpiresAt != nil {
  		expiresAt = *input.ExpiresAt
-@@ -835,6 +874,112 @@ func (s *AccountLeaseService) DeleteForSubsite(ctx context.Context, subsiteID, l
+@@ -835,6 +903,112 @@ func (s *AccountLeaseService) DeleteForSubsite(ctx context.Context, subsiteID, l
  	return s.leaseRepo.DeleteForSubsite(ctx, strings.TrimSpace(subsiteID), strings.TrimSpace(leaseID))
  }
  
@@ -3596,7 +4582,7 @@ index 8cfa424..ec45274 100644
  type RequestAuthorizeService struct {
  	subsiteRepo     SubsiteRepository
  	leaseRepo       AccountLeaseRepository
-@@ -1180,9 +1325,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1180,9 +1354,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			continue
  		}
  		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
@@ -3608,7 +4594,7 @@ index 8cfa424..ec45274 100644
  			continue
  		}
  		if lease.GroupID != groupID {
-@@ -1208,15 +1355,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1208,15 +1384,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return nil, nil, err
  		}
  		if account == nil || !account.IsSchedulable() {
@@ -3631,7 +4617,7 @@ index 8cfa424..ec45274 100644
  		if err != nil {
  			return nil, nil, err
  		}
-@@ -1230,6 +1382,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1230,6 +1411,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  	return nil, nil, ErrSubsiteAuthorizeNoLease
  }
  
@@ -3663,7 +4649,7 @@ index 8cfa424..ec45274 100644
  func isPrivateSubsiteAutoLeaseEligible(apiKey *APIKey) bool {
  	if apiKey == nil || apiKey.User == nil || apiKey.Group == nil {
  		return false
-@@ -1306,24 +1483,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1306,24 +1512,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  	}
  }
  
@@ -3692,7 +4678,7 @@ index 8cfa424..ec45274 100644
  			continue
  		}
  		lease := &AccountLease{
-@@ -1333,7 +1511,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1333,7 +1540,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  			GroupID:        groupID,
  			Platform:       account.Platform,
  			Status:         AccountLeaseStatusActive,
@@ -3701,7 +4687,7 @@ index 8cfa424..ec45274 100644
  			AssignedAt:     now,
  			ExpiresAt:      now.Add(30 * time.Minute),
  		}
-@@ -1348,6 +1526,331 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1348,6 +1555,331 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  	return nil, nil, nil
  }
  
@@ -4033,16 +5019,44 @@ index 8cfa424..ec45274 100644
  func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, account *Account) bool {
  	if account == nil {
  		return false
-@@ -1722,12 +2225,18 @@ func (s *SubsiteMaintenanceService) runOnce() {
+@@ -1652,14 +2184,15 @@ func validateUsageReservation(reservation *QuotaReservation, cmd *UsageBillingCo
+ }
+ 
+ type SubsiteMaintenanceService struct {
+-	subsiteRepo     SubsiteRepository
+-	leaseRepo       AccountLeaseRepository
+-	reservationRepo QuotaReservationRepository
+-	interval        time.Duration
+-	stopCh          chan struct{}
+-	startOnce       sync.Once
+-	stopOnce        sync.Once
+-	wg              sync.WaitGroup
++	subsiteRepo        SubsiteRepository
++	leaseRepo          AccountLeaseRepository
++	reservationRepo    QuotaReservationRepository
++	interval           time.Duration
++	lastRelayReconcile time.Time
++	stopCh             chan struct{}
++	startOnce          sync.Once
++	stopOnce           sync.Once
++	wg                 sync.WaitGroup
+ }
+ 
+ func NewSubsiteMaintenanceService(
+@@ -1722,12 +2255,24 @@ func (s *SubsiteMaintenanceService) runOnce() {
  		log.Printf("[SubsiteMaintenance] run failed: %v", err)
  		return
  	}
 -	if result.ExpiredLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 {
++	if result.RelayCreatedLeases > 0 || result.RelaySkippedAccounts > 0 {
++		log.Printf("[SubsiteMaintenance] relay_created_leases=%d relay_skipped_accounts=%d relay_online_subsites=%d", result.RelayCreatedLeases, result.RelaySkippedAccounts, result.RelayOnlineSubsites)
++	}
 +	if result.ExpiredLeases > 0 || result.ReleasedInvalidLeases > 0 || result.ExpiredReservations > 0 || result.UnhealthySubsites > 0 ||
-+		result.ExpiredAffinities > 0 || result.ExpiredCircuitBreakers > 0 || result.DeletedForwardEvents > 0 || result.DeletedHealthSamples > 0 {
++		result.ExpiredAffinities > 0 || result.ExpiredCircuitBreakers > 0 || result.DeletedForwardEvents > 0 || result.DeletedHealthSamples > 0 ||
++		result.AutoRenewedLeases > 0 || result.DeletedTerminalLeases > 0 {
  		log.Printf(
 -			"[SubsiteMaintenance] expired_leases=%d expired_reservations=%d unhealthy_subsites=%d",
-+			"[SubsiteMaintenance] expired_leases=%d released_invalid_leases=%d expired_reservations=%d unhealthy_subsites=%d expired_affinities=%d expired_breakers=%d deleted_events=%d deleted_samples=%d",
++			"[SubsiteMaintenance] expired_leases=%d released_invalid_leases=%d expired_reservations=%d unhealthy_subsites=%d expired_affinities=%d expired_breakers=%d deleted_events=%d deleted_samples=%d auto_renewed_leases=%d deleted_terminal_leases=%d",
  			result.ExpiredLeases,
 +			result.ReleasedInvalidLeases,
  			result.ExpiredReservations,
@@ -4051,10 +5065,12 @@ index 8cfa424..ec45274 100644
 +			result.ExpiredCircuitBreakers,
 +			result.DeletedForwardEvents,
 +			result.DeletedHealthSamples,
++			result.AutoRenewedLeases,
++			result.DeletedTerminalLeases,
  		)
  	}
  }
-@@ -1752,6 +2261,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1752,6 +2297,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -4068,7 +5084,7 @@ index 8cfa424..ec45274 100644
  	expiredReservations, err := s.reservationRepo.ExpireStale(ctx, now.Add(-reservationExpiryGrace))
  	if err != nil {
  		return nil, err
-@@ -1760,10 +2276,22 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1760,10 +2312,55 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -4077,6 +5093,34 @@ index 8cfa424..ec45274 100644
 +		forwardCleanup, err = relayRepo.CleanupForwardState(ctx, now)
 +		if err != nil {
 +			return nil, err
++		}
++	}
++	autoRenewedLeases := int64(0)
++	deletedTerminalLeases := int64(0)
++	if lifecycleRepo, ok := s.leaseRepo.(subsiteLeaseLifecycleMaintenanceRepository); ok {
++		autoRenewedLeases, err = lifecycleRepo.AutoRenewExpiringHealthy(ctx, now, DefaultSubsiteLeaseAutoRenewBefore, DefaultSubsiteLeaseAutoRenewTTL)
++		if err != nil {
++			return nil, err
++		}
++		deletedTerminalLeases, err = lifecycleRepo.DeleteTerminalLeases(ctx, now, DefaultSubsiteLeaseCleanupRetention)
++		if err != nil {
++			return nil, err
++		}
++	}
++	relayCreatedLeases := 0
++	relaySkippedAccounts := 0
++	relayOnlineSubsites := 0
++	if now.Sub(s.lastRelayReconcile) >= DefaultSubsiteRelayReconcileInterval {
++		s.lastRelayReconcile = now
++		if reconciler, ok := defaultSubsiteRelayReconciler.(*AccountLeaseService); ok && reconciler != nil {
++			distribution, err := reconciler.AutoDistributeRelayAccounts(ctx)
++			if err != nil {
++				return nil, err
++			}
++			relayCreatedLeases = distribution.CreatedCount
++			relaySkippedAccounts = distribution.SkippedCount
++			relayOnlineSubsites = distribution.OnlineSubsites
++			releasedInvalidLeases += distribution.ReleasedInvalidLeases
 +		}
 +	}
  	return &SubsiteMaintenanceResult{
@@ -4088,15 +5132,20 @@ index 8cfa424..ec45274 100644
 +		ExpiredCircuitBreakers:     forwardCleanup.ExpiredBreakers,
 +		DeletedForwardEvents:       forwardCleanup.DeletedEvents,
 +		DeletedHealthSamples:       forwardCleanup.DeletedSamples,
++		AutoRenewedLeases:          autoRenewedLeases,
++		DeletedTerminalLeases:      deletedTerminalLeases,
++		RelayCreatedLeases:         relayCreatedLeases,
++		RelaySkippedAccounts:       relaySkippedAccounts,
++		RelayOnlineSubsites:        relayOnlineSubsites,
  		HeartbeatTimeoutSecs:       int64(heartbeatTimeout.Seconds()),
  		ReservationExpiryGraceSecs: int64(reservationExpiryGrace.Seconds()),
  	}, nil
 diff --git a/backend/internal/service/subsite_relay.go b/backend/internal/service/subsite_relay.go
 new file mode 100644
-index 0000000..c9741aa
+index 0000000..d3389d2
 --- /dev/null
 +++ b/backend/internal/service/subsite_relay.go
-@@ -0,0 +1,574 @@
+@@ -0,0 +1,618 @@
 +package service
 +
 +import (
@@ -4555,13 +5604,13 @@ index 0000000..c9741aa
 +			items = append(items, SubsiteRelayAdvice{
 +				Code:     "POOL_HAS_UNKNOWN_LEVEL_" + strings.ToUpper(pool.Platform) + "_" + strings.ToUpper(pool.RequiredLevel),
 +				Severity: "warning",
-+				Message:  fmt.Sprintf("%s/%s/%s 有 %d 个账号等级未知。账号虽然可能已审核通过，但为了避免错价计费，不会自动进入有等级要求的价格池。请重新校验等级或修复等级识别。", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel), pool.UnknownLevelAccounts),
++				Message:  fmt.Sprintf("%s 有 %d 个账号等级未知。账号虽然可能已审核通过，但为了避免错价计费，不会自动进入有等级要求的价格池。请重新校验等级或修复等级识别。", displayRelayPool(pool), pool.UnknownLevelAccounts),
 +			})
 +		}
 +		if pool.TotalAccounts > 0 && pool.SchedulableAccounts == 0 {
-+			message := fmt.Sprintf("%s/%s/%s 有账号，但没有一个可分发。请检查审核状态、共享模式、限流、账号状态和等级。", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel))
++			message := fmt.Sprintf("%s 有账号，但没有一个可分发。请检查审核状态、共享模式、限流、账号状态和等级。", displayRelayPool(pool))
 +			if pool.BlockedReason != "" {
-+				message = fmt.Sprintf("%s/%s/%s 暂不可分发：%s。", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel), pool.BlockedReason)
++				message = fmt.Sprintf("%s 暂不可分发：%s。", displayRelayPool(pool), pool.BlockedReason)
 +			}
 +			items = append(items, SubsiteRelayAdvice{
 +				Code:     "POOL_NOT_SCHEDULABLE_" + strings.ToUpper(pool.Platform) + "_" + strings.ToUpper(pool.RequiredLevel),
@@ -4573,7 +5622,7 @@ index 0000000..c9741aa
 +			items = append(items, SubsiteRelayAdvice{
 +				Code:     "POOL_HAS_UNLEASED_" + strings.ToUpper(pool.Platform) + "_" + strings.ToUpper(pool.RequiredLevel),
 +				Severity: "info",
-+				Message:  fmt.Sprintf("%s/%s/%s 有 %d 个可分发账号尚未进入子站。点击“立即自动分发”可以马上创建租约。", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel), pool.UnleasedAccounts),
++				Message:  fmt.Sprintf("%s 有 %d 个可分发账号尚未进入子站。点击“立即自动分发”可以马上创建租约。", displayRelayPool(pool), pool.UnleasedAccounts),
 +			})
 +		}
 +	}
@@ -4583,9 +5632,53 @@ index 0000000..c9741aa
 +func displayRelayLevel(level string) string {
 +	level = strings.TrimSpace(level)
 +	if level == "" {
-+		return "any"
++		return "不限等级"
 +	}
-+	return level
++	switch level {
++	case AccountLevelFree:
++		return "Free 免费"
++	case AccountLevelPlus:
++		return "Plus 会员"
++	case AccountLevelPro:
++		return "Pro 专业"
++	case AccountLevelTeam:
++		return "Team 团队"
++	default:
++		return level
++	}
++}
++
++func displayRelayPlatform(platform string) string {
++	switch strings.ToLower(strings.TrimSpace(platform)) {
++	case PlatformOpenAI:
++		return "OpenAI"
++	case PlatformAnthropic:
++		return "Claude"
++	case PlatformGemini:
++		return "Gemini"
++	case PlatformAntigravity:
++		return "Antigravity"
++	default:
++		if strings.TrimSpace(platform) == "" {
++			return "未知平台"
++		}
++		return platform
++	}
++}
++
++func displayRelayScope(scope string) string {
++	switch strings.ToLower(strings.TrimSpace(scope)) {
++	case GroupScopeUserPrivate:
++		return "用户私有池"
++	case GroupScopePublic, "":
++		return "公有池"
++	default:
++		return scope
++	}
++}
++
++func displayRelayPool(pool SubsiteRelayPoolStat) string {
++	return fmt.Sprintf("%s / %s / %s", displayRelayPlatform(pool.Platform), displayRelayScope(pool.Scope), displayRelayLevel(pool.RequiredLevel))
 +}
 +
 +func (s *SubsiteService) SignRouteHint(ctx context.Context, subsiteID, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) (string, error) {
@@ -4670,6 +5763,183 @@ index 0000000..c9741aa
 +		return "degraded"
 +	}
 +	return "online"
++}
+diff --git a/backend/internal/service/subsite_relay_reconcile.go b/backend/internal/service/subsite_relay_reconcile.go
+new file mode 100644
+index 0000000..74c77b2
+--- /dev/null
++++ b/backend/internal/service/subsite_relay_reconcile.go
+@@ -0,0 +1,171 @@
++package service
++
++import (
++	"context"
++	"log/slog"
++	"reflect"
++	"sort"
++	"strings"
++	"time"
++)
++
++var defaultSubsiteRelayReconciler subsiteRelayReconciler
++
++// RegisterSubsiteRelayReconciler connects account lifecycle changes to relay lease reconciliation.
++func RegisterSubsiteRelayReconciler(reconciler subsiteRelayReconciler) {
++	defaultSubsiteRelayReconciler = reconciler
++}
++
++func TriggerSubsiteRelayReconcile(reason string) {
++	if defaultSubsiteRelayReconciler == nil {
++		return
++	}
++	defaultSubsiteRelayReconciler.TriggerSubsiteRelayReconcile(reason)
++}
++
++func ShouldReconcileSubsiteRelayForAccountChange(before, after *Account) bool {
++	if after == nil {
++		return false
++	}
++	if before == nil {
++		return after.IsActive() && after.Schedulable
++	}
++	if before.ID != after.ID {
++		return true
++	}
++	if before.Platform != after.Platform ||
++		before.Type != after.Type ||
++		before.Status != after.Status ||
++		before.Schedulable != after.Schedulable ||
++		NormalizeAccountShareMode(before.ShareMode) != NormalizeAccountShareMode(after.ShareMode) ||
++		NormalizeAccountShareStatus(before.ShareStatus) != NormalizeAccountShareStatus(after.ShareStatus) ||
++		NormalizeAccountLevel(before.AccountLevel) != NormalizeAccountLevel(after.AccountLevel) ||
++		before.ErrorMessage != after.ErrorMessage ||
++		!sameOptionalInt64(before.OwnerUserID, after.OwnerUserID) ||
++		!sameOptionalTime(before.ExpiresAt, after.ExpiresAt) ||
++		before.AutoPauseOnExpired != after.AutoPauseOnExpired ||
++		!sameOptionalTime(before.RateLimitResetAt, after.RateLimitResetAt) ||
++		!sameOptionalTime(before.OverloadUntil, after.OverloadUntil) ||
++		!sameOptionalTime(before.TempUnschedulableUntil, after.TempUnschedulableUntil) {
++		return true
++	}
++	return !reflect.DeepEqual(normalizeInt64Set(before.GroupIDs), normalizeInt64Set(after.GroupIDs))
++}
++
++func (s *AccountLeaseService) StartSubsiteRelayReconciler() {
++	if s == nil || s.reconcileCh == nil || s.reconcileStopCh == nil {
++		return
++	}
++	s.reconcileStartOnce.Do(func() {
++		s.reconcileWG.Add(1)
++		go func() {
++			defer s.reconcileWG.Done()
++			var timer *time.Timer
++			var timerC <-chan time.Time
++			pendingReason := ""
++			for {
++				select {
++				case reason := <-s.reconcileCh:
++					if strings.TrimSpace(reason) != "" {
++						pendingReason = strings.TrimSpace(reason)
++					}
++					if timer == nil {
++						timer = time.NewTimer(DefaultSubsiteRelayReconcileDebounce)
++						timerC = timer.C
++					} else {
++						if !timer.Stop() {
++							select {
++							case <-timer.C:
++							default:
++							}
++						}
++						timer.Reset(DefaultSubsiteRelayReconcileDebounce)
++					}
++				case <-timerC:
++					s.runRelayReconcile(pendingReason)
++					pendingReason = ""
++					timerC = nil
++					timer = nil
++				case <-s.reconcileStopCh:
++					if timer != nil {
++						timer.Stop()
++					}
++					return
++				}
++			}
++		}()
++	})
++}
++
++func (s *AccountLeaseService) StopSubsiteRelayReconciler() {
++	if s == nil || s.reconcileStopCh == nil {
++		return
++	}
++	s.reconcileStopOnce.Do(func() {
++		close(s.reconcileStopCh)
++	})
++	s.reconcileWG.Wait()
++}
++
++func (s *AccountLeaseService) TriggerSubsiteRelayReconcile(reason string) {
++	if s == nil || s.reconcileCh == nil {
++		return
++	}
++	select {
++	case s.reconcileCh <- strings.TrimSpace(reason):
++	default:
++	}
++}
++
++func (s *AccountLeaseService) runRelayReconcile(reason string) {
++	ctx, cancel := context.WithTimeout(context.Background(), DefaultSubsiteMaintenanceRunTimeout)
++	defer cancel()
++	result, err := s.AutoDistributeRelayAccounts(ctx)
++	if err != nil {
++		slog.Warn("subsite_relay.reconcile_failed", "reason", reason, "error", err)
++		return
++	}
++	if result.CreatedCount > 0 || result.ReleasedInvalidLeases > 0 {
++		slog.Info("subsite_relay.reconciled",
++			"reason", reason,
++			"created_leases", result.CreatedCount,
++			"released_invalid_leases", result.ReleasedInvalidLeases,
++			"skipped_accounts", result.SkippedCount,
++			"online_subsites", result.OnlineSubsites,
++		)
++	}
++}
++
++func sameOptionalInt64(a, b *int64) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	return *a == *b
++}
++
++func sameOptionalTime(a, b *time.Time) bool {
++	if a == nil || b == nil {
++		return a == nil && b == nil
++	}
++	return a.Equal(*b)
++}
++
++func normalizeInt64Set(values []int64) []int64 {
++	if len(values) == 0 {
++		return nil
++	}
++	seen := make(map[int64]struct{}, len(values))
++	out := make([]int64, 0, len(values))
++	for _, value := range values {
++		if value <= 0 {
++			continue
++		}
++		if _, ok := seen[value]; ok {
++			continue
++		}
++		seen[value] = struct{}{}
++		out = append(out, value)
++	}
++	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
++	return out
 +}
 diff --git a/backend/internal/service/subsite_relay_test.go b/backend/internal/service/subsite_relay_test.go
 new file mode 100644
@@ -5664,10 +6934,10 @@ index 1faa4eb..ef22e95 100644
 +  listForwardEvents
  }
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..47ddc11 100644
+index cb5d3f8..645585c 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,5 +1,528 @@
+@@ -1,5 +1,586 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -5680,6 +6950,10 @@ index cb5d3f8..47ddc11 100644
 +            </div>
 +            <p class="mt-2 text-sm text-gray-600 dark:text-gray-300">{{ relayHealthState.description }}</p>
 +            <p class="mt-2 text-xs text-gray-500">规则：账号必须审核通过、等级匹配价格分组、公有/私有模式匹配，并且一个账号同一时间只能在一个子站池里。</p>
++            <p class="mt-1 text-xs text-gray-500">自动分发：账号审核通过、等级变化、公私切换、分组变化后约 10 秒内重算；系统每 60 秒兜底扫描一次，自动释放不合规旧租约并补充分发。</p>
++            <p v-if="distributedAccounts.length > 0" class="mt-2 text-xs font-medium text-emerald-700 dark:text-emerald-300">
++              当前已分发：{{ distributedAccountsSummary }}
++            </p>
 +          </div>
 +          <div class="min-w-full rounded-2xl border border-gray-100 bg-gray-50 p-3 dark:border-dark-600 dark:bg-dark-700 xl:min-w-[25rem]">
 +            <p class="text-xs text-gray-500">当前转发模式</p>
@@ -5728,7 +7002,58 @@ index cb5d3f8..47ddc11 100644
 +          <div class="rounded-2xl bg-sky-50 p-4 dark:bg-sky-950/20">
 +            <p class="text-xs text-sky-700 dark:text-sky-300">24h 请求 / 缓存</p>
 +            <p class="mt-2 text-sm font-semibold text-sky-800 dark:text-sky-100">{{ formatCompact(forwardStats?.events_24h || 0) }} / {{ formatPercent(forwardStats?.cache_hit_ratio_24h || 0) }}</p>
-+            <p class="mt-1 text-xs text-sky-700 dark:text-sky-300">P95 {{ Math.round(forwardStats?.p95_latency_ms_24h || 0) }} ms</p>
++            <p class="mt-1 text-xs text-sky-700 dark:text-sky-300">95% 请求延迟 {{ Math.round(forwardStats?.p95_latency_ms_24h || 0) }} 毫秒</p>
++          </div>
++        </div>
++
++        <div class="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_minmax(0,1fr)]">
++          <div class="rounded-2xl border border-emerald-100 bg-emerald-50/70 p-4 dark:border-emerald-900/40 dark:bg-emerald-950/20">
++            <div class="flex items-center justify-between gap-3">
++              <div>
++                <h2 class="text-sm font-semibold text-emerald-900 dark:text-emerald-100">已经进入子站的账号</h2>
++                <p class="text-xs text-emerald-700 dark:text-emerald-300">这里显示账号现在在哪个子站池里。</p>
++              </div>
++              <span class="badge badge-success">{{ distributedAccounts.length }}</span>
++            </div>
++            <div class="mt-3 space-y-2">
++              <div v-for="item in distributedAccounts.slice(0, 5)" :key="`distributed-${item.account_id}-${item.lease_id}`" class="rounded-xl bg-white/80 p-3 text-sm text-gray-700 shadow-sm dark:bg-dark-800 dark:text-gray-200">
++                <div class="flex flex-wrap items-center justify-between gap-2">
++                  <span class="font-medium text-gray-950 dark:text-white">#{{ item.account_id }} {{ item.account_name || '未命名账号' }}</span>
++                  <span class="badge badge-success">已进子站</span>
++                </div>
++                <p class="mt-1 text-xs text-gray-500">
++                  子站：{{ item.subsite_name || item.subsite_id }} · 价格池：{{ item.group_name || '-' }} · 到期：{{ formatDate(item.lease_expires_at) }}
++                </p>
++              </div>
++              <p v-if="!distributedAccounts.length" class="text-sm text-emerald-700 dark:text-emerald-300">还没有账号进入子站。请先看右侧阻断原因，或点击“立即自动分发”。</p>
++            </div>
++          </div>
++
++          <div class="rounded-2xl border border-amber-100 bg-amber-50/70 p-4 dark:border-amber-900/40 dark:bg-amber-950/20">
++            <div class="flex items-center justify-between gap-3">
++              <div>
++                <h2 class="text-sm font-semibold text-amber-900 dark:text-amber-100">还没进入子站的原因</h2>
++                <p class="text-xs text-amber-700 dark:text-amber-300">优先显示最影响分发的几个原因。</p>
++              </div>
++              <span class="badge badge-warning">{{ blockedAccountCount + readyAccountCount }}</span>
++            </div>
++            <div class="mt-3 space-y-2">
++              <div v-for="reason in topAccountBlockReasons" :key="reason.label" class="rounded-xl bg-white/80 p-3 text-sm text-gray-700 shadow-sm dark:bg-dark-800 dark:text-gray-200">
++                <div class="flex items-center justify-between gap-3">
++                  <span class="font-medium text-gray-950 dark:text-white">{{ reason.label }}</span>
++                  <span>{{ reason.value }} 个</span>
++                </div>
++                <p class="mt-1 text-xs text-gray-500">{{ reason.hint }}</p>
++              </div>
++              <p v-if="!topAccountBlockReasons.length" class="text-sm text-amber-700 dark:text-amber-300">暂无明显阻断项。若账号还没分发，请点击“立即自动分发”后查看结果。</p>
++            </div>
++          </div>
++        </div>
++
++        <div class="mt-4 grid gap-3 lg:grid-cols-3">
++          <div v-for="rule in relayAutomationRules" :key="rule.title" class="rounded-2xl border border-gray-100 bg-gray-50 p-4 text-sm dark:border-dark-600 dark:bg-dark-700">
++            <div class="font-semibold text-gray-900 dark:text-white">{{ rule.title }}</div>
++            <p class="mt-1 text-xs text-gray-500 dark:text-gray-300">{{ rule.description }}</p>
 +          </div>
 +        </div>
 +
@@ -5750,7 +7075,7 @@ index cb5d3f8..47ddc11 100644
 +                <p v-for="item in autoDistributeDetails.skipped" :key="`${item.account_id}-${item.group_name}-${item.reason}`">
 +                  #{{ item.account_id }} {{ item.account_name || '' }} / {{ item.group_name || '未命名分组' }}：{{ item.reason }}
 +                </p>
-+                <p v-if="!autoDistributeDetails.skipped.length" class="text-sky-700 dark:text-sky-300">没有可展示的跳过项。若仍未分发，请看下方账号去向明细。</p>
++                <p v-if="!autoDistributeDetails.skipped.length" class="text-sky-700 dark:text-sky-300">没有可展示的跳过项。若仍未分发，请看下方“账号去向明细”，那里会显示待审核、等级未知、分组不匹配等完整原因。</p>
 +              </div>
 +            </div>
 +          </div>
@@ -5899,7 +7224,7 @@ index cb5d3f8..47ddc11 100644
 +        <div class="mb-3 flex flex-wrap items-center justify-between gap-3">
 +          <div>
 +            <h2 class="text-base font-semibold text-gray-900 dark:text-white">账号去向明细</h2>
-+            <p class="text-xs text-gray-500">这里逐个账号解释：进了哪个子站，或者为什么没有进子站。</p>
++            <p class="text-xs text-gray-500">每个账号只展示一个当前结论：已进哪个子站，或者为什么还不能进子站。</p>
 +          </div>
 +          <div class="flex flex-wrap gap-2 text-xs">
 +            <span class="badge badge-success">已分发 {{ distributedAccountCount }}</span>
@@ -5946,6 +7271,9 @@ index cb5d3f8..47ddc11 100644
 +                  <p class="mt-1 max-w-md text-xs text-gray-500 dark:text-gray-300">{{ item.reason }}</p>
 +                  <p v-if="item.reason_code === 'ACCOUNT_LEVEL_UNKNOWN'" class="mt-1 max-w-md text-xs text-amber-600 dark:text-amber-300">
 +                    这个账号虽然审核通过，但系统没有识别出 Free/Plus/Pro。为了避免错价计费，暂时不会把它放进 Free 公共池。
++                  </p>
++                  <p v-if="item.distributed" class="mt-1 max-w-md text-xs text-emerald-600 dark:text-emerald-300">
++                    这个账号已经在子站账号池中，不会再分发到第二个子站。
 +                  </p>
 +                </td>
 +              </tr>
@@ -6050,12 +7378,12 @@ index cb5d3f8..47ddc11 100644
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
 +                    <span :class="['badge', loadLevelClass(site.load_level)]">{{ loadLevelLabel(site.load_level) }}</span><br />
 +                    活跃 {{ site.active_requests }} / 队列 {{ site.queued_usage }}<br />
-+                    每秒请求 {{ site.qps.toFixed(2) }} / CPU {{ site.cpu_percent.toFixed(1) }}%
++                    每秒请求 {{ site.qps.toFixed(2) }} / 处理器 {{ site.cpu_percent.toFixed(1) }}%
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
 +                    请求 {{ formatCompact(site.events_24h) }}<br />
 +                    <span :class="site.failures_24h > 0 ? 'text-red-600' : 'text-emerald-600'">成功率 {{ formatPercent(site.success_rate_24h || 0) }}</span><br />
-+                    95% 请求延迟 {{ Math.round(site.p95_latency_ms_24h || 0) }} ms
++                    95% 请求延迟 {{ Math.round(site.p95_latency_ms_24h || 0) }} 毫秒
 +                  </td>
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
 +                    <span class="font-medium text-emerald-600">{{ formatPercent(site.cache_hit_ratio_24h || 0) }}</span><br />
@@ -6064,7 +7392,7 @@ index cb5d3f8..47ddc11 100644
 +                  <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
 +                    {{ site.affinities }} 条<br />
 +                    锁定 {{ site.locked_affinities }} 条<br />
-+                    租约 {{ site.active_leases || 0 }} 个
++                    账号池 {{ site.active_leases || 0 }} 个
 +                  </td>
 +                  <td class="py-3">
 +                    <span :class="['badge', statusClass(site.effective_status || site.status)]">{{ site.health_score }}%</span>
@@ -6080,7 +7408,7 @@ index cb5d3f8..47ddc11 100644
 +
 +        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
 +          <h2 class="text-base font-semibold text-gray-900 dark:text-white">手动粘性路由</h2>
-+          <p class="mt-1 text-xs text-gray-500">用于把某个密钥、账号或会话固定到指定子站。</p>
++          <p class="mt-1 text-xs text-gray-500">用于把某个密钥、账号或会话固定到指定子站。一般不用手动设置，除非要排查路由。</p>
 +          <div class="mt-4 space-y-3">
 +            <input v-model.trim="forwardLockForm.affinity_key" class="input" placeholder="路由标识，例如 api-key:123 或 session:abc" />
 +            <select v-model="forwardLockForm.subsite_id" class="input">
@@ -6196,7 +7524,16 @@ index cb5d3f8..47ddc11 100644
      <TablePageLayout>
        <template #filters>
          <div class="flex flex-wrap items-center gap-3">
-@@ -103,7 +626,7 @@
+@@ -61,7 +642,7 @@
+ 
+           <template #cell-limits="{ row }">
+             <div class="text-sm text-gray-700 dark:text-gray-200">
+-              QPS {{ row.max_qps || '-' }} / 并发 {{ row.max_concurrency || '-' }}
++              每秒请求 {{ row.max_qps || '-' }} / 并发 {{ row.max_concurrency || '-' }}
+             </div>
+           </template>
+ 
+@@ -103,7 +684,7 @@
              <input v-model.trim="form.subsite_id" class="input" :disabled="!!editing" placeholder="留空自动生成" />
            </label>
            <label class="form-field md:col-span-2">
@@ -6205,7 +7542,7 @@ index cb5d3f8..47ddc11 100644
              <input v-model.trim="form.public_url" class="input" placeholder="https://edge.example.com" />
            </label>
            <label class="form-field">
-@@ -269,7 +792,7 @@
+@@ -269,7 +850,7 @@
              <p v-if="leaseBulkSummary" class="text-xs text-gray-500 dark:text-gray-400">{{ leaseBulkSummary }}</p>
            </label>
            <label class="form-field">
@@ -6214,7 +7551,7 @@ index cb5d3f8..47ddc11 100644
              <input v-model.number="leaseForm.ttl_hours" type="number" min="1" class="input" required />
            </label>
            <label class="form-field">
-@@ -370,7 +893,15 @@
+@@ -370,7 +951,15 @@
  <script setup lang="ts">
  import { computed, onMounted, reactive, ref } from 'vue'
  import { adminAPI } from '@/api/admin'
@@ -6231,7 +7568,7 @@ index cb5d3f8..47ddc11 100644
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -382,6 +913,9 @@ import type { Column } from '@/components/common/types'
+@@ -382,6 +971,9 @@ import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
  
  const subsites = ref<Subsite[]>([])
@@ -6241,7 +7578,7 @@ index cb5d3f8..47ddc11 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,6 +928,12 @@ const leaseBulkSaving = ref(false)
+@@ -394,6 +986,12 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
@@ -6254,7 +7591,7 @@ index cb5d3f8..47ddc11 100644
  const search = ref('')
  const status = ref('')
  const leaseAccountSearch = ref('')
-@@ -442,6 +982,15 @@ const leaseBulkEditForm = reactive({
+@@ -442,6 +1040,15 @@ const leaseBulkEditForm = reactive({
    max_requests: 0,
    max_tokens: 0
  })
@@ -6270,40 +7607,64 @@ index cb5d3f8..47ddc11 100644
  const selectedLeaseIDs = ref<Set<string>>(new Set())
  
  const leaseGroupOptions = computed(() => leaseGroups.value
-@@ -470,6 +1019,90 @@ const activeLeaseAccountIDs = computed(() => new Set(
+@@ -470,6 +1077,128 @@ const activeLeaseAccountIDs = computed(() => new Set(
    activeLeaseAccountIds.value
  ))
  
 +const accountDistribution = computed(() => forwardStats.value?.account_distribution || [])
-+const visibleAccountDistribution = computed(() => accountDistribution.value.slice(0, 80))
++const accountDistributionByAccount = computed(() => {
++  const priority = (item: typeof accountDistribution.value[number]) => {
++    if (item.distributed) return 0
++    if (item.distributable) return 1
++    if (item.reason_code === 'ACCOUNT_LEVEL_UNKNOWN') return 2
++    if (item.reason_code === 'ACCOUNT_LEVEL_MISMATCH') return 3
++    if (item.group_id > 0) return 4
++    return 5
++  }
++  const byID = new Map<number, typeof accountDistribution.value[number]>()
++  for (const item of accountDistribution.value) {
++    const current = byID.get(item.account_id)
++    if (!current || priority(item) < priority(current)) {
++      byID.set(item.account_id, item)
++    }
++  }
++  return [...byID.values()]
++})
++const visibleAccountDistribution = computed(() => accountDistributionByAccount.value.slice(0, 80))
 +const uniqueAccountIDs = computed(() => new Set(accountDistribution.value.map((item) => item.account_id)))
-+const distributedAccountCount = computed(() => uniqueCount(accountDistribution.value.filter((item) => item.distributed).map((item) => item.account_id)))
-+const readyAccountCount = computed(() => uniqueCount(accountDistribution.value.filter((item) => !item.distributed && item.distributable).map((item) => item.account_id)))
-+const blockedAccountCount = computed(() => uniqueCount(accountDistribution.value.filter((item) => !item.distributed && !item.distributable).map((item) => item.account_id)))
-+const accountDistributionOverflow = computed(() => Math.max(accountDistribution.value.length - visibleAccountDistribution.value.length, 0))
++const distributedAccounts = computed(() => accountDistributionByAccount.value.filter((item) => item.distributed))
++const distributedAccountsSummary = computed(() => {
++  const visible = distributedAccounts.value.slice(0, 3).map((item) => `#${item.account_id} 到 ${item.subsite_name || item.subsite_id}`)
++  const suffix = distributedAccounts.value.length > visible.length ? `，还有 ${distributedAccounts.value.length - visible.length} 个` : ''
++  return `${visible.join('；')}${suffix}`
++})
++const distributedAccountCount = computed(() => distributedAccounts.value.length)
++const readyAccountCount = computed(() => accountDistributionByAccount.value.filter((item) => !item.distributed && item.distributable).length)
++const blockedAccountCount = computed(() => accountDistributionByAccount.value.filter((item) => !item.distributed && !item.distributable).length)
++const accountDistributionOverflow = computed(() => Math.max(accountDistributionByAccount.value.length - visibleAccountDistribution.value.length, 0))
 +const relaySummary = computed(() => {
 +  const stats = forwardStats.value
 +  const totalAccounts = uniqueAccountIDs.value.size
-+  const unknownLevel = uniqueCount(accountDistribution.value.filter((item) => item.reason_code === 'ACCOUNT_LEVEL_UNKNOWN').map((item) => item.account_id))
-+  const levelMismatch = uniqueCount(accountDistribution.value.filter((item) => item.reason_code === 'ACCOUNT_LEVEL_MISMATCH').map((item) => item.account_id))
-+  const shareModeMismatch = uniqueCount(accountDistribution.value.filter((item) => [
++  const unknownLevel = accountDistributionByAccount.value.filter((item) => item.reason_code === 'ACCOUNT_LEVEL_UNKNOWN').length
++  const levelMismatch = accountDistributionByAccount.value.filter((item) => item.reason_code === 'ACCOUNT_LEVEL_MISMATCH').length
++  const shareModeMismatch = accountDistributionByAccount.value.filter((item) => [
 +    'PRIVATE_SHARE_MODE_MISMATCH',
 +    'PUBLIC_SHARE_NOT_APPROVED',
 +    'PRIVATE_OWNER_MISMATCH'
-+  ].includes(item.reason_code)).map((item) => item.account_id))
-+  const groupBlocked = uniqueCount(accountDistribution.value.filter((item) => [
++  ].includes(item.reason_code)).length
++  const groupBlocked = accountDistributionByAccount.value.filter((item) => [
 +    'GROUP_NOT_BOUND',
 +    'GROUP_INACTIVE',
 +    'PLATFORM_MISMATCH'
-+  ].includes(item.reason_code)).map((item) => item.account_id))
-+  const temporarilyBlocked = uniqueCount(accountDistribution.value.filter((item) => [
++  ].includes(item.reason_code)).length
++  const temporarilyBlocked = accountDistributionByAccount.value.filter((item) => [
 +    'ACCOUNT_RATE_LIMITED',
 +    'ACCOUNT_TEMP_BLOCKED',
 +    'ACCOUNT_OVERLOADED',
 +    'ACCOUNT_EXPIRED',
 +    'ACCOUNT_INACTIVE',
 +    'ACCOUNT_UNSCHEDULABLE'
-+  ].includes(item.reason_code)).map((item) => item.account_id))
++  ].includes(item.reason_code)).length
 +  const criticalChecks = stats?.configuration_checks?.filter((check) => check.status !== 'ok' && check.severity === 'critical') || []
 +  const warningChecks = stats?.configuration_checks?.filter((check) => check.status !== 'ok' && check.severity !== 'critical') || []
 +  return {
@@ -6346,6 +7707,11 @@ index cb5d3f8..47ddc11 100644
 +  { label: '符合分发规则', value: readyAccountCount.value + distributedAccountCount.value, hint: '等级、模式、限流、过期状态都满足' },
 +  { label: '已进入子站', value: distributedAccountCount.value, hint: '有有效租约，子站可取用该账号' }
 +])
++const relayAutomationRules = [
++  { title: '审核通过后自动进池', description: '账号检测通过并满足等级、分组、公私模式后，系统会在约 10 秒内尝试分发到负载最低的在线子站。' },
++  { title: '公私切换会迁移租约', description: '公有改私有、私有改公有、等级变化或分组变化时，旧租约会先被释放，再按新规则重新进入正确账号池。' },
++  { title: '每 60 秒自动兜底', description: '后台会定时清理离线子站、限流账号、过期账号和不合规租约，并补充分发漏掉的账号。' }
++]
 +const relayBlockReasons = computed(() => [
 +  { label: '账号等级未知', value: relaySummary.value.unknownLevel, hint: '审核通过但未识别 Free/Plus/Pro，不能进有等级要求的价格池。' },
 +  { label: '等级不匹配', value: relaySummary.value.levelMismatch, hint: '账号等级和分组要求不同，比如 Free 账号不能进 Plus 分组。' },
@@ -6353,6 +7719,15 @@ index cb5d3f8..47ddc11 100644
 +  { label: '分组未绑定或异常', value: relaySummary.value.groupBlocked, hint: '账号没有绑定分组，或分组未启用、平台不一致。' },
 +  { label: '账号临时不可用', value: relaySummary.value.temporarilyBlocked, hint: '账号被限流、过载、过期、停用或不可调度。' }
 +].filter((item) => item.value > 0))
++const topAccountBlockReasons = computed(() => {
++  if (readyAccountCount.value > 0) {
++    return [
++      { label: '可分发但还没创建租约', value: readyAccountCount.value, hint: '这些账号已经满足规则，点击“立即自动分发”后会进入在线子站。' },
++      ...relayBlockReasons.value
++    ].slice(0, 4)
++  }
++  return relayBlockReasons.value.slice(0, 4)
++})
 +const autoDistributeDetails = ref<{
 +  created: Array<{ lease_id: string; account_id: number; account_name?: string | null; subsite_id: string; group_name?: string | null }>
 +  skipped: Array<{ account_id: number; account_name: string; group_name: string; reason: string }>
@@ -6361,7 +7736,7 @@ index cb5d3f8..47ddc11 100644
  const bulkLeaseAccounts = computed(() => filteredLeaseAccounts.value)
  const allVisibleLeasesSelected = computed(() => leases.value.length > 0 && leases.value.every((lease) => selectedLeaseIDs.value.has(lease.lease_id)))
  const randomTenCount = computed(() => Math.min(10, bulkLeaseAccounts.value.length))
-@@ -520,11 +1153,112 @@ async function reload(): Promise<void> {
+@@ -520,11 +1249,112 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -6474,18 +7849,16 @@ index cb5d3f8..47ddc11 100644
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -931,6 +1665,10 @@ function normalizeNonNegativeNumber(value: number): number {
-   return Math.max(0, Math.floor(value))
+@@ -708,7 +1538,7 @@ async function loadLeaseAccounts(): Promise<void> {
  }
  
-+function uniqueCount(values: number[]): number {
-+  return new Set(values.filter((value) => Number.isFinite(value) && value > 0)).size
-+}
-+
- function accountOptionLabel(account: Account): string {
-   const parts = [`#${account.id}`, account.name || account.platform || 'account']
-   if (account.account_level && account.account_level !== 'unknown') parts.push(account.account_level)
-@@ -1015,7 +1753,7 @@ function leaseGroupLabel(row: AccountLease): string {
+ async function loadLeaseGroups(): Promise<void> {
+-  leaseGroups.value = await adminAPI.groups.getAll(undefined, 'public')
++  leaseGroups.value = await adminAPI.groups.getAll(undefined, 'all')
+ }
+ 
+ function handleLeaseGroupChange(): void {
+@@ -1015,7 +1845,7 @@ function leaseGroupLabel(row: AccountLease): string {
  }
  
  function leaseGroupMeta(row: AccountLease): string {
@@ -6494,7 +7867,7 @@ index cb5d3f8..47ddc11 100644
  }
  
  function leaseAccountLabel(row: AccountLease): string {
-@@ -1027,7 +1765,273 @@ function formatDate(value?: string): string {
+@@ -1027,7 +1857,273 @@ function formatDate(value?: string): string {
    return new Date(value).toLocaleString()
  }
  
