@@ -1,10 +1,11 @@
 diff --git a/backend/cmd/server/VERSION b/backend/cmd/server/VERSION
-index 8955a01..f96743f 100644
+index 8955a01..e9c5dfb 100644
 --- a/backend/cmd/server/VERSION
 +++ b/backend/cmd/server/VERSION
 @@ -1 +1 @@
 -1.0.26
-+1.0.26.5
++1.0.26.6
+\ No newline at end of file
 diff --git a/backend/cmd/server/wire_gen.go b/backend/cmd/server/wire_gen.go
 index 526ea32..ca4822c 100644
 --- a/backend/cmd/server/wire_gen.go
@@ -1468,10 +1469,10 @@ index 80bed32..c5fa486 100644
  	NewPaymentHandler,
 diff --git a/backend/internal/repository/subsite_relay_repo.go b/backend/internal/repository/subsite_relay_repo.go
 new file mode 100644
-index 0000000..c1bc359
+index 0000000..e3d64f7
 --- /dev/null
 +++ b/backend/internal/repository/subsite_relay_repo.go
-@@ -0,0 +1,799 @@
+@@ -0,0 +1,1159 @@
 +package repository
 +
 +import (
@@ -1738,8 +1739,11 @@ index 0000000..c1bc359
 +
 +func (r *subsiteRepository) ForwardStats(ctx context.Context) (*service.SubsiteForwardStats, error) {
 +	stats := &service.SubsiteForwardStats{
-+		BySubsite:       []service.SubsiteForwardSiteStat{},
-+		CircuitBreakers: []service.SubsiteCircuitBreaker{},
++		BySubsite:         []service.SubsiteForwardSiteStat{},
++		CircuitBreakers:   []service.SubsiteCircuitBreaker{},
++		LeaseDistribution: []service.SubsiteRelayLeaseStat{},
++		PoolDistribution:  []service.SubsiteRelayPoolStat{},
++		ConfigChecks:      []service.SubsiteRelayConfigCheck{},
 +	}
 +	var cacheableInputTokens24h int64
 +	if err := r.db.QueryRowContext(ctx, `
@@ -1813,6 +1817,17 @@ index 0000000..c1bc359
 +		return nil, err
 +	}
 +	stats.LeaseDistribution = distribution
++	pools, err := r.ListRelayPoolDistribution(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.PoolDistribution = pools
++	checks, err := r.ListRelayConfigChecks(ctx)
++	if err != nil {
++		return nil, err
++	}
++	stats.ConfigChecks = checks
++	stats.Automation = buildSubsiteRelayAutomationSummary(stats)
 +	return stats, nil
 +}
 +
@@ -1855,6 +1870,264 @@ index 0000000..c1bc359
 +			&item.ExpiringLeases24h,
 +		); err != nil {
 +			return nil, err
++		}
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *subsiteRepository) ListRelayPoolDistribution(ctx context.Context) ([]service.SubsiteRelayPoolStat, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		WITH effective_leases AS (
++			SELECT account_id, group_id, subsite_id
++			FROM account_leases
++			WHERE deleted_at IS NULL
++			  AND status IN ('active', 'renewing', 'draining')
++			  AND expires_at > NOW()
++		)
++		SELECT
++			g.id,
++			COALESCE(NULLIF(g.name, ''), ''),
++			g.platform,
++			COALESCE(NULLIF(g.scope, ''), 'public'),
++			COALESCE(g.required_account_level, ''),
++			COUNT(DISTINCT a.id) AS total_accounts,
++			COUNT(DISTINCT a.id) FILTER (
++				WHERE a.status = 'active'
++				  AND a.schedulable = TRUE
++				  AND (a.auto_pause_on_expired = FALSE OR a.expires_at IS NULL OR a.expires_at > NOW())
++				  AND (a.overload_until IS NULL OR a.overload_until <= NOW())
++				  AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= NOW())
++				  AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
++				  AND (
++					(COALESCE(g.scope, 'public') = 'user_private'
++					  AND a.owner_user_id IS NOT NULL
++					  AND g.owner_user_id IS NOT NULL
++					  AND a.owner_user_id = g.owner_user_id
++					  AND COALESCE(a.share_mode, 'private') = 'private')
++					OR
++					(COALESCE(g.scope, 'public') <> 'user_private'
++					  AND (
++						a.owner_user_id IS NULL
++						OR (COALESCE(a.share_mode, 'private') = 'public' AND COALESCE(a.share_status, 'approved') = 'approved')
++					  ))
++				  )
++				  AND (
++					g.platform <> 'openai'
++					OR COALESCE(g.required_account_level, '') = ''
++					OR CASE WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus' ELSE COALESCE(a.account_level, 'unknown') END =
++					   CASE WHEN g.required_account_level = 'team' THEN 'plus' ELSE g.required_account_level END
++				  )
++			) AS schedulable_accounts,
++			COUNT(DISTINCT a.id) FILTER (
++				WHERE a.status <> 'active'
++				   OR a.schedulable = FALSE
++				   OR (a.auto_pause_on_expired = TRUE AND a.expires_at IS NOT NULL AND a.expires_at <= NOW())
++				   OR (a.overload_until IS NOT NULL AND a.overload_until > NOW())
++				   OR (a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > NOW())
++				   OR (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > NOW())
++			) AS unschedulable_accounts,
++			COUNT(DISTINCT a.id) FILTER (WHERE COALESCE(a.share_mode, 'private') = 'public' AND COALESCE(a.share_status, 'approved') = 'pending') AS pending_accounts,
++			COUNT(DISTINCT a.id) FILTER (WHERE COALESCE(a.share_mode, 'private') = 'public' AND COALESCE(a.share_status, 'approved') = 'suspended') AS suspended_accounts,
++			COUNT(DISTINCT a.id) FILTER (WHERE a.rate_limit_reset_at IS NOT NULL AND a.rate_limit_reset_at > NOW()) AS rate_limited_accounts,
++			COUNT(DISTINCT a.id) FILTER (
++				WHERE (a.overload_until IS NOT NULL AND a.overload_until > NOW())
++				   OR (a.temp_unschedulable_until IS NOT NULL AND a.temp_unschedulable_until > NOW())
++			) AS temp_blocked_accounts,
++			COUNT(DISTINCT a.id) FILTER (WHERE a.auto_pause_on_expired = TRUE AND a.expires_at IS NOT NULL AND a.expires_at <= NOW()) AS expired_accounts,
++			COUNT(DISTINCT a.id) FILTER (WHERE g.platform = 'openai' AND COALESCE(a.account_level, 'unknown') = 'unknown') AS unknown_level_accounts,
++			COUNT(DISTINCT a.id) FILTER (
++				WHERE g.platform = 'openai'
++				  AND COALESCE(g.required_account_level, '') <> ''
++				  AND CASE WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus' ELSE COALESCE(a.account_level, 'unknown') END <>
++					  CASE WHEN g.required_account_level = 'team' THEN 'plus' ELSE g.required_account_level END
++			) AS level_mismatch_accounts,
++			COUNT(DISTINCT el.account_id) AS leased_accounts,
++			GREATEST(
++				COUNT(DISTINCT a.id) FILTER (
++					WHERE a.status = 'active'
++					  AND a.schedulable = TRUE
++					  AND (a.auto_pause_on_expired = FALSE OR a.expires_at IS NULL OR a.expires_at > NOW())
++					  AND (a.overload_until IS NULL OR a.overload_until <= NOW())
++					  AND (a.rate_limit_reset_at IS NULL OR a.rate_limit_reset_at <= NOW())
++					  AND (a.temp_unschedulable_until IS NULL OR a.temp_unschedulable_until <= NOW())
++					  AND (
++						(COALESCE(g.scope, 'public') = 'user_private'
++						  AND a.owner_user_id IS NOT NULL
++						  AND g.owner_user_id IS NOT NULL
++						  AND a.owner_user_id = g.owner_user_id
++						  AND COALESCE(a.share_mode, 'private') = 'private')
++						OR
++						(COALESCE(g.scope, 'public') <> 'user_private'
++						  AND (
++							a.owner_user_id IS NULL
++							OR (COALESCE(a.share_mode, 'private') = 'public' AND COALESCE(a.share_status, 'approved') = 'approved')
++						  ))
++					  )
++					  AND (
++						g.platform <> 'openai'
++						OR COALESCE(g.required_account_level, '') = ''
++						OR CASE WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus' ELSE COALESCE(a.account_level, 'unknown') END =
++						   CASE WHEN g.required_account_level = 'team' THEN 'plus' ELSE g.required_account_level END
++					  )
++				) - COUNT(DISTINCT el.account_id),
++				0
++			) AS unleased_accounts,
++			COUNT(DISTINCT el.subsite_id) AS assigned_subsites,
++			COUNT(el.account_id) AS active_leases
++		FROM groups g
++		LEFT JOIN account_groups ag ON ag.group_id = g.id
++		LEFT JOIN accounts a ON a.id = ag.account_id AND a.deleted_at IS NULL
++		LEFT JOIN effective_leases el ON el.account_id = a.id AND el.group_id = g.id
++		WHERE g.deleted_at IS NULL
++		  AND g.status = 'active'
++		GROUP BY g.id, g.name, g.platform, g.scope, g.required_account_level
++		HAVING COUNT(DISTINCT a.id) > 0 OR COUNT(el.account_id) > 0
++		ORDER BY g.platform ASC, COALESCE(NULLIF(g.scope, ''), 'public') ASC, COALESCE(g.required_account_level, '') ASC, g.id ASC
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list relay pool distribution: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteRelayPoolStat, 0)
++	for rows.Next() {
++		var item service.SubsiteRelayPoolStat
++		if err := rows.Scan(
++			&item.GroupID,
++			&item.GroupName,
++			&item.Platform,
++			&item.Scope,
++			&item.RequiredLevel,
++			&item.TotalAccounts,
++			&item.SchedulableAccounts,
++			&item.UnschedulableAccounts,
++			&item.PendingAccounts,
++			&item.SuspendedAccounts,
++			&item.RateLimitedAccounts,
++			&item.TempBlockedAccounts,
++			&item.ExpiredAccounts,
++			&item.UnknownLevelAccounts,
++			&item.LevelMismatchAccounts,
++			&item.LeasedAccounts,
++			&item.UnleasedAccounts,
++			&item.AssignedSubsites,
++			&item.ActiveLeases,
++		); err != nil {
++			return nil, err
++		}
++		item.BlockedReason = relayPoolBlockedReason(item)
++		items = append(items, item)
++	}
++	return items, rows.Err()
++}
++
++func (r *subsiteRepository) ListRelayConfigChecks(ctx context.Context) ([]service.SubsiteRelayConfigCheck, error) {
++	rows, err := r.db.QueryContext(ctx, `
++		WITH metrics AS (
++			SELECT
++				(SELECT COUNT(*) FROM account_share_policies
++				 WHERE deleted_at IS NULL
++				   AND enabled = TRUE
++				   AND effective_at <= NOW()
++				   AND scope_type = 'global'
++				   AND owner_share_ratio > 0) AS global_share_policy,
++				(SELECT COUNT(*) FROM subsites
++				 WHERE deleted_at IS NULL
++				   AND status = 'active'
++				   AND last_heartbeat_at >= NOW() - INTERVAL '3 minutes') AS online_subsites,
++				(SELECT COUNT(*) FROM groups
++				 WHERE deleted_at IS NULL
++				   AND status = 'active'
++				   AND platform = 'openai'
++				   AND COALESCE(scope, 'public') = 'public'
++				   AND required_account_level = 'free') AS public_openai_free_group,
++				(SELECT COUNT(*) FROM groups
++				 WHERE deleted_at IS NULL
++				   AND status = 'active'
++				   AND platform = 'openai'
++				   AND COALESCE(scope, 'public') = 'public'
++				   AND required_account_level = 'plus') AS public_openai_plus_group,
++				(SELECT COUNT(*) FROM groups
++				 WHERE deleted_at IS NULL
++				   AND status = 'active'
++				   AND platform = 'openai'
++				   AND COALESCE(scope, 'public') = 'public'
++				   AND required_account_level = 'pro') AS public_openai_pro_group,
++				(SELECT COUNT(*)
++				 FROM (
++					SELECT account_id
++					FROM account_leases
++					WHERE deleted_at IS NULL
++					  AND status IN ('active', 'renewing', 'draining')
++					  AND expires_at > NOW()
++					GROUP BY account_id
++					HAVING COUNT(*) > 1
++				 ) dup) AS duplicate_effective_lease,
++				(SELECT COUNT(*)
++				 FROM accounts
++				 WHERE deleted_at IS NULL
++				   AND share_mode = 'public'
++				   AND share_status = 'pending'
++				   AND COALESCE(NULLIF(error_message, ''), '') = '') AS pending_without_reason,
++				(SELECT COUNT(*)
++				 FROM account_leases al
++				 JOIN accounts a ON a.id = al.account_id
++				 JOIN groups g ON g.id = al.group_id
++				 WHERE al.deleted_at IS NULL
++				   AND al.status IN ('active', 'renewing', 'draining')
++				   AND al.expires_at > NOW()
++				   AND g.platform = 'openai'
++				   AND COALESCE(g.required_account_level, '') <> ''
++				   AND CASE WHEN COALESCE(a.account_level, 'unknown') = 'team' THEN 'plus' ELSE COALESCE(a.account_level, 'unknown') END <>
++					   CASE WHEN g.required_account_level = 'team' THEN 'plus' ELSE g.required_account_level END) AS level_mismatch_lease,
++				(SELECT COUNT(*)
++				 FROM account_leases al
++				 JOIN accounts a ON a.id = al.account_id
++				 JOIN groups g ON g.id = al.group_id
++				 WHERE al.deleted_at IS NULL
++				   AND al.status IN ('active', 'renewing', 'draining')
++				   AND al.expires_at > NOW()
++				   AND (
++					(COALESCE(g.scope, 'public') = 'user_private'
++					  AND (a.owner_user_id IS NULL OR g.owner_user_id IS NULL OR a.owner_user_id <> g.owner_user_id OR COALESCE(a.share_mode, 'private') <> 'private'))
++					OR
++					(COALESCE(g.scope, 'public') <> 'user_private'
++					  AND a.owner_user_id IS NOT NULL
++					  AND (COALESCE(a.share_mode, 'private') <> 'public' OR COALESCE(a.share_status, 'approved') <> 'approved'))
++				   )) AS share_mode_mismatch_lease
++		)
++		SELECT code, ok, severity, message
++		FROM metrics m
++		CROSS JOIN LATERAL (
++			VALUES
++				('GLOBAL_SHARE_POLICY', m.global_share_policy > 0, 'critical', 'No enabled global account share policy with owner_share_ratio > 0. Public shared accounts will remain pending.'),
++				('ONLINE_SUBSITE', m.online_subsites > 0, 'critical', 'No active subsite heartbeat in the last 3 minutes. Relay forwarding cannot select a healthy target.'),
++				('PUBLIC_OPENAI_FREE_GROUP', m.public_openai_free_group > 0, 'warning', 'No active public OpenAI Free group. Free public accounts cannot be assigned to the intended pool.'),
++				('PUBLIC_OPENAI_PLUS_GROUP', m.public_openai_plus_group > 0, 'warning', 'No active public OpenAI Plus group. Plus public accounts cannot be assigned to the intended pool.'),
++				('PUBLIC_OPENAI_PRO_GROUP', m.public_openai_pro_group > 0, 'warning', 'No active public OpenAI Pro group. Pro public accounts cannot be assigned to the intended pool.'),
++				('DUPLICATE_EFFECTIVE_LEASE', m.duplicate_effective_lease = 0, 'critical', 'Some accounts have more than one effective lease. One account must belong to only one subsite pool at a time.'),
++				('PENDING_WITHOUT_REASON', m.pending_without_reason = 0, 'info', 'Some public accounts are pending without an error reason. Revalidate them to expose the blocking cause.'),
++				('LEVEL_MISMATCH_LEASE', m.level_mismatch_lease = 0, 'critical', 'Some OpenAI leases do not match the group required account level. Release invalid leases.'),
++				('SHARE_MODE_MISMATCH_LEASE', m.share_mode_mismatch_lease = 0, 'critical', 'Some leases conflict with public/private share mode. Release invalid leases.')
++		) AS checks(code, ok, severity, message)
++	`)
++	if err != nil {
++		return nil, fmt.Errorf("list relay config checks: %w", err)
++	}
++	defer rows.Close()
++	items := make([]service.SubsiteRelayConfigCheck, 0)
++	for rows.Next() {
++		var item service.SubsiteRelayConfigCheck
++		var ok bool
++		if err := rows.Scan(&item.Code, &ok, &item.Severity, &item.Message); err != nil {
++			return nil, err
++		}
++		if ok {
++			item.Status = "ok"
++			item.Severity = "info"
++			item.Message = relayConfigCheckOKMessage(item.Code)
++		} else {
++			item.Status = "failed"
 +		}
 +		items = append(items, item)
 +	}
@@ -2010,6 +2283,94 @@ index 0000000..c1bc359
 +	return items, rows.Err()
 +}
 +
++func buildSubsiteRelayAutomationSummary(stats *service.SubsiteForwardStats) service.SubsiteRelayAutomationSummary {
++	if stats == nil {
++		return service.SubsiteRelayAutomationSummary{}
++	}
++	summary := service.SubsiteRelayAutomationSummary{
++		ConfigOK:       true,
++		OnlineSubsites: stats.OnlineSubsites,
++		LeasedAccounts: stats.ActiveLeases,
++	}
++	for _, check := range stats.ConfigChecks {
++		if check.Status != "ok" && (check.Severity == "critical" || check.Severity == "warning") {
++			summary.ConfigOK = false
++		}
++	}
++	for _, pool := range stats.PoolDistribution {
++		if pool.Scope == service.GroupScopeUserPrivate {
++			summary.PrivatePoolAccounts += pool.TotalAccounts
++		} else {
++			summary.PublicPoolAccounts += pool.TotalAccounts
++		}
++		summary.SchedulableAccounts += pool.SchedulableAccounts
++		summary.UnleasedAccounts += pool.UnleasedAccounts
++		summary.PendingAccounts += pool.PendingAccounts
++		summary.BlockedAccounts += pool.UnschedulableAccounts + pool.SuspendedAccounts + pool.LevelMismatchAccounts
++	}
++	summary.Ready = summary.ConfigOK && summary.OnlineSubsites > 0 && summary.SchedulableAccounts > 0
++	return summary
++}
++
++func relayPoolBlockedReason(item service.SubsiteRelayPoolStat) string {
++	if item.TotalAccounts == 0 {
++		return "no accounts bound to this group"
++	}
++	if item.SchedulableAccounts > 0 {
++		return ""
++	}
++	if item.PendingAccounts > 0 {
++		return "public accounts are still pending approval or share policy resolution"
++	}
++	if item.SuspendedAccounts > 0 {
++		return "public accounts are suspended"
++	}
++	if item.LevelMismatchAccounts > 0 {
++		return "OpenAI account level does not match group required level"
++	}
++	if item.UnknownLevelAccounts > 0 && item.RequiredLevel != "" {
++		return "OpenAI account level is unknown for a level-restricted group"
++	}
++	if item.RateLimitedAccounts > 0 {
++		return "accounts are rate-limited"
++	}
++	if item.TempBlockedAccounts > 0 {
++		return "accounts are temporarily unschedulable or overloaded"
++	}
++	if item.ExpiredAccounts > 0 {
++		return "accounts are expired"
++	}
++	if item.UnschedulableAccounts > 0 {
++		return "accounts are inactive or manually unschedulable"
++	}
++	return "no schedulable account matches relay rules"
++}
++
++func relayConfigCheckOKMessage(code string) string {
++	switch code {
++	case "GLOBAL_SHARE_POLICY":
++		return "Global account share policy is configured."
++	case "ONLINE_SUBSITE":
++		return "At least one active subsite is online."
++	case "PUBLIC_OPENAI_FREE_GROUP":
++		return "Public OpenAI Free group is configured."
++	case "PUBLIC_OPENAI_PLUS_GROUP":
++		return "Public OpenAI Plus group is configured."
++	case "PUBLIC_OPENAI_PRO_GROUP":
++		return "Public OpenAI Pro group is configured."
++	case "DUPLICATE_EFFECTIVE_LEASE":
++		return "Each account has at most one effective lease."
++	case "PENDING_WITHOUT_REASON":
++		return "Pending public accounts include diagnostic reasons."
++	case "LEVEL_MISMATCH_LEASE":
++		return "Effective OpenAI leases match group account levels."
++	case "SHARE_MODE_MISMATCH_LEASE":
++		return "Effective leases match public/private share rules."
++	default:
++		return "Check passed."
++	}
++}
++
 +func (r *subsiteRepository) ListActiveCircuitBreakers(ctx context.Context) ([]service.SubsiteCircuitBreaker, error) {
 +	rows, err := r.db.QueryContext(ctx, `
 +		SELECT id, scope, target_id, COALESCE(subsite_id, ''), COALESCE(account_id, 0),
@@ -2152,7 +2513,7 @@ index 0000000..c1bc359
 +
 +	deletedEvents, err := tx.ExecContext(ctx, `
 +		DELETE FROM subsite_forward_events
-+		WHERE created_at < $1 - INTERVAL '14 days'
++		WHERE created_at < $1::timestamptz - INTERVAL '14 days'
 +	`, now)
 +	if err != nil {
 +		return nil, fmt.Errorf("cleanup relay forward events: %w", err)
@@ -2161,7 +2522,7 @@ index 0000000..c1bc359
 +
 +	deletedSamples, err := tx.ExecContext(ctx, `
 +		DELETE FROM subsite_health_samples
-+		WHERE created_at < $1 - INTERVAL '7 days'
++		WHERE created_at < $1::timestamptz - INTERVAL '7 days'
 +	`, now)
 +	if err != nil {
 +		return nil, fmt.Errorf("cleanup relay health samples: %w", err)
@@ -2811,7 +3172,7 @@ index 0000000..d730f7d
 +	return normalized, nil
 +}
 diff --git a/backend/internal/service/subsite.go b/backend/internal/service/subsite.go
-index 8cfa424..0d4a63d 100644
+index 8cfa424..6dbe9f1 100644
 --- a/backend/internal/service/subsite.go
 +++ b/backend/internal/service/subsite.go
 @@ -12,6 +12,7 @@ import (
@@ -2892,7 +3253,26 @@ index 8cfa424..0d4a63d 100644
  }
  
  func (s *SubsiteService) Create(ctx context.Context, input CreateSubsiteInput) (*CreateSubsiteResult, error) {
-@@ -1180,9 +1207,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -749,6 +776,18 @@ func (s *AccountLeaseService) Create(ctx context.Context, input CreateAccountLea
+ 	if !containsInt64(account.GroupIDs, group.ID) {
+ 		return nil, ErrSubsiteInvalidInput
+ 	}
++	routeUserID := int64(0)
++	if group.IsUserPrivateScope() {
++		if group.OwnerUserID == nil || *group.OwnerUserID <= 0 {
++			return nil, ErrSubsiteInvalidInput
++		}
++		routeUserID = *group.OwnerUserID
++	} else if account.OwnerUserID != nil {
++		routeUserID = *account.OwnerUserID
++	}
++	if !isRelayLeaseAccountAllowed(&APIKey{Group: group, User: &User{ID: routeUserID}}, group.Platform, account) {
++		return nil, ErrAccountLeaseInvalidStatus
++	}
+ 	expiresAt := time.Now().Add(30 * time.Minute)
+ 	if input.ExpiresAt != nil {
+ 		expiresAt = *input.ExpiresAt
+@@ -1180,9 +1219,11 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			continue
  		}
  		if lease.MaxRequests > 0 && lease.UsedRequests >= int64(lease.MaxRequests) {
@@ -2904,7 +3284,7 @@ index 8cfa424..0d4a63d 100644
  			continue
  		}
  		if lease.GroupID != groupID {
-@@ -1208,15 +1237,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1208,15 +1249,20 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  			return nil, nil, err
  		}
  		if account == nil || !account.IsSchedulable() {
@@ -2927,7 +3307,7 @@ index 8cfa424..0d4a63d 100644
  		if err != nil {
  			return nil, nil, err
  		}
-@@ -1230,6 +1264,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
+@@ -1230,6 +1276,31 @@ func (s *RequestAuthorizeService) selectLease(ctx context.Context, input Authori
  	return nil, nil, ErrSubsiteAuthorizeNoLease
  }
  
@@ -2959,7 +3339,7 @@ index 8cfa424..0d4a63d 100644
  func isPrivateSubsiteAutoLeaseEligible(apiKey *APIKey) bool {
  	if apiKey == nil || apiKey.User == nil || apiKey.Group == nil {
  		return false
-@@ -1306,24 +1365,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
+@@ -1306,24 +1377,25 @@ func (s *RequestAuthorizeService) authorizeAgainstLeaseCandidates(
  	}
  }
  
@@ -2988,7 +3368,7 @@ index 8cfa424..0d4a63d 100644
  			continue
  		}
  		lease := &AccountLease{
-@@ -1333,7 +1393,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1333,7 +1405,7 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  			GroupID:        groupID,
  			Platform:       account.Platform,
  			Status:         AccountLeaseStatusActive,
@@ -2997,7 +3377,7 @@ index 8cfa424..0d4a63d 100644
  			AssignedAt:     now,
  			ExpiresAt:      now.Add(30 * time.Minute),
  		}
-@@ -1348,6 +1408,89 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
+@@ -1348,6 +1420,89 @@ func (s *RequestAuthorizeService) ensurePrivateLease(ctx context.Context, input
  	return nil, nil, nil
  }
  
@@ -3087,7 +3467,7 @@ index 8cfa424..0d4a63d 100644
  func isPrivateLeaseCandidate(ownerUserID int64, requestedPlatform string, account *Account) bool {
  	if account == nil {
  		return false
-@@ -1722,12 +1865,18 @@ func (s *SubsiteMaintenanceService) runOnce() {
+@@ -1722,12 +1877,18 @@ func (s *SubsiteMaintenanceService) runOnce() {
  		log.Printf("[SubsiteMaintenance] run failed: %v", err)
  		return
  	}
@@ -3108,7 +3488,7 @@ index 8cfa424..0d4a63d 100644
  		)
  	}
  }
-@@ -1752,6 +1901,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1752,6 +1913,13 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -3122,7 +3502,7 @@ index 8cfa424..0d4a63d 100644
  	expiredReservations, err := s.reservationRepo.ExpireStale(ctx, now.Add(-reservationExpiryGrace))
  	if err != nil {
  		return nil, err
-@@ -1760,10 +1916,22 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
+@@ -1760,10 +1928,22 @@ func (s *SubsiteMaintenanceService) RunOnce(ctx context.Context, input SubsiteMa
  	if err != nil {
  		return nil, err
  	}
@@ -3147,10 +3527,10 @@ index 8cfa424..0d4a63d 100644
  	}, nil
 diff --git a/backend/internal/service/subsite_relay.go b/backend/internal/service/subsite_relay.go
 new file mode 100644
-index 0000000..28401cf
+index 0000000..b04c8b4
 --- /dev/null
 +++ b/backend/internal/service/subsite_relay.go
-@@ -0,0 +1,436 @@
+@@ -0,0 +1,521 @@
 +package service
 +
 +import (
@@ -3218,34 +3598,37 @@ index 0000000..28401cf
 +}
 +
 +type SubsiteForwardStats struct {
-+	TotalAffinities    int64                    `json:"total_affinities"`
-+	LockedAffinity     int64                    `json:"locked_affinities"`
-+	ActiveAffinity     int64                    `json:"active_affinities"`
-+	AccountAffinity    int64                    `json:"account_affinities"`
-+	Events24h          int64                    `json:"events_24h"`
-+	Failures24h        int64                    `json:"failures_24h"`
-+	Failovers24h       int64                    `json:"failovers_24h"`
-+	CircuitOpen        int64                    `json:"circuit_open"`
-+	TotalSubsites      int64                    `json:"total_subsites"`
-+	OnlineSubsites     int64                    `json:"online_subsites"`
-+	DegradedSubsites   int64                    `json:"degraded_subsites"`
-+	OfflineSubsites    int64                    `json:"offline_subsites"`
-+	ActiveLeases       int64                    `json:"active_leases"`
-+	ExpiringLeases24h  int64                    `json:"expiring_leases_24h"`
-+	AvgLatencyMS24h    float64                  `json:"avg_latency_ms_24h"`
-+	P95LatencyMS24h    float64                  `json:"p95_latency_ms_24h"`
-+	P99LatencyMS24h    float64                  `json:"p99_latency_ms_24h"`
-+	SuccessRate24h     float64                  `json:"success_rate_24h"`
-+	ForwardedTokens24h int64                    `json:"forwarded_tokens_24h"`
-+	ForwardedCost24h   float64                  `json:"forwarded_cost_24h"`
-+	CacheReadTokens24h int64                    `json:"cache_read_tokens_24h"`
-+	CacheHitRatio24h   float64                  `json:"cache_hit_ratio_24h"`
-+	AvgFirstTokenMS24h float64                  `json:"avg_first_token_ms_24h"`
-+	Mode               string                   `json:"mode"`
-+	BySubsite          []SubsiteForwardSiteStat `json:"by_subsite"`
-+	CircuitBreakers    []SubsiteCircuitBreaker  `json:"circuit_breakers"`
-+	LeaseDistribution  []SubsiteRelayLeaseStat  `json:"lease_distribution"`
-+	Recommendations    []SubsiteRelayAdvice     `json:"recommendations"`
++	TotalAffinities    int64                         `json:"total_affinities"`
++	LockedAffinity     int64                         `json:"locked_affinities"`
++	ActiveAffinity     int64                         `json:"active_affinities"`
++	AccountAffinity    int64                         `json:"account_affinities"`
++	Events24h          int64                         `json:"events_24h"`
++	Failures24h        int64                         `json:"failures_24h"`
++	Failovers24h       int64                         `json:"failovers_24h"`
++	CircuitOpen        int64                         `json:"circuit_open"`
++	TotalSubsites      int64                         `json:"total_subsites"`
++	OnlineSubsites     int64                         `json:"online_subsites"`
++	DegradedSubsites   int64                         `json:"degraded_subsites"`
++	OfflineSubsites    int64                         `json:"offline_subsites"`
++	ActiveLeases       int64                         `json:"active_leases"`
++	ExpiringLeases24h  int64                         `json:"expiring_leases_24h"`
++	AvgLatencyMS24h    float64                       `json:"avg_latency_ms_24h"`
++	P95LatencyMS24h    float64                       `json:"p95_latency_ms_24h"`
++	P99LatencyMS24h    float64                       `json:"p99_latency_ms_24h"`
++	SuccessRate24h     float64                       `json:"success_rate_24h"`
++	ForwardedTokens24h int64                         `json:"forwarded_tokens_24h"`
++	ForwardedCost24h   float64                       `json:"forwarded_cost_24h"`
++	CacheReadTokens24h int64                         `json:"cache_read_tokens_24h"`
++	CacheHitRatio24h   float64                       `json:"cache_hit_ratio_24h"`
++	AvgFirstTokenMS24h float64                       `json:"avg_first_token_ms_24h"`
++	Mode               string                        `json:"mode"`
++	BySubsite          []SubsiteForwardSiteStat      `json:"by_subsite"`
++	CircuitBreakers    []SubsiteCircuitBreaker       `json:"circuit_breakers"`
++	LeaseDistribution  []SubsiteRelayLeaseStat       `json:"lease_distribution"`
++	PoolDistribution   []SubsiteRelayPoolStat        `json:"pool_distribution"`
++	ConfigChecks       []SubsiteRelayConfigCheck     `json:"configuration_checks"`
++	Automation         SubsiteRelayAutomationSummary `json:"automation_summary"`
++	Recommendations    []SubsiteRelayAdvice          `json:"recommendations"`
 +}
 +
 +type SubsiteRelayLeaseStat struct {
@@ -3258,6 +3641,49 @@ index 0000000..28401cf
 +	AssignedSubsites  int64  `json:"assigned_subsites"`
 +	ExpiringLeases1h  int64  `json:"expiring_leases_1h"`
 +	ExpiringLeases24h int64  `json:"expiring_leases_24h"`
++}
++
++type SubsiteRelayPoolStat struct {
++	GroupID               int64  `json:"group_id"`
++	GroupName             string `json:"group_name"`
++	Platform              string `json:"platform"`
++	Scope                 string `json:"scope"`
++	RequiredLevel         string `json:"required_level"`
++	TotalAccounts         int64  `json:"total_accounts"`
++	SchedulableAccounts   int64  `json:"schedulable_accounts"`
++	UnschedulableAccounts int64  `json:"unschedulable_accounts"`
++	PendingAccounts       int64  `json:"pending_accounts"`
++	SuspendedAccounts     int64  `json:"suspended_accounts"`
++	RateLimitedAccounts   int64  `json:"rate_limited_accounts"`
++	TempBlockedAccounts   int64  `json:"temp_blocked_accounts"`
++	ExpiredAccounts       int64  `json:"expired_accounts"`
++	UnknownLevelAccounts  int64  `json:"unknown_level_accounts"`
++	LevelMismatchAccounts int64  `json:"level_mismatch_accounts"`
++	LeasedAccounts        int64  `json:"leased_accounts"`
++	UnleasedAccounts      int64  `json:"unleased_accounts"`
++	AssignedSubsites      int64  `json:"assigned_subsites"`
++	ActiveLeases          int64  `json:"active_leases"`
++	BlockedReason         string `json:"blocked_reason"`
++}
++
++type SubsiteRelayConfigCheck struct {
++	Code     string `json:"code"`
++	Status   string `json:"status"`
++	Severity string `json:"severity"`
++	Message  string `json:"message"`
++}
++
++type SubsiteRelayAutomationSummary struct {
++	Ready               bool  `json:"ready"`
++	ConfigOK            bool  `json:"config_ok"`
++	OnlineSubsites      int64 `json:"online_subsites"`
++	PublicPoolAccounts  int64 `json:"public_pool_accounts"`
++	PrivatePoolAccounts int64 `json:"private_pool_accounts"`
++	SchedulableAccounts int64 `json:"schedulable_accounts"`
++	LeasedAccounts      int64 `json:"leased_accounts"`
++	UnleasedAccounts    int64 `json:"unleased_accounts"`
++	PendingAccounts     int64 `json:"pending_accounts"`
++	BlockedAccounts     int64 `json:"blocked_accounts"`
 +}
 +
 +type SubsiteRelayAdvice struct {
@@ -3363,6 +3789,8 @@ index 0000000..28401cf
 +	ForwardStats(ctx context.Context) (*SubsiteForwardStats, error)
 +	ForwardRouteStats(ctx context.Context) ([]SubsiteForwardSiteStat, error)
 +	ListRelayLeaseDistribution(ctx context.Context) ([]SubsiteRelayLeaseStat, error)
++	ListRelayPoolDistribution(ctx context.Context) ([]SubsiteRelayPoolStat, error)
++	ListRelayConfigChecks(ctx context.Context) ([]SubsiteRelayConfigCheck, error)
 +	ListActiveCircuitBreakers(ctx context.Context) ([]SubsiteCircuitBreaker, error)
 +	CleanupForwardState(ctx context.Context, now time.Time) (*SubsiteForwardCleanupResult, error)
 +}
@@ -3501,7 +3929,44 @@ index 0000000..28401cf
 +	if stats.ExpiringLeases24h > 0 {
 +		items = append(items, SubsiteRelayAdvice{Code: "LEASE_EXPIRING", Severity: "info", Message: "Some leases expire within 24 hours. Automatic renewal or redistribution will keep requests available."})
 +	}
++	if stats.ActiveLeases == 0 && stats.Automation.PublicPoolAccounts == 0 && stats.Automation.PrivatePoolAccounts == 0 {
++		items = append(items, SubsiteRelayAdvice{Code: "NO_RELAY_POOL_ACCOUNT", Severity: "warning", Message: "No account is bound to a relay pool. Bind validated public or private accounts to the matching group."})
++	}
++	for _, check := range stats.ConfigChecks {
++		if check.Status == "ok" || check.Severity == "" {
++			continue
++		}
++		items = append(items, SubsiteRelayAdvice{Code: check.Code, Severity: check.Severity, Message: check.Message})
++	}
++	for _, pool := range stats.PoolDistribution {
++		if pool.TotalAccounts > 0 && pool.SchedulableAccounts == 0 {
++			message := fmt.Sprintf("%s/%s/%s has accounts but none are schedulable. Check validation, share mode, rate limits, and account status.", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel))
++			if pool.BlockedReason != "" {
++				message = fmt.Sprintf("%s/%s/%s is blocked: %s.", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel), pool.BlockedReason)
++			}
++			items = append(items, SubsiteRelayAdvice{
++				Code:     "POOL_NOT_SCHEDULABLE_" + strings.ToUpper(pool.Platform) + "_" + strings.ToUpper(pool.RequiredLevel),
++				Severity: "warning",
++				Message:  message,
++			})
++		}
++		if pool.SchedulableAccounts > 0 && pool.UnleasedAccounts > 0 && stats.OnlineSubsites > 0 {
++			items = append(items, SubsiteRelayAdvice{
++				Code:     "POOL_HAS_UNLEASED_" + strings.ToUpper(pool.Platform) + "_" + strings.ToUpper(pool.RequiredLevel),
++				Severity: "info",
++				Message:  fmt.Sprintf("%s/%s/%s has %d schedulable account(s) waiting for automatic distribution. They will lease on demand.", pool.Platform, pool.Scope, displayRelayLevel(pool.RequiredLevel), pool.UnleasedAccounts),
++			})
++		}
++	}
 +	return items
++}
++
++func displayRelayLevel(level string) string {
++	level = strings.TrimSpace(level)
++	if level == "" {
++		return "any"
++	}
++	return level
 +}
 +
 +func (s *SubsiteService) SignRouteHint(ctx context.Context, subsiteID, method, path, timestamp, nonce, preferredLeaseID string, preferredAccountID int64) (string, error) {
@@ -4239,10 +4704,10 @@ index 40896f8..d53ce81 100644
 +  SubsiteForwardStats
 +} from './subsites'
 diff --git a/frontend/src/api/admin/subsites.ts b/frontend/src/api/admin/subsites.ts
-index 1faa4eb..e213550 100644
+index 1faa4eb..435eb0a 100644
 --- a/frontend/src/api/admin/subsites.ts
 +++ b/frontend/src/api/admin/subsites.ts
-@@ -43,6 +43,170 @@ export interface AccountLease {
+@@ -43,6 +43,216 @@ export interface AccountLease {
    updated_at: string
  }
  
@@ -4306,6 +4771,49 @@ index 1faa4eb..e213550 100644
 +  expiring_leases_24h: number
 +}
 +
++export interface SubsiteRelayPoolStat {
++  group_id: number
++  group_name: string
++  platform: string
++  scope: string
++  required_level: string
++  total_accounts: number
++  schedulable_accounts: number
++  unschedulable_accounts: number
++  pending_accounts: number
++  suspended_accounts: number
++  rate_limited_accounts: number
++  temp_blocked_accounts: number
++  expired_accounts: number
++  unknown_level_accounts: number
++  level_mismatch_accounts: number
++  leased_accounts: number
++  unleased_accounts: number
++  assigned_subsites: number
++  active_leases: number
++  blocked_reason: string
++}
++
++export interface SubsiteRelayConfigCheck {
++  code: string
++  status: string
++  severity: string
++  message: string
++}
++
++export interface SubsiteRelayAutomationSummary {
++  ready: boolean
++  config_ok: boolean
++  online_subsites: number
++  public_pool_accounts: number
++  private_pool_accounts: number
++  schedulable_accounts: number
++  leased_accounts: number
++  unleased_accounts: number
++  pending_accounts: number
++  blocked_accounts: number
++}
++
 +export interface SubsiteRelayAdvice {
 +  code: string
 +  severity: string
@@ -4340,6 +4848,9 @@ index 1faa4eb..e213550 100644
 +  by_subsite: SubsiteForwardSiteStat[]
 +  circuit_breakers: SubsiteCircuitBreaker[]
 +  lease_distribution: SubsiteRelayLeaseStat[]
++  pool_distribution: SubsiteRelayPoolStat[]
++  configuration_checks: SubsiteRelayConfigCheck[]
++  automation_summary: SubsiteRelayAutomationSummary
 +  recommendations: SubsiteRelayAdvice[]
 +}
 +
@@ -4413,7 +4924,7 @@ index 1faa4eb..e213550 100644
  export interface CreateSubsiteRequest {
    subsite_id?: string
    name: string
-@@ -187,6 +351,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
+@@ -187,6 +397,55 @@ export async function deleteLease(subsiteID: string, leaseID: string): Promise<v
    await apiClient.delete(`/admin/subsites/${subsiteID}/leases/${leaseID}`)
  }
  
@@ -4469,7 +4980,7 @@ index 1faa4eb..e213550 100644
  export default {
    list,
    create,
-@@ -202,5 +415,11 @@ export default {
+@@ -202,5 +461,11 @@ export default {
    releaseLease,
    renewLease,
    updateLease,
@@ -4483,10 +4994,10 @@ index 1faa4eb..e213550 100644
 +  listForwardEvents
  }
 diff --git a/frontend/src/views/admin/SubsitesView.vue b/frontend/src/views/admin/SubsitesView.vue
-index cb5d3f8..466619c 100644
+index cb5d3f8..6ed760b 100644
 --- a/frontend/src/views/admin/SubsitesView.vue
 +++ b/frontend/src/views/admin/SubsitesView.vue
-@@ -1,5 +1,304 @@
+@@ -1,5 +1,424 @@
  <template>
    <AppLayout>
 +    <section class="mb-6 space-y-4">
@@ -4549,6 +5060,126 @@ index cb5d3f8..466619c 100644
 +          <p class="mt-2 text-sm font-semibold text-gray-900 dark:text-white">用量回传后由主站结算</p>
 +          <p class="mt-1 text-xs text-gray-500">24h 在线 {{ forwardStats?.online_subsites || 0 }}/{{ forwardStats?.total_subsites || 0 }}，活跃租约 {{ forwardStats?.active_leases || 0 }}，即将过期 {{ forwardStats?.expiring_leases_24h || 0 }}。</p>
 +        </div>
++      </div>
++
++      <div class="grid gap-4 xl:grid-cols-[minmax(0,0.82fr)_minmax(0,1.18fr)]">
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-4 flex items-start justify-between gap-3">
++            <div>
++              <h2 class="text-base font-semibold text-gray-900 dark:text-white">Subsite Relay Orchestrator</h2>
++              <p class="text-xs text-gray-500">Account pool readiness, one-account-one-subsite lease control, and master-side billing diagnostics.</p>
++            </div>
++            <span :class="['badge', forwardStats?.automation_summary?.ready ? 'badge-success' : 'badge-danger']">
++              {{ forwardStats?.automation_summary?.ready ? 'READY' : 'NOT READY' }}
++            </span>
++          </div>
++          <div class="grid gap-3 sm:grid-cols-2">
++            <div class="rounded-xl bg-gray-50 p-3 dark:bg-dark-700">
++              <p class="text-xs uppercase tracking-wide text-gray-500">Config</p>
++              <p class="mt-1 text-lg font-semibold text-gray-900 dark:text-white">{{ forwardStats?.automation_summary?.config_ok ? 'OK' : 'Check Required' }}</p>
++            </div>
++            <div class="rounded-xl bg-gray-50 p-3 dark:bg-dark-700">
++              <p class="text-xs uppercase tracking-wide text-gray-500">Online Subsites</p>
++              <p class="mt-1 text-lg font-semibold text-gray-900 dark:text-white">{{ forwardStats?.automation_summary?.online_subsites || 0 }}</p>
++            </div>
++            <div class="rounded-xl bg-gray-50 p-3 dark:bg-dark-700">
++              <p class="text-xs uppercase tracking-wide text-gray-500">Schedulable Accounts</p>
++              <p class="mt-1 text-lg font-semibold text-emerald-600">{{ forwardStats?.automation_summary?.schedulable_accounts || 0 }}</p>
++            </div>
++            <div class="rounded-xl bg-gray-50 p-3 dark:bg-dark-700">
++              <p class="text-xs uppercase tracking-wide text-gray-500">Blocked Accounts</p>
++              <p class="mt-1 text-lg font-semibold text-amber-600">{{ forwardStats?.automation_summary?.blocked_accounts || 0 }}</p>
++            </div>
++          </div>
++          <div class="mt-4 grid gap-2 text-xs text-gray-600 dark:text-gray-300 sm:grid-cols-2">
++            <span>Public pool: {{ forwardStats?.automation_summary?.public_pool_accounts || 0 }}</span>
++            <span>Private pool: {{ forwardStats?.automation_summary?.private_pool_accounts || 0 }}</span>
++            <span>Leased: {{ forwardStats?.automation_summary?.leased_accounts || 0 }}</span>
++            <span>Unleased: {{ forwardStats?.automation_summary?.unleased_accounts || 0 }}</span>
++            <span>Pending review: {{ forwardStats?.automation_summary?.pending_accounts || 0 }}</span>
++            <span>Mode: {{ forwardModeLabel(forwardStats?.mode) }}</span>
++          </div>
++        </div>
++
++        <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++          <div class="mb-3 flex items-center justify-between gap-3">
++            <div>
++              <h2 class="text-base font-semibold text-gray-900 dark:text-white">Configuration Self-Check</h2>
++              <p class="text-xs text-gray-500">Explains why public accounts stay pending, leases mismatch, or relay cannot select a target.</p>
++            </div>
++            <span class="badge badge-secondary">{{ (forwardStats?.configuration_checks || []).length }}</span>
++          </div>
++          <div class="grid gap-2 md:grid-cols-2">
++            <div
++              v-for="check in forwardStats?.configuration_checks || []"
++              :key="check.code"
++              :class="['rounded-xl border p-3 text-sm', check.status === 'ok' ? 'border-emerald-100 bg-emerald-50/50 text-emerald-800 dark:border-emerald-900/40 dark:bg-emerald-950/20 dark:text-emerald-100' : adviceClass(check.severity)]"
++            >
++              <div class="flex items-center justify-between gap-3">
++                <span class="font-semibold">{{ check.code }}</span>
++                <span class="text-xs uppercase tracking-wide">{{ check.status }}</span>
++              </div>
++              <p class="mt-1 text-xs">{{ check.message }}</p>
++            </div>
++          </div>
++          <p v-if="!(forwardStats?.configuration_checks || []).length" class="text-sm text-gray-500">No configuration check data.</p>
++        </div>
++      </div>
++
++      <div class="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm dark:border-dark-600 dark:bg-dark-800">
++        <div class="mb-3 flex items-center justify-between gap-3">
++          <div>
++            <h2 class="text-base font-semibold text-gray-900 dark:text-white">Account Pool Distribution</h2>
++            <p class="text-xs text-gray-500">Public/private pools are separated by group and OpenAI level. A valid account can have only one effective subsite lease.</p>
++          </div>
++          <span class="badge badge-secondary">{{ (forwardStats?.pool_distribution || []).length }}</span>
++        </div>
++        <div class="overflow-x-auto">
++          <table class="min-w-full divide-y divide-gray-200 text-sm dark:divide-dark-600">
++            <thead class="text-left text-xs uppercase tracking-wide text-gray-500">
++              <tr>
++                <th class="py-2 pr-4">Group</th>
++                <th class="py-2 pr-4">Pool</th>
++                <th class="py-2 pr-4">Accounts</th>
++                <th class="py-2 pr-4">Lease</th>
++                <th class="py-2 pr-4">Blocked</th>
++                <th class="py-2">Diagnosis</th>
++              </tr>
++            </thead>
++            <tbody class="divide-y divide-gray-100 dark:divide-dark-700">
++              <tr v-for="pool in forwardStats?.pool_distribution || []" :key="`${pool.group_id}-${pool.platform}-${pool.scope}-${pool.required_level}`">
++                <td class="py-3 pr-4">
++                  <div class="font-medium text-gray-900 dark:text-white">{{ pool.group_name || `#${pool.group_id}` }}</div>
++                  <div class="text-xs text-gray-500">#{{ pool.group_id }}</div>
++                </td>
++                <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                  {{ pool.platform }} / {{ pool.scope }}<br />
++                  <span class="text-xs">level {{ pool.required_level || 'any' }}</span>
++                </td>
++                <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                  total {{ pool.total_accounts }}<br />
++                  <span class="text-emerald-600">schedulable {{ pool.schedulable_accounts }}</span>
++                </td>
++                <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                  active {{ pool.active_leases }}<br />
++                  unleased {{ pool.unleased_accounts }} / subsites {{ pool.assigned_subsites }}
++                </td>
++                <td class="py-3 pr-4 text-gray-600 dark:text-gray-300">
++                  pending {{ pool.pending_accounts }} / suspended {{ pool.suspended_accounts }}<br />
++                  rate {{ pool.rate_limited_accounts }} / temp {{ pool.temp_blocked_accounts }} / level {{ pool.level_mismatch_accounts }}
++                </td>
++                <td class="py-3">
++                  <span :class="['badge', pool.schedulable_accounts > 0 ? 'badge-success' : 'badge-warning']">
++                    {{ pool.schedulable_accounts > 0 ? 'available' : 'blocked' }}
++                  </span>
++                  <p v-if="pool.blocked_reason" class="mt-1 max-w-sm text-xs text-amber-600 dark:text-amber-300">{{ pool.blocked_reason }}</p>
++                  <p v-else class="mt-1 text-xs text-gray-500">ready for on-demand lease</p>
++                </td>
++              </tr>
++            </tbody>
++          </table>
++        </div>
++        <p v-if="!(forwardStats?.pool_distribution || []).length" class="mt-3 text-sm text-gray-500">No account pool data. Bind validated accounts to groups first.</p>
 +      </div>
 +
 +      <div v-if="(forwardStats?.recommendations || []).length || (forwardStats?.lease_distribution || []).length" class="grid gap-4 xl:grid-cols-[minmax(0,0.9fr)_minmax(0,1.1fr)]">
@@ -4791,7 +5422,7 @@ index cb5d3f8..466619c 100644
      <TablePageLayout>
        <template #filters>
          <div class="flex flex-wrap items-center gap-3">
-@@ -370,7 +669,15 @@
+@@ -370,7 +789,15 @@
  <script setup lang="ts">
  import { computed, onMounted, reactive, ref } from 'vue'
  import { adminAPI } from '@/api/admin'
@@ -4808,7 +5439,7 @@ index cb5d3f8..466619c 100644
  import type { Account, AdminGroup } from '@/types'
  import AppLayout from '@/components/layout/AppLayout.vue'
  import TablePageLayout from '@/components/layout/TablePageLayout.vue'
-@@ -382,6 +689,9 @@ import type { Column } from '@/components/common/types'
+@@ -382,6 +809,9 @@ import type { Column } from '@/components/common/types'
  import { useClipboard } from '@/composables/useClipboard'
  
  const subsites = ref<Subsite[]>([])
@@ -4818,7 +5449,7 @@ index cb5d3f8..466619c 100644
  const leases = ref<AccountLease[]>([])
  const leaseAccounts = ref<Account[]>([])
  const leaseGroups = ref<AdminGroup[]>([])
-@@ -394,6 +704,10 @@ const leaseBulkSaving = ref(false)
+@@ -394,6 +824,10 @@ const leaseBulkSaving = ref(false)
  const leaseBulkUpdating = ref(false)
  const leaseAccountsLoading = ref(false)
  const resettingSecret = ref(false)
@@ -4829,7 +5460,7 @@ index cb5d3f8..466619c 100644
  const search = ref('')
  const status = ref('')
  const leaseAccountSearch = ref('')
-@@ -442,6 +756,15 @@ const leaseBulkEditForm = reactive({
+@@ -442,6 +876,15 @@ const leaseBulkEditForm = reactive({
    max_requests: 0,
    max_tokens: 0
  })
@@ -4845,7 +5476,7 @@ index cb5d3f8..466619c 100644
  const selectedLeaseIDs = ref<Set<string>>(new Set())
  
  const leaseGroupOptions = computed(() => leaseGroups.value
-@@ -520,11 +843,84 @@ async function reload(): Promise<void> {
+@@ -520,11 +963,84 @@ async function reload(): Promise<void> {
      })
      subsites.value = result.items
      pagination.total = result.total
@@ -4930,7 +5561,7 @@ index cb5d3f8..466619c 100644
  function handleSearch(): void {
    window.clearTimeout(searchTimer.value)
    searchTimer.value = window.setTimeout(() => {
-@@ -1027,7 +1423,129 @@ function formatDate(value?: string): string {
+@@ -1027,7 +1543,129 @@ function formatDate(value?: string): string {
    return new Date(value).toLocaleString()
  }
  
