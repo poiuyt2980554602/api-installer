@@ -69,17 +69,19 @@ jobs:
       - name: Apply Pixel compatibility patches and overlays
         run: |
           set -euo pipefail
+          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
           if [ -f "$patch_file" ]; then
             git apply --directory=pixel-src "$patch_file"
           elif [ "${PIXEL_SOURCE_VERSION}" = "upgrade/v0.1.121-merge" ]; then
             echo "Using upstream ${PIXEL_SOURCE_VERSION} source as the forwarder base."
+          elif [ -d "overlays/${overlay_key}" ]; then
+            echo "Using upstream ${PIXEL_SOURCE_VERSION} with overlay ${overlay_key}."
           else
             echo "::error::Missing compatibility patch: ${patch_file}"
             echo "Refusing to build an unpatched forwarder release."
             exit 1
           fi
-          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           for overlay_dir in "overlays/${overlay_key}" "overlays/upgrade_v0.1.121-merge"; do
             if [ -d "$overlay_dir" ]; then
               cp -a "${overlay_dir}/." pixel-src/
