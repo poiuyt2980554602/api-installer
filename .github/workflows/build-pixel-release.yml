@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.29.1"
+        default: "1.0.29.2"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -27,7 +27,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29.1' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29.2' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'codex/pixel-1.0.27-401-fix-test' }}
     steps:

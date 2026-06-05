@@ -491,6 +491,127 @@ func TestSubsiteAgentProxy_OpenAIOAuthResponsesUsesCodexUpstream(t *testing.T) {
 	require.Equal(t, "hello", gjson.GetBytes([]byte(mustJSON(t, upstreamBody)), "input.0.content").String())
 }
 
+func TestSubsiteAgentProxy_OpenAIResponsesStreamsThroughAndQueuesUsage(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "subsite-secret"
+	groupID := int64(18)
+	firstChunkWritten := make(chan struct{})
+	releaseFinalChunk := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		flusher.Flush()
+		close(firstChunkWritten)
+		<-releaseFinalChunk
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_stream_1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":13,\"output_tokens\":4,\"input_tokens_details\":{\"cached_tokens\":3}}}}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireSubsiteSignature(t, r, secret)
+		switch r.URL.Path {
+		case "/api/internal/requests/authorize":
+			writeMasterEnvelope(t, w, service.AuthorizeSubsiteResponse{
+				RequestID:      "subreq_stream_1",
+				ReservationID:  "qres_stream_1",
+				SubsiteID:      "site_1",
+				LeaseID:        "lease_1",
+				AccountID:      100,
+				APIKeyID:       200,
+				UserID:         300,
+				GroupID:        &groupID,
+				Platform:       service.PlatformOpenAI,
+				RequestedModel: "gpt-5.4",
+				MappedModel:    "gpt-5.4",
+				MaxCost:        1,
+				ExpiresAt:      time.Now().Add(time.Minute),
+				BillingType:    service.BillingTypeBalance,
+				Credential: service.CredentialSnapshot{
+					AccountType: service.AccountTypeAPIKey,
+					Credentials: map[string]any{
+						"api_key":  "sk-upstream",
+						"base_url": upstream.URL,
+					},
+					ExpiresAt: time.Now().Add(time.Minute),
+				},
+			})
+		default:
+			t.Fatalf("unexpected master path: %s", r.URL.Path)
+		}
+	}))
+	defer master.Close()
+
+	usageQueue, err := queue.Open(filepath.Join(t.TempDir(), "usage.db"))
+	require.NoError(t, err)
+	defer func() { _ = usageQueue.Close() }()
+
+	server := NewServer(&Config{
+		ListenAddr: ":0",
+		Subsite:    SubsiteConfig{ID: "site_1"},
+		Master:     MasterConfig{BaseURL: master.URL, Secret: secret},
+		Queue:      QueueConfig{Path: filepath.Join(t.TempDir(), "unused.db")},
+	}, masterclient.NewMasterClient(master.URL, "site_1", secret), usageQueue)
+
+	subsite := httptest.NewServer(server.engine)
+	defer subsite.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subsite.URL+"/v1/responses", strings.NewReader(`{"model":"gpt-5.4","input":"hi","stream":true}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	var resp *http.Response
+	select {
+	case resp = <-respCh:
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("subsite did not return streaming response headers before upstream completed")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Contains(t, resp.Header.Get("Content-Type"), "text/event-stream")
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not write first stream chunk")
+	}
+	first := make([]byte, 128)
+	n, err := resp.Body.Read(first)
+	require.NoError(t, err)
+	require.Contains(t, string(first[:n]), "response.output_text.delta")
+
+	close(releaseFinalChunk)
+	_, _ = io.ReadAll(resp.Body)
+
+	items, err := usageQueue.DequeueBatch(context.Background(), 10)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Equal(t, "subreq_stream_1", items[0].Payload.RequestID)
+	require.Equal(t, int16(service.RequestTypeStream), items[0].Payload.RequestType)
+	require.Equal(t, 10, items[0].Payload.InputTokens)
+	require.Equal(t, 4, items[0].Payload.OutputTokens)
+	require.Equal(t, 3, items[0].Payload.CacheReadTokens)
+	require.NotNil(t, items[0].Payload.FirstTokenMs)
+}
+
 func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponses(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
@@ -659,6 +780,127 @@ func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesCapturesLatencyAndRe
 	require.GreaterOrEqual(t, *item.DurationMs, 20)
 	require.GreaterOrEqual(t, *item.FirstTokenMs, 0)
 	require.LessOrEqual(t, *item.FirstTokenMs, *item.DurationMs)
+}
+
+func TestSubsiteAgentProxy_OpenAIChatCompletionsViaResponsesStreamsConversion(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	const secret = "subsite-secret"
+	groupID := int64(18)
+	firstChunkWritten := make(chan struct{})
+	releaseFinalChunk := make(chan struct{})
+
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		require.True(t, ok)
+		_, _ = w.Write([]byte("data: {\"type\":\"response.output_text.delta\",\"delta\":\"hello\"}\n\n"))
+		flusher.Flush()
+		close(firstChunkWritten)
+		<-releaseFinalChunk
+		_, _ = w.Write([]byte("data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_cc_stream_1\",\"model\":\"gpt-5.4\",\"status\":\"completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":5}}}\n\n"))
+		flusher.Flush()
+	}))
+	defer upstream.Close()
+
+	master := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requireSubsiteSignature(t, r, secret)
+		switch r.URL.Path {
+		case "/api/internal/requests/authorize":
+			writeMasterEnvelope(t, w, service.AuthorizeSubsiteResponse{
+				RequestID:      "subreq_cc_stream_1",
+				ReservationID:  "qres_cc_stream_1",
+				SubsiteID:      "site_1",
+				LeaseID:        "lease_1",
+				AccountID:      100,
+				APIKeyID:       200,
+				UserID:         300,
+				GroupID:        &groupID,
+				Platform:       service.PlatformOpenAI,
+				RequestedModel: "gpt-5.4",
+				MappedModel:    "gpt-5.4",
+				MaxCost:        1,
+				ExpiresAt:      time.Now().Add(time.Minute),
+				BillingType:    service.BillingTypeBalance,
+				Credential: service.CredentialSnapshot{
+					AccountType: service.AccountTypeAPIKey,
+					Credentials: map[string]any{
+						"api_key":  "sk-upstream",
+						"base_url": upstream.URL,
+					},
+					ExpiresAt: time.Now().Add(time.Minute),
+				},
+			})
+		default:
+			t.Fatalf("unexpected master path: %s", r.URL.Path)
+		}
+	}))
+	defer master.Close()
+
+	usageQueue, err := queue.Open(filepath.Join(t.TempDir(), "usage.db"))
+	require.NoError(t, err)
+	defer func() { _ = usageQueue.Close() }()
+
+	server := NewServer(&Config{
+		ListenAddr: ":0",
+		Subsite:    SubsiteConfig{ID: "site_1"},
+		Master:     MasterConfig{BaseURL: master.URL, Secret: secret},
+		Queue:      QueueConfig{Path: filepath.Join(t.TempDir(), "unused.db")},
+	}, masterclient.NewMasterClient(master.URL, "site_1", secret), usageQueue)
+
+	subsite := httptest.NewServer(server.engine)
+	defer subsite.Close()
+
+	req, err := http.NewRequest(http.MethodPost, subsite.URL+"/v1/chat/completions", strings.NewReader(`{"model":"gpt-5.4","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	require.NoError(t, err)
+	req.Header.Set("Authorization", "Bearer client-key")
+	req.Header.Set("Content-Type", "application/json")
+
+	respCh := make(chan *http.Response, 1)
+	errCh := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			errCh <- err
+			return
+		}
+		respCh <- resp
+	}()
+
+	var resp *http.Response
+	select {
+	case resp = <-respCh:
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(2 * time.Second):
+		t.Fatal("subsite did not return chat streaming response headers before upstream completed")
+	}
+	defer func() { _ = resp.Body.Close() }()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	require.Contains(t, resp.Header.Get("Content-Type"), "text/event-stream")
+
+	select {
+	case <-firstChunkWritten:
+	case <-time.After(2 * time.Second):
+		t.Fatal("upstream did not write first stream chunk")
+	}
+	first := make([]byte, 256)
+	n, err := resp.Body.Read(first)
+	require.NoError(t, err)
+	require.Contains(t, string(first[:n]), "chat.completion.chunk")
+	require.Contains(t, string(first[:n]), "hello")
+
+	close(releaseFinalChunk)
+	_, _ = io.ReadAll(resp.Body)
+
+	items, err := usageQueue.DequeueBatch(context.Background(), 10)
+	require.NoError(t, err)
+	require.Len(t, items, 1)
+	require.Equal(t, "subreq_cc_stream_1", items[0].Payload.RequestID)
+	require.Equal(t, int16(service.RequestTypeStream), items[0].Payload.RequestType)
+	require.Equal(t, 8, items[0].Payload.InputTokens)
+	require.Equal(t, 5, items[0].Payload.OutputTokens)
+	require.NotNil(t, items[0].Payload.FirstTokenMs)
 }
 
 func TestSubsiteAgentProxy_OpenAIOAuthChatCompletionsUseCodexResponsesUpstream(t *testing.T) {

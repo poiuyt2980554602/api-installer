@@ -32,6 +32,7 @@ import (
 )
 
 const maxBufferedUpstreamBody = 64 << 20
+const maxSubsiteSSELineSize = 4 << 20
 const subsiteCodexCLIUserAgent = "codex_cli_rs/0.125.0"
 
 type proxyResult struct {
@@ -158,19 +159,35 @@ func (s *Server) proxyOpenAIChatCompletionsViaResponses(c *gin.Context, authoriz
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	responseBody, wroteResponse, metrics, err := streamOrBufferResponse(c, resp)
-	if err != nil {
-		return nil, err
-	}
+	metrics := &responseCaptureMetrics{}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		responseBody, readErr := readUpstreamBodyWithMetrics(resp.Body, resp.Header.Get("Content-Type"), metrics)
+		if readErr != nil {
+			return nil, fmt.Errorf("read upstream error response: %w", readErr)
+		}
 		return nil, newUpstreamError(resp.StatusCode, resp.Header.Get("Content-Type"), responseBody)
 	}
 
-	convertedBody, convertedContentType, convertErr := convertResponsesBodyToChatCompletions(c, responseBody, originalModel, chatReq.Stream)
-	if convertErr != nil {
-		return nil, convertErr
+	copyResponseHeaders(c.Writer.Header(), resp.Header)
+	c.Status(resp.StatusCode)
+
+	var responseBody []byte
+	var wroteResponse bool
+	if isSSEContentType(resp.Header.Get("Content-Type")) {
+		responseBody, err = streamResponsesSSEAsChatCompletions(c, resp, originalModel, metrics)
+		wroteResponse = true
+	} else {
+		responseBody, err = readUpstreamBodyWithMetrics(resp.Body, resp.Header.Get("Content-Type"), metrics)
 	}
+	if err != nil {
+		return nil, err
+	}
+
 	if !wroteResponse {
+		convertedBody, convertedContentType, convertErr := convertResponsesBodyToChatCompletions(c, responseBody, originalModel, chatReq.Stream)
+		if convertErr != nil {
+			return nil, convertErr
+		}
 		c.Data(resp.StatusCode, convertedContentType, convertedBody)
 	}
 
@@ -179,6 +196,57 @@ func (s *Server) proxyOpenAIChatCompletionsViaResponses(c *gin.Context, authoriz
 		return nil, fmt.Errorf("enqueue usage before response: %w", err)
 	}
 	return &proxyResult{UpstreamEndpoint: "/v1/responses"}, nil
+}
+
+func streamResponsesSSEAsChatCompletions(c *gin.Context, resp *http.Response, originalModel string, metrics *responseCaptureMetrics) ([]byte, error) {
+	prepareSSEDownstream(c, "text/event-stream")
+	startedAt := time.Now()
+	state := apicompat.NewResponsesEventToChatState()
+	state.Model = originalModel
+	var usageCapture bytes.Buffer
+
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 0, 64*1024), maxSubsiteSSELineSize)
+	for scanner.Scan() {
+		line := scanner.Text()
+		captureSSEUsageLine([]byte(line), &usageCapture, startedAt, metrics)
+		data, ok := extractSSEDataLine(line)
+		if !ok || data == "" || data == "[DONE]" {
+			continue
+		}
+		var event apicompat.ResponsesStreamEvent
+		if err := json.Unmarshal([]byte(data), &event); err != nil {
+			return usageCapture.Bytes(), fmt.Errorf("parse responses sse event: %w", err)
+		}
+		for _, chunk := range apicompat.ResponsesEventToChatChunks(&event, state) {
+			sse, err := apicompat.ChatChunkToSSE(chunk)
+			if err != nil {
+				return usageCapture.Bytes(), fmt.Errorf("marshal chat chunk: %w", err)
+			}
+			if _, err := c.Writer.WriteString(sse); err != nil {
+				return usageCapture.Bytes(), err
+			}
+			c.Writer.Flush()
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return usageCapture.Bytes(), fmt.Errorf("scan responses sse: %w", err)
+	}
+	for _, chunk := range apicompat.FinalizeResponsesChatStream(state) {
+		sse, err := apicompat.ChatChunkToSSE(chunk)
+		if err != nil {
+			return usageCapture.Bytes(), fmt.Errorf("finalize chat chunk: %w", err)
+		}
+		if _, err := c.Writer.WriteString(sse); err != nil {
+			return usageCapture.Bytes(), err
+		}
+		c.Writer.Flush()
+	}
+	if _, err := c.Writer.WriteString("data: [DONE]\n\n"); err != nil {
+		return usageCapture.Bytes(), err
+	}
+	c.Writer.Flush()
+	return usageCapture.Bytes(), nil
 }
 
 func buildOpenAIResponsesRequest(c *gin.Context, authorization *service.AuthorizeSubsiteResponse, account *service.Account, body []byte) (*http.Request, error) {
@@ -514,6 +582,13 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool, 
 	}
 	c.Status(resp.StatusCode)
 	metrics := &responseCaptureMetrics{}
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 && isSSEContentType(contentType) {
+		body, err := streamRawSSEUpstreamResponse(c, resp.Body, contentType, metrics)
+		if err != nil {
+			return body, true, metrics, fmt.Errorf("stream upstream response: %w", err)
+		}
+		return body, true, metrics, nil
+	}
 	body, err := readUpstreamBodyWithMetrics(resp.Body, contentType, metrics)
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("read upstream response: %w", err)
@@ -522,6 +597,84 @@ func streamOrBufferResponse(c *gin.Context, resp *http.Response) ([]byte, bool, 
 		return body, false, metrics, nil
 	}
 	return body, false, metrics, nil
+}
+
+func streamRawSSEUpstreamResponse(c *gin.Context, reader io.Reader, contentType string, metrics *responseCaptureMetrics) ([]byte, error) {
+	prepareSSEDownstream(c, contentType)
+	startedAt := time.Now()
+	var usageCapture bytes.Buffer
+	var pending []byte
+	chunk := make([]byte, 32*1024)
+	for {
+		n, readErr := reader.Read(chunk)
+		if n > 0 {
+			part := chunk[:n]
+			if _, writeErr := c.Writer.Write(part); writeErr != nil {
+				return usageCapture.Bytes(), writeErr
+			}
+			c.Writer.Flush()
+			pending = append(pending, part...)
+			pending = captureSSEUsageLines(pending, &usageCapture, startedAt, metrics)
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				break
+			}
+			return usageCapture.Bytes(), readErr
+		}
+	}
+	if len(pending) > 0 {
+		captureSSEUsageLine(bytes.TrimRight(pending, "\r"), &usageCapture, startedAt, metrics)
+	}
+	return usageCapture.Bytes(), nil
+}
+
+func prepareSSEDownstream(c *gin.Context, contentType string) {
+	if c == nil {
+		return
+	}
+	header := c.Writer.Header()
+	if strings.TrimSpace(contentType) == "" {
+		contentType = "text/event-stream"
+	}
+	header.Set("Content-Type", contentType)
+	header.Set("Cache-Control", "no-cache")
+	header.Set("X-Accel-Buffering", "no")
+	header.Del("Content-Length")
+	c.Writer.WriteHeaderNow()
+	c.Writer.Flush()
+}
+
+func captureSSEUsageLines(pending []byte, usageCapture *bytes.Buffer, startedAt time.Time, metrics *responseCaptureMetrics) []byte {
+	for {
+		idx := bytes.IndexByte(pending, '\n')
+		if idx < 0 {
+			return pending
+		}
+		line := bytes.TrimRight(pending[:idx], "\r")
+		captureSSEUsageLine(line, usageCapture, startedAt, metrics)
+		pending = pending[idx+1:]
+	}
+}
+
+func captureSSEUsageLine(line []byte, usageCapture *bytes.Buffer, startedAt time.Time, metrics *responseCaptureMetrics) {
+	_ = observeSSELine(line, startedAt, metrics)
+	if usageCapture == nil {
+		return
+	}
+	data, ok := extractSSEDataLine(string(line))
+	if !ok || data == "" || data == "[DONE]" || !gjson.Valid(data) {
+		return
+	}
+	payload := []byte(data)
+	if !ssePayloadHasUsage(payload) {
+		return
+	}
+	if usageCapture.Len()+len(line)+2 > maxBufferedUpstreamBody {
+		return
+	}
+	_, _ = usageCapture.Write(line)
+	_, _ = usageCapture.WriteString("\n\n")
 }
 
 func writeBufferedResponse(c *gin.Context, resp *http.Response, body []byte) {
@@ -1094,6 +1247,20 @@ func ssePayloadHasToken(payload []byte) bool {
 	}
 	if strings.TrimSpace(gjson.GetBytes(payload, "candidates.0.content.parts.0.text").String()) != "" {
 		return true
+	}
+	return false
+}
+
+func ssePayloadHasUsage(payload []byte) bool {
+	for _, path := range []string{
+		"usage",
+		"response.usage",
+		"message.usage",
+		"usageMetadata",
+	} {
+		if gjson.GetBytes(payload, path).Exists() {
+			return true
+		}
 	}
 	return false
 }
