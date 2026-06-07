@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.29.2"
+        default: "1.0.29"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -15,6 +15,10 @@ on:
         description: Upstream Pixel source tag or branch
         required: true
         default: "codex/pixel-1.0.27-401-fix-test"
+      release_flavor:
+        description: Release flavor: official or forwarder
+        required: true
+        default: "official"
   push:
     tags:
       - "v*-pixel"
@@ -27,9 +31,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29.2' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'codex/pixel-1.0.27-401-fix-test' }}
+      RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
     steps:
       - name: Download installer repo
         run: |
@@ -41,6 +46,10 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
+          release_flavor="official"
+          if printf '%s\n' "${tag}" | grep -q -- '-forwarder-pixel$'; then
+            release_flavor="forwarder"
+          fi
           version="${version%-forwarder-pixel}"
           version="${version%-pixel}"
           source_version="${version}"
@@ -53,6 +62,7 @@ jobs:
           fi
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
           echo "PIXEL_SOURCE_VERSION=${source_version}" >> "$GITHUB_ENV"
+          echo "RELEASE_FLAVOR=${release_flavor}" >> "$GITHUB_ENV"
 
       - name: Download Pixel source
         run: |
@@ -69,6 +79,10 @@ jobs:
       - name: Apply Pixel compatibility patches and overlays
         run: |
           set -euo pipefail
+          if [ "${RELEASE_FLAVOR}" = "official" ]; then
+            echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
+            exit 0
+          fi
           overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
           if [ -f "$patch_file" ]; then
@@ -180,17 +194,25 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="v${PIXEL_VERSION}-forwarder-pixel"
+          tag_suffix="pixel"
+          release_title="Pixel ${PIXEL_VERSION} official binaries"
+          release_note="without custom patches or overlays"
+          if [ "${RELEASE_FLAVOR}" = "forwarder" ]; then
+            tag_suffix="forwarder-pixel"
+            release_title="Pixel ${PIXEL_VERSION} Sub2API forwarder binaries"
+            release_note="with the subsite forwarder patch/overlay"
+          fi
+          tag="v${PIXEL_VERSION}-${tag_suffix}"
           body_file="$(mktemp)"
           cat > "$body_file" <<EOF
-          Prebuilt Sub2API-compatible binaries built from \`${PIXEL_SOURCE_REPO}\` source \`${PIXEL_SOURCE_VERSION}\` with the subsite forwarder patch/overlay. Published as \`${PIXEL_VERSION}\` for this custom forwarder release.
+          Prebuilt Sub2API-compatible binaries built from \`${PIXEL_SOURCE_REPO}\` source \`${PIXEL_SOURCE_VERSION}\` ${release_note}. Published as \`${PIXEL_VERSION}\`.
 
           Install:
           \`\`\`bash
           curl -sSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/deploy/install.sh | sudo bash
           \`\`\`
           EOF
-          python3 - "$tag" "Pixel ${PIXEL_VERSION} Sub2API forwarder binaries" "$body_file" dist/*.tar.gz dist/checksums.txt <<'PY'
+          python3 - "$tag" "$release_title" "$body_file" dist/*.tar.gz dist/checksums.txt <<'PY'
           import json
           import mimetypes
           import os

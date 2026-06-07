@@ -14,8 +14,8 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.0.29.2}"
-RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-forwarder-pixel}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.0.29}"
+RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
 
 APP_NAME="sub2api"
 SERVICE_NAME="sub2api"
@@ -26,8 +26,6 @@ SERVICE_FILE="/etc/systemd/system/sub2api.service"
 
 SERVER_HOST="${SERVER_HOST:-0.0.0.0}"
 SERVER_PORT="${SERVER_PORT:-8080}"
-SUBSITE_FORWARD_MODE="${SUBSITE_FORWARD_MODE:-forward}"
-SUBSITE_FORWARD_LOCAL_FALLBACK="${SUBSITE_FORWARD_LOCAL_FALLBACK:-true}"
 FORCE_YES="${FORCE_YES:-false}"
 PURGE_CONFIG="${PURGE_CONFIG:-false}"
 SERVER_CONFIGURED="${SERVER_CONFIGURED:-false}"
@@ -124,15 +122,12 @@ Options:
   -v, --version VER   Install Pixel version, default ${PIXEL_VERSION}
   --host HOST         Server listen address, default ${SERVER_HOST}
   --port PORT         Server port, default ${SERVER_PORT}
-  --forward-mode MODE Subsite routing mode: forward, local, or direct. Default ${SUBSITE_FORWARD_MODE}
 
 Environment overrides:
   RELEASE_REPO=${RELEASE_REPO}
   RELEASE_TAG=${RELEASE_TAG}
   SERVER_HOST=${SERVER_HOST}
   SERVER_PORT=${SERVER_PORT}
-  SUBSITE_FORWARD_MODE=${SUBSITE_FORWARD_MODE}
-  SUBSITE_FORWARD_LOCAL_FALLBACK=${SUBSITE_FORWARD_LOCAL_FALLBACK}
 EOF
 }
 
@@ -280,16 +275,9 @@ install_files() {
     print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
-verify_forwarder_binary() {
+verify_binary() {
     local binary_path="${INSTALL_DIR}/${APP_NAME}"
     local version_output=""
-
-    if ! binary_contains "$binary_path" "SUBSITE_FORWARD_NO_CANDIDATE"; then
-        print_error "Installed binary does not contain the Subsite Relay module."
-        print_error "Refusing to start an incomplete forwarder package."
-        exit 1
-    fi
-    print_success "Subsite Relay capability verified"
 
     version_output="$("$binary_path" --version 2>&1 || true)"
     if printf '%s' "$version_output" | grep -q "Sub2API ${PIXEL_VERSION}"; then
@@ -330,8 +318,6 @@ ReadWritePaths=${INSTALL_DIR}
 Environment=GIN_MODE=release
 Environment=SERVER_HOST=${SERVER_HOST}
 Environment=SERVER_PORT=${SERVER_PORT}
-Environment=SUBSITE_FORWARD_MODE=${SUBSITE_FORWARD_MODE}
-Environment=SUBSITE_FORWARD_LOCAL_FALLBACK=${SUBSITE_FORWARD_LOCAL_FALLBACK}
 
 [Install]
 WantedBy=multi-user.target
@@ -377,7 +363,6 @@ Version:        Pixel ${PIXEL_VERSION}
 Install dir:    ${INSTALL_DIR}
 Config dir:     ${CONFIG_DIR}
 Listen address: ${SERVER_HOST}:${SERVER_PORT}
-Subsite mode:   ${SUBSITE_FORWARD_MODE}
 
 Open the setup page:
   http://${display_host}:${SERVER_PORT}
@@ -397,7 +382,7 @@ do_install() {
     download_and_extract
     create_user_if_needed
     install_files
-    verify_forwarder_binary
+    verify_binary
     install_service
     start_service
     print_completion
@@ -459,7 +444,7 @@ main() {
                     exit 1
                 fi
                 PIXEL_VERSION="${2#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
                 shift 2
                 ;;
             --host)
@@ -498,22 +483,10 @@ main() {
                 SERVER_CONFIGURED="true"
                 shift
                 ;;
-            --forward-mode)
-                if [ -z "${2:-}" ]; then
-                    print_error "--forward-mode requires a value: forward, local, or direct"
-                    exit 1
-                fi
-                SUBSITE_FORWARD_MODE="$2"
-                shift 2
-                ;;
-            --forward-mode=*)
-                SUBSITE_FORWARD_MODE="${1#*=}"
-                shift
-                ;;
             --version=*)
                 PIXEL_VERSION="${1#*=}"
                 PIXEL_VERSION="${PIXEL_VERSION#v}"
-                RELEASE_TAG="v${PIXEL_VERSION}-forwarder-pixel"
+                RELEASE_TAG="v${PIXEL_VERSION}-pixel"
                 shift
                 ;;
             -h|--help)
