@@ -79,11 +79,17 @@ jobs:
       - name: Apply Pixel compatibility patches and overlays
         run: |
           set -euo pipefail
+          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           if [ "${RELEASE_FLAVOR}" = "official" ]; then
-            echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
+            official_overlay_dir="overlays/official_${overlay_key}"
+            if [ -d "$official_overlay_dir" ]; then
+              echo "Using upstream ${PIXEL_SOURCE_VERSION} with official overlay official_${overlay_key}."
+              cp -a "${official_overlay_dir}/." pixel-src/
+            else
+              echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
+            fi
             exit 0
           fi
-          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
           if [ -f "$patch_file" ]; then
             git apply --directory=pixel-src "$patch_file"
