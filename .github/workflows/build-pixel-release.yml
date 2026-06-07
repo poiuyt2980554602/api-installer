@@ -16,7 +16,7 @@ on:
         required: true
         default: "codex/pixel-1.0.27-401-fix-test"
       release_flavor:
-        description: Release flavor: official or forwarder
+        description: "Release flavor: official or forwarder"
         required: true
         default: "official"
   push:
