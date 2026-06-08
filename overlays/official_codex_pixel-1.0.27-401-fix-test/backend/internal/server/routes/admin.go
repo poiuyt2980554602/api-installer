@@ -510,6 +510,8 @@ func registerProxyAffinityRoutes(admin *gin.RouterGroup, h *handler.Handlers) {
 		affinity.PUT("/settings", h.Admin.ProxyAffinity.UpdateSettings)
 		affinity.GET("/overview", h.Admin.ProxyAffinity.GetOverview)
 		affinity.POST("/assign", h.Admin.ProxyAffinity.Assign)
+		affinity.POST("/bind", h.Admin.ProxyAffinity.BindAccount)
+		affinity.POST("/release", h.Admin.ProxyAffinity.ReleaseAccount)
 	}
 }
 

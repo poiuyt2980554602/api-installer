@@ -17,10 +17,16 @@ import (
 const (
 	SettingKeyProxyAffinityConfig    = "proxy_affinity_config"
 	SettingKeyProxyAffinityLastRunAt = "proxy_affinity_last_run_at"
+	SettingKeyProxyAffinityEvents    = "proxy_affinity_events"
 
 	proxyAffinityDefaultScanIntervalMinutes = 5
 	proxyAffinityDefaultBatchSize           = 100
 	proxyAffinityMaxBatchSize               = 1000
+	proxyAffinityDefaultMaxEvents           = 200
+	proxyAffinityMaxStoredEvents            = 500
+
+	proxyAffinityStrategyLeastLoaded         = "least_loaded"
+	proxyAffinityStrategyWeightedLeastLoaded = "weighted_least_loaded"
 
 	proxyAffinityExtraSource        = "proxy_affinity_source"
 	proxyAffinityExtraAssignedAt    = "proxy_affinity_assigned_at"
@@ -31,32 +37,40 @@ const (
 )
 
 type ProxyAffinitySettings struct {
-	Enabled                    bool     `json:"enabled"`
-	UserOwnedEnabled           bool     `json:"user_owned_enabled"`
-	AdminAccountsEnabled       bool     `json:"admin_accounts_enabled"`
-	PrivateAccountsEnabled     bool     `json:"private_accounts_enabled"`
-	PublicAccountsEnabled      bool     `json:"public_accounts_enabled"`
-	OnlyApprovedPublicAccounts bool     `json:"only_approved_public_accounts"`
-	IncludeAPIKeyAccounts      bool     `json:"include_api_key_accounts"`
-	IncludeOAuthAccounts       bool     `json:"include_oauth_accounts"`
-	MaxAccountsPerProxy        int64    `json:"max_accounts_per_proxy"`
-	BatchSize                  int      `json:"batch_size"`
-	ScanIntervalMinutes        int      `json:"scan_interval_minutes"`
-	Platforms                  []string `json:"platforms"`
-	AllowReassignWhenProxyDown bool     `json:"allow_reassign_when_proxy_down"`
-	ReleaseWhenAccountInactive bool     `json:"release_when_account_inactive"`
+	Enabled                    bool          `json:"enabled"`
+	UserOwnedEnabled           bool          `json:"user_owned_enabled"`
+	AdminAccountsEnabled       bool          `json:"admin_accounts_enabled"`
+	PrivateAccountsEnabled     bool          `json:"private_accounts_enabled"`
+	PublicAccountsEnabled      bool          `json:"public_accounts_enabled"`
+	OnlyApprovedPublicAccounts bool          `json:"only_approved_public_accounts"`
+	IncludeAPIKeyAccounts      bool          `json:"include_api_key_accounts"`
+	IncludeOAuthAccounts       bool          `json:"include_oauth_accounts"`
+	MaxAccountsPerProxy        int64         `json:"max_accounts_per_proxy"`
+	BatchSize                  int           `json:"batch_size"`
+	ScanIntervalMinutes        int           `json:"scan_interval_minutes"`
+	Platforms                  []string      `json:"platforms"`
+	AllowReassignWhenProxyDown bool          `json:"allow_reassign_when_proxy_down"`
+	ReleaseWhenAccountInactive bool          `json:"release_when_account_inactive"`
+	Strategy                   string        `json:"strategy"`
+	MaxStoredEvents            int           `json:"max_stored_events"`
+	PausedProxyIDs             []int64       `json:"paused_proxy_ids"`
+	ProxyWeights               map[int64]int `json:"proxy_weights"`
 }
 
 type ProxyAffinityOverview struct {
-	Settings                   ProxyAffinitySettings    `json:"settings"`
-	TotalProxies               int                      `json:"total_proxies"`
-	AvailableProxies           int                      `json:"available_proxies"`
-	FullProxies                int                      `json:"full_proxies"`
-	BoundAccounts              int64                    `json:"bound_accounts"`
-	UnassignedEligibleAccounts int64                    `json:"unassigned_eligible_accounts"`
-	SkippedAccounts            int64                    `json:"skipped_accounts"`
-	AverageLoad                float64                  `json:"average_load"`
-	ProxyLoads                 []ProxyAffinityProxyLoad `json:"proxy_loads"`
+	Settings                   ProxyAffinitySettings         `json:"settings"`
+	TotalProxies               int                           `json:"total_proxies"`
+	AvailableProxies           int                           `json:"available_proxies"`
+	FullProxies                int                           `json:"full_proxies"`
+	BoundAccounts              int64                         `json:"bound_accounts"`
+	UnassignedEligibleAccounts int64                         `json:"unassigned_eligible_accounts"`
+	SkippedAccounts            int64                         `json:"skipped_accounts"`
+	AverageLoad                float64                       `json:"average_load"`
+	ProxyLoads                 []ProxyAffinityProxyLoad      `json:"proxy_loads"`
+	BoundAccountDetails        []ProxyAffinityAccountBinding `json:"bound_account_details"`
+	PendingAccounts            []ProxyAffinityPendingAccount `json:"pending_accounts"`
+	RecentEvents               []ProxyAffinityEvent          `json:"recent_events"`
+	LastRunAt                  string                        `json:"last_run_at,omitempty"`
 }
 
 type ProxyAffinityProxyLoad struct {
@@ -75,6 +89,10 @@ type ProxyAffinityProxyLoad struct {
 	CountryCode   string  `json:"country_code,omitempty"`
 	QualityStatus string  `json:"quality_status,omitempty"`
 	QualityGrade  string  `json:"quality_grade,omitempty"`
+	Paused        bool    `json:"paused"`
+	Weight        int     `json:"weight"`
+	EffectiveLoad float64 `json:"effective_load"`
+	Reason        string  `json:"reason,omitempty"`
 }
 
 type ProxyAffinityCandidate struct {
@@ -97,10 +115,55 @@ type ProxyAffinityAssignment struct {
 	DryRun    bool                   `json:"dry_run"`
 }
 
+type ProxyAffinityAccountBinding struct {
+	ProxyAffinityCandidate
+	ProxyID      int64  `json:"proxy_id"`
+	ProxyName    string `json:"proxy_name,omitempty"`
+	ProxyHost    string `json:"proxy_host,omitempty"`
+	ProxyPort    int    `json:"proxy_port,omitempty"`
+	AssignedAt   string `json:"assigned_at,omitempty"`
+	AssignedBy   string `json:"assigned_by,omitempty"`
+	AssignReason string `json:"assign_reason,omitempty"`
+	HealthStatus string `json:"health_status"`
+	HealthReason string `json:"health_reason,omitempty"`
+}
+
+type ProxyAffinityPendingAccount struct {
+	ProxyAffinityCandidate
+	Reason string `json:"reason"`
+}
+
+type ProxyAffinityEvent struct {
+	ID          string         `json:"id"`
+	OccurredAt  string         `json:"occurred_at"`
+	Source      string         `json:"source"`
+	Action      string         `json:"action"`
+	AccountID   int64          `json:"account_id,omitempty"`
+	AccountName string         `json:"account_name,omitempty"`
+	ProxyID     int64          `json:"proxy_id,omitempty"`
+	ProxyName   string         `json:"proxy_name,omitempty"`
+	Reason      string         `json:"reason,omitempty"`
+	DryRun      bool           `json:"dry_run"`
+	Details     map[string]any `json:"details,omitempty"`
+}
+
 type ProxyAffinityAssignRequest struct {
 	DryRun    bool     `json:"dry_run"`
 	Limit     int      `json:"limit"`
 	Platforms []string `json:"platforms"`
+}
+
+type ProxyAffinityBindRequest struct {
+	AccountID int64  `json:"account_id"`
+	ProxyID   int64  `json:"proxy_id"`
+	DryRun    bool   `json:"dry_run"`
+	Reason    string `json:"reason"`
+}
+
+type ProxyAffinityReleaseRequest struct {
+	AccountID int64  `json:"account_id"`
+	DryRun    bool   `json:"dry_run"`
+	Reason    string `json:"reason"`
 }
 
 type ProxyAffinityAssignResult struct {
@@ -175,6 +238,10 @@ func DefaultProxyAffinitySettings() ProxyAffinitySettings {
 		Platforms:                  []string{PlatformOpenAI, PlatformAnthropic, PlatformGemini, PlatformAntigravity},
 		AllowReassignWhenProxyDown: false,
 		ReleaseWhenAccountInactive: false,
+		Strategy:                   proxyAffinityStrategyWeightedLeastLoaded,
+		MaxStoredEvents:            proxyAffinityDefaultMaxEvents,
+		PausedProxyIDs:             []int64{},
+		ProxyWeights:               map[int64]int{},
 	}
 }
 
@@ -224,18 +291,33 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 	if err != nil {
 		return nil, fmt.Errorf("list active accounts: %w", err)
 	}
+	proxyByID := proxyAffinityProxyLoadMap(proxyLoads)
 
 	var bound, eligible, skipped int64
+	boundDetails := make([]ProxyAffinityAccountBinding, 0)
+	pendingAccounts := make([]ProxyAffinityPendingAccount, 0)
 	for i := range accounts {
 		account := &accounts[i]
 		if account.ProxyID != nil {
 			bound++
+			boundDetails = append(boundDetails, s.accountBindingFromAccount(account, proxyByID, settings))
 			continue
 		}
-		if ok, _ := s.isEligibleAccount(account, settings); ok {
+		candidate := proxyAffinityCandidateFromAccount(account)
+		if ok, reason := s.isEligibleAccount(account, settings); ok {
 			eligible++
+			pendingAccounts = append(pendingAccounts, ProxyAffinityPendingAccount{
+				ProxyAffinityCandidate: candidate,
+				Reason:                 "符合规则，等待自动或手动分配",
+			})
 		} else {
 			skipped++
+			if len(pendingAccounts) < 200 {
+				pendingAccounts = append(pendingAccounts, ProxyAffinityPendingAccount{
+					ProxyAffinityCandidate: candidate,
+					Reason:                 reason,
+				})
+			}
 		}
 	}
 
@@ -255,6 +337,11 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 	if len(proxyLoads) > 0 {
 		averageLoad = float64(totalLoad) / float64(len(proxyLoads))
 	}
+	events, _ := s.getRecentEvents(ctx)
+	lastRunAt := ""
+	if raw, err := s.settingRepo.GetValue(ctx, SettingKeyProxyAffinityLastRunAt); err == nil {
+		lastRunAt = strings.TrimSpace(raw)
+	}
 
 	return &ProxyAffinityOverview{
 		Settings:                   settings,
@@ -266,6 +353,10 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 		SkippedAccounts:            skipped,
 		AverageLoad:                averageLoad,
 		ProxyLoads:                 proxyLoads,
+		BoundAccountDetails:        boundDetails,
+		PendingAccounts:            pendingAccounts,
+		RecentEvents:               events,
+		LastRunAt:                  lastRunAt,
 	}, nil
 }
 
@@ -322,6 +413,9 @@ func (s *ProxyAffinityService) AssignUnassigned(ctx context.Context, req ProxyAf
 	}
 
 	if len(assignable) == 0 {
+		if len(result.Assignments) > 0 && !req.DryRun {
+			_ = s.appendAssignmentEvents(ctx, result.Assignments, "auto")
+		}
 		return result, nil
 	}
 
@@ -354,7 +448,7 @@ func (s *ProxyAffinityService) AssignUnassigned(ctx context.Context, req ProxyAf
 			continue
 		}
 
-		chosen, ok := chooseProxyAffinityTarget(assignable)
+		chosen, ok := chooseProxyAffinityTarget(assignable, settings)
 		if !ok {
 			result.Skipped++
 			result.Assignments = append(result.Assignments, ProxyAffinityAssignment{
@@ -371,7 +465,7 @@ func (s *ProxyAffinityService) AssignUnassigned(ctx context.Context, req ProxyAf
 			ProxyID:   chosen.ProxyID,
 			ProxyName: chosen.Name,
 			Action:    "assigned",
-			Reason:    "选择当前账号数最少的可用代理",
+			Reason:    proxyAffinityAssignmentReason(settings),
 			DryRun:    req.DryRun,
 		}
 		if !req.DryRun {
@@ -395,7 +489,99 @@ func (s *ProxyAffinityService) AssignUnassigned(ctx context.Context, req ProxyAf
 		}
 	}
 
+	if len(result.Assignments) > 0 && !req.DryRun {
+		_ = s.appendAssignmentEvents(ctx, result.Assignments, "auto")
+	}
 	return result, nil
+}
+
+func (s *ProxyAffinityService) BindAccount(ctx context.Context, req ProxyAffinityBindRequest) (*ProxyAffinityAssignment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.AccountID <= 0 {
+		return nil, infraerrors.BadRequest("PROXY_AFFINITY_ACCOUNT_REQUIRED", "account_id is required")
+	}
+	if req.ProxyID <= 0 {
+		return nil, infraerrors.BadRequest("PROXY_AFFINITY_PROXY_REQUIRED", "proxy_id is required")
+	}
+	account, err := s.accountRepo.GetByID(ctx, req.AccountID)
+	if err != nil {
+		return nil, fmt.Errorf("get account for proxy affinity bind: %w", err)
+	}
+	proxy, err := s.proxyRepo.GetByID(ctx, req.ProxyID)
+	if err != nil {
+		return nil, fmt.Errorf("get proxy for proxy affinity bind: %w", err)
+	}
+	assignment := &ProxyAffinityAssignment{
+		Candidate: proxyAffinityCandidateFromAccount(account),
+		ProxyID:   proxy.ID,
+		ProxyName: proxy.Name,
+		Action:    "assigned",
+		Reason:    strings.TrimSpace(req.Reason),
+		DryRun:    req.DryRun,
+	}
+	if assignment.Reason == "" {
+		assignment.Reason = "管理员手动绑定代理"
+	}
+	if account.ProxyID != nil {
+		assignment.Action = "skipped"
+		assignment.ProxyID = *account.ProxyID
+		assignment.Reason = "账号已经绑定代理，请先释放原绑定"
+		return assignment, nil
+	}
+	if proxy.Status != StatusActive {
+		assignment.Action = "skipped"
+		assignment.Reason = "代理状态不是 active，不能绑定"
+		return assignment, nil
+	}
+	if !req.DryRun {
+		if err := s.assignAccountToProxy(ctx, account, proxy.ID, "manual_bind"); err != nil {
+			assignment.Action = "failed"
+			assignment.Reason = err.Error()
+		}
+		_ = s.appendAssignmentEvents(ctx, []ProxyAffinityAssignment{*assignment}, "manual")
+	}
+	return assignment, nil
+}
+
+func (s *ProxyAffinityService) ReleaseAccount(ctx context.Context, req ProxyAffinityReleaseRequest) (*ProxyAffinityAssignment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.AccountID <= 0 {
+		return nil, infraerrors.BadRequest("PROXY_AFFINITY_ACCOUNT_REQUIRED", "account_id is required")
+	}
+	account, err := s.accountRepo.GetByID(ctx, req.AccountID)
+	if err != nil {
+		return nil, fmt.Errorf("get account for proxy affinity release: %w", err)
+	}
+	assignment := &ProxyAffinityAssignment{
+		Candidate: proxyAffinityCandidateFromAccount(account),
+		Action:    "released",
+		Reason:    strings.TrimSpace(req.Reason),
+		DryRun:    req.DryRun,
+	}
+	if assignment.Reason == "" {
+		assignment.Reason = "管理员手动释放代理绑定"
+	}
+	if account.ProxyID == nil {
+		assignment.Action = "skipped"
+		assignment.Reason = "账号当前没有代理绑定"
+		return assignment, nil
+	}
+	assignment.ProxyID = *account.ProxyID
+	if proxy, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && proxy != nil {
+		assignment.ProxyName = proxy.Name
+	}
+	if !req.DryRun {
+		if err := s.releaseAccountProxy(ctx, account, assignment.Reason); err != nil {
+			assignment.Action = "failed"
+			assignment.Reason = err.Error()
+		}
+		_ = s.appendAssignmentEvents(ctx, []ProxyAffinityAssignment{*assignment}, "manual")
+	}
+	return assignment, nil
 }
 
 func (s *ProxyAffinityService) maintenanceTick() {
@@ -441,8 +627,27 @@ func (s *ProxyAffinityService) loadProxyLoads(ctx context.Context, settings Prox
 	if err != nil {
 		return nil, fmt.Errorf("list active proxies: %w", err)
 	}
+	paused := proxyAffinityIDSet(settings.PausedProxyIDs)
 	out := make([]ProxyAffinityProxyLoad, 0, len(proxies))
 	for _, proxy := range proxies {
+		weight := settings.ProxyWeights[proxy.ID]
+		if weight <= 0 {
+			weight = 1
+		}
+		isPaused := false
+		if _, ok := paused[proxy.ID]; ok {
+			isPaused = true
+		}
+		assignable := proxy.Status == StatusActive && !isPaused && (settings.MaxAccountsPerProxy <= 0 || proxy.AccountCount < settings.MaxAccountsPerProxy)
+		reason := ""
+		switch {
+		case proxy.Status != StatusActive:
+			reason = "代理状态不是 active"
+		case isPaused:
+			reason = "代理已暂停自动分配"
+		case settings.MaxAccountsPerProxy > 0 && proxy.AccountCount >= settings.MaxAccountsPerProxy:
+			reason = "代理已达到账号上限"
+		}
 		load := ProxyAffinityProxyLoad{
 			ProxyID:       proxy.ID,
 			Name:          proxy.Name,
@@ -452,12 +657,16 @@ func (s *ProxyAffinityService) loadProxyLoads(ctx context.Context, settings Prox
 			Status:        proxy.Status,
 			AccountCount:  proxy.AccountCount,
 			MaxAccounts:   settings.MaxAccountsPerProxy,
-			Assignable:    proxy.Status == StatusActive && (settings.MaxAccountsPerProxy <= 0 || proxy.AccountCount < settings.MaxAccountsPerProxy),
+			Assignable:    assignable,
 			IPAddress:     proxy.IPAddress,
 			Country:       proxy.Country,
 			CountryCode:   proxy.CountryCode,
 			QualityStatus: proxy.QualityStatus,
 			QualityGrade:  proxy.QualityGrade,
+			Paused:        isPaused,
+			Weight:        weight,
+			EffectiveLoad: float64(proxy.AccountCount) / float64(weight),
+			Reason:        reason,
 		}
 		if settings.MaxAccountsPerProxy > 0 {
 			load.LoadPercent = float64(proxy.AccountCount) * 100 / float64(settings.MaxAccountsPerProxy)
@@ -465,10 +674,10 @@ func (s *ProxyAffinityService) loadProxyLoads(ctx context.Context, settings Prox
 		out = append(out, load)
 	}
 	sort.SliceStable(out, func(i, j int) bool {
-		if out[i].AccountCount == out[j].AccountCount {
+		if out[i].EffectiveLoad == out[j].EffectiveLoad {
 			return out[i].ProxyID < out[j].ProxyID
 		}
-		return out[i].AccountCount < out[j].AccountCount
+		return out[i].EffectiveLoad < out[j].EffectiveLoad
 	})
 	return out, nil
 }
@@ -621,6 +830,9 @@ func (s *ProxyAffinityService) isEligibleBoundAccount(account *Account, settings
 	if !account.Schedulable {
 		return false, "账号已被手动设为不可调度，释放代理绑定"
 	}
+	if account.AutoPauseOnExpired && account.ExpiresAt != nil && !time.Now().Before(*account.ExpiresAt) {
+		return false, "账号已过期并自动暂停，释放代理绑定"
+	}
 	if !proxyAffinityPlatformAllowed(account.Platform, settings.Platforms) {
 		return false, "账号平台不在代理亲和调度范围内，释放代理绑定"
 	}
@@ -705,7 +917,43 @@ func (s *ProxyAffinityService) releaseAccountProxy(ctx context.Context, account 
 	return nil
 }
 
-func chooseProxyAffinityTarget(loads []ProxyAffinityProxyLoad) (ProxyAffinityProxyLoad, bool) {
+func (s *ProxyAffinityService) accountBindingFromAccount(account *Account, proxyByID map[int64]ProxyAffinityProxyLoad, settings ProxyAffinitySettings) ProxyAffinityAccountBinding {
+	binding := ProxyAffinityAccountBinding{
+		ProxyAffinityCandidate: proxyAffinityCandidateFromAccount(account),
+		HealthStatus:           "healthy",
+	}
+	if account == nil || account.ProxyID == nil {
+		return binding
+	}
+	binding.ProxyID = *account.ProxyID
+	if proxy, ok := proxyByID[*account.ProxyID]; ok {
+		binding.ProxyName = proxy.Name
+		binding.ProxyHost = proxy.Host
+		binding.ProxyPort = proxy.Port
+		if proxy.Status != StatusActive {
+			binding.HealthStatus = "proxy_down"
+			binding.HealthReason = "代理状态不是 active"
+		} else if proxy.Paused {
+			binding.HealthStatus = "proxy_paused"
+			binding.HealthReason = "代理已暂停自动分配，当前绑定仍会保持"
+		}
+	} else {
+		binding.HealthStatus = "proxy_missing"
+		binding.HealthReason = "绑定的代理不存在或不可用"
+	}
+	if ok, reason := s.isEligibleBoundAccount(account, settings); !ok {
+		binding.HealthStatus = "account_ineligible"
+		binding.HealthReason = reason
+	}
+	if account.Extra != nil {
+		binding.AssignedAt = stringFromAny(account.Extra[proxyAffinityExtraAssignedAt])
+		binding.AssignedBy = stringFromAny(account.Extra[proxyAffinityExtraSource])
+		binding.AssignReason = stringFromAny(account.Extra[proxyAffinityExtraReason])
+	}
+	return binding
+}
+
+func chooseProxyAffinityTarget(loads []ProxyAffinityProxyLoad, settings ProxyAffinitySettings) (ProxyAffinityProxyLoad, bool) {
 	candidates := make([]ProxyAffinityProxyLoad, 0, len(loads))
 	for _, load := range loads {
 		if load.Assignable {
@@ -716,12 +964,25 @@ func chooseProxyAffinityTarget(loads []ProxyAffinityProxyLoad) (ProxyAffinityPro
 		return ProxyAffinityProxyLoad{}, false
 	}
 	sort.SliceStable(candidates, func(i, j int) bool {
-		if candidates[i].AccountCount == candidates[j].AccountCount {
+		if settings.Strategy == proxyAffinityStrategyLeastLoaded {
+			if candidates[i].AccountCount == candidates[j].AccountCount {
+				return candidates[i].ProxyID < candidates[j].ProxyID
+			}
+			return candidates[i].AccountCount < candidates[j].AccountCount
+		}
+		if candidates[i].EffectiveLoad == candidates[j].EffectiveLoad {
 			return candidates[i].ProxyID < candidates[j].ProxyID
 		}
-		return candidates[i].AccountCount < candidates[j].AccountCount
+		return candidates[i].EffectiveLoad < candidates[j].EffectiveLoad
 	})
 	return candidates[0], true
+}
+
+func proxyAffinityAssignmentReason(settings ProxyAffinitySettings) string {
+	if settings.Strategy == proxyAffinityStrategyLeastLoaded {
+		return "选择当前账号数最少的可用代理"
+	}
+	return "按代理权重选择有效负载最低的可用代理"
 }
 
 func proxyAffinityCandidateFromAccount(account *Account) ProxyAffinityCandidate {
@@ -737,6 +998,103 @@ func proxyAffinityCandidateFromAccount(account *Account) ProxyAffinityCandidate 
 		ShareStatus:  NormalizeAccountShareStatus(account.ShareStatus),
 		AccountLevel: NormalizeAccountLevel(account.AccountLevel),
 		OwnerUserID:  account.OwnerUserID,
+	}
+}
+
+func (s *ProxyAffinityService) appendAssignmentEvents(ctx context.Context, assignments []ProxyAffinityAssignment, source string) error {
+	if len(assignments) == 0 {
+		return nil
+	}
+	events, err := s.getRecentEvents(ctx)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	for _, assignment := range assignments {
+		if assignment.DryRun {
+			continue
+		}
+		event := ProxyAffinityEvent{
+			ID:          fmt.Sprintf("%d-%d-%s", now.UnixNano(), assignment.Candidate.AccountID, assignment.Action),
+			OccurredAt:  now.Format(time.RFC3339),
+			Source:      source,
+			Action:      assignment.Action,
+			AccountID:   assignment.Candidate.AccountID,
+			AccountName: assignment.Candidate.AccountName,
+			ProxyID:     assignment.ProxyID,
+			ProxyName:   assignment.ProxyName,
+			Reason:      assignment.Reason,
+			DryRun:      assignment.DryRun,
+		}
+		events = append([]ProxyAffinityEvent{event}, events...)
+	}
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		settings = DefaultProxyAffinitySettings()
+	}
+	maxEvents := settings.MaxStoredEvents
+	if maxEvents <= 0 {
+		maxEvents = proxyAffinityDefaultMaxEvents
+	}
+	if maxEvents > proxyAffinityMaxStoredEvents {
+		maxEvents = proxyAffinityMaxStoredEvents
+	}
+	if len(events) > maxEvents {
+		events = events[:maxEvents]
+	}
+	data, err := json.Marshal(events)
+	if err != nil {
+		return fmt.Errorf("marshal proxy affinity events: %w", err)
+	}
+	return s.settingRepo.Set(ctx, SettingKeyProxyAffinityEvents, string(data))
+}
+
+func (s *ProxyAffinityService) getRecentEvents(ctx context.Context) ([]ProxyAffinityEvent, error) {
+	raw, err := s.settingRepo.GetValue(ctx, SettingKeyProxyAffinityEvents)
+	if err != nil {
+		if infraerrors.IsNotFound(err) {
+			return []ProxyAffinityEvent{}, nil
+		}
+		return nil, fmt.Errorf("get proxy affinity events: %w", err)
+	}
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return []ProxyAffinityEvent{}, nil
+	}
+	var events []ProxyAffinityEvent
+	if err := json.Unmarshal([]byte(raw), &events); err != nil {
+		slog.Warn("failed to parse proxy affinity events, clearing invalid cache", "error", err)
+		return []ProxyAffinityEvent{}, nil
+	}
+	return events, nil
+}
+
+func proxyAffinityProxyLoadMap(loads []ProxyAffinityProxyLoad) map[int64]ProxyAffinityProxyLoad {
+	out := make(map[int64]ProxyAffinityProxyLoad, len(loads))
+	for _, load := range loads {
+		out[load.ProxyID] = load
+	}
+	return out
+}
+
+func proxyAffinityIDSet(ids []int64) map[int64]struct{} {
+	out := make(map[int64]struct{}, len(ids))
+	for _, id := range ids {
+		if id > 0 {
+			out[id] = struct{}{}
+		}
+	}
+	return out
+}
+
+func stringFromAny(v any) string {
+	switch value := v.(type) {
+	case string:
+		return value
+	case fmt.Stringer:
+		return value.String()
+	default:
+		return ""
 	}
 }
 
@@ -756,11 +1114,59 @@ func normalizeProxyAffinitySettings(settings ProxyAffinitySettings) ProxyAffinit
 	if settings.MaxAccountsPerProxy < 0 {
 		settings.MaxAccountsPerProxy = 0
 	}
+	switch strings.TrimSpace(settings.Strategy) {
+	case proxyAffinityStrategyLeastLoaded, proxyAffinityStrategyWeightedLeastLoaded:
+		settings.Strategy = strings.TrimSpace(settings.Strategy)
+	default:
+		settings.Strategy = proxyAffinityStrategyWeightedLeastLoaded
+	}
+	if settings.MaxStoredEvents <= 0 {
+		settings.MaxStoredEvents = proxyAffinityDefaultMaxEvents
+	}
+	if settings.MaxStoredEvents > proxyAffinityMaxStoredEvents {
+		settings.MaxStoredEvents = proxyAffinityMaxStoredEvents
+	}
 	settings.Platforms = normalizeProxyAffinityPlatforms(settings.Platforms)
 	if len(settings.Platforms) == 0 {
 		settings.Platforms = DefaultProxyAffinitySettings().Platforms
 	}
+	settings.PausedProxyIDs = normalizeProxyAffinityIDs(settings.PausedProxyIDs)
+	settings.ProxyWeights = normalizeProxyAffinityWeights(settings.ProxyWeights)
 	return settings
+}
+
+func normalizeProxyAffinityIDs(ids []int64) []int64 {
+	seen := map[int64]struct{}{}
+	out := make([]int64, 0, len(ids))
+	for _, id := range ids {
+		if id <= 0 {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	return out
+}
+
+func normalizeProxyAffinityWeights(weights map[int64]int) map[int64]int {
+	out := map[int64]int{}
+	for id, weight := range weights {
+		if id <= 0 {
+			continue
+		}
+		if weight <= 0 {
+			continue
+		}
+		if weight > 100 {
+			weight = 100
+		}
+		out[id] = weight
+	}
+	return out
 }
 
 func normalizeProxyAffinityPlatforms(platforms []string) []string {

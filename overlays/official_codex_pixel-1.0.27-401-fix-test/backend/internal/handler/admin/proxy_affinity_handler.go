@@ -67,3 +67,41 @@ func (h *ProxyAffinityHandler) Assign(c *gin.Context) {
 	}
 	response.Success(c, result)
 }
+
+func (h *ProxyAffinityHandler) BindAccount(c *gin.Context) {
+	var req service.ProxyAffinityBindRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if raw := strings.TrimSpace(c.Query("dry_run")); raw != "" {
+		if dryRun, err := strconv.ParseBool(raw); err == nil {
+			req.DryRun = dryRun
+		}
+	}
+	result, err := h.proxyAffinityService.BindAccount(c.Request.Context(), req)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, result)
+}
+
+func (h *ProxyAffinityHandler) ReleaseAccount(c *gin.Context) {
+	var req service.ProxyAffinityReleaseRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if raw := strings.TrimSpace(c.Query("dry_run")); raw != "" {
+		if dryRun, err := strconv.ParseBool(raw); err == nil {
+			req.DryRun = dryRun
+		}
+	}
+	result, err := h.proxyAffinityService.ReleaseAccount(c.Request.Context(), req)
+	if err != nil {
+		response.ErrorFrom(c, err)
+		return
+	}
+	response.Success(c, result)
+}

@@ -104,6 +104,102 @@ func TestProxyAffinityDryRunReleaseDoesNotUpdateAccounts(t *testing.T) {
 	require.Equal(t, "released", result.Assignments[0].Action)
 }
 
+func TestProxyAffinityWeightedLeastLoadedUsesProxyWeight(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "private", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePrivate, ShareStatus: AccountShareStatusApproved},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{
+			{Proxy: Proxy{ID: 10, Name: "low-weight", Status: StatusActive}, AccountCount: 2},
+			{Proxy: Proxy{ID: 11, Name: "high-weight", Status: StatusActive}, AccountCount: 3},
+		},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.ProxyWeights = map[int64]int{10: 1, 11: 10}
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	result, err := svc.AssignUnassigned(ctx, ProxyAffinityAssignRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Assigned)
+	require.Len(t, accountRepo.updated, 1)
+	require.Equal(t, int64(11), *accountRepo.updated[0].ProxyID)
+}
+
+func TestProxyAffinityPausedProxyIsNotAssignable(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "private", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePrivate, ShareStatus: AccountShareStatusApproved},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{
+			{Proxy: Proxy{ID: 10, Name: "paused", Status: StatusActive}, AccountCount: 0},
+			{Proxy: Proxy{ID: 11, Name: "active", Status: StatusActive}, AccountCount: 5},
+		},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.PausedProxyIDs = []int64{10}
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	result, err := svc.AssignUnassigned(ctx, ProxyAffinityAssignRequest{Limit: 1})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Assigned)
+	require.Equal(t, int64(11), *accountRepo.updated[0].ProxyID)
+}
+
+func TestProxyAffinityReleaseDoesNotReleaseTemporaryRateLimitedAccount(t *testing.T) {
+	ctx := context.Background()
+	resetAt := time.Now().Add(time.Hour)
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "rate-limited", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePrivate, ShareStatus: AccountShareStatusApproved, ProxyID: ptrInt64(10), RateLimitResetAt: &resetAt},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{{Proxy: Proxy{ID: 10, Name: "proxy", Status: StatusActive}, AccountCount: 1}},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.ReleaseWhenAccountInactive = true
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	result, err := svc.AssignUnassigned(ctx, ProxyAffinityAssignRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, 0, result.Released)
+	require.Empty(t, accountRepo.updated)
+}
+
+func TestProxyAffinityManualBindAndRelease(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "private", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePrivate, ShareStatus: AccountShareStatusApproved},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{{Proxy: Proxy{ID: 10, Name: "proxy", Status: StatusActive}, AccountCount: 0}},
+	}, accountRepo)
+
+	bound, err := svc.BindAccount(ctx, ProxyAffinityBindRequest{AccountID: 1, ProxyID: 10})
+	require.NoError(t, err)
+	require.Equal(t, "assigned", bound.Action)
+	require.Len(t, accountRepo.updated, 1)
+	require.Equal(t, int64(10), *accountRepo.updated[0].ProxyID)
+
+	accountRepo.accounts[0].ProxyID = ptrInt64(10)
+	released, err := svc.ReleaseAccount(ctx, ProxyAffinityReleaseRequest{AccountID: 1})
+	require.NoError(t, err)
+	require.Equal(t, "released", released.Action)
+	require.Len(t, accountRepo.updated, 2)
+	require.Nil(t, accountRepo.updated[1].ProxyID)
+}
+
 func ptrInt64(v int64) *int64 {
 	return &v
 }

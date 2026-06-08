@@ -15,6 +15,10 @@ export interface ProxyAffinitySettings {
   platforms: string[]
   allow_reassign_when_proxy_down: boolean
   release_when_account_inactive: boolean
+  strategy: 'least_loaded' | 'weighted_least_loaded'
+  max_stored_events: number
+  paused_proxy_ids: number[]
+  proxy_weights: Record<number, number>
 }
 
 export interface ProxyAffinityProxyLoad {
@@ -33,6 +37,10 @@ export interface ProxyAffinityProxyLoad {
   country_code?: string
   quality_status?: string
   quality_grade?: string
+  paused: boolean
+  weight: number
+  effective_load: number
+  reason?: string
 }
 
 export interface ProxyAffinityOverview {
@@ -45,6 +53,10 @@ export interface ProxyAffinityOverview {
   skipped_accounts: number
   average_load: number
   proxy_loads: ProxyAffinityProxyLoad[]
+  bound_account_details: ProxyAffinityAccountBinding[]
+  pending_accounts: ProxyAffinityPendingAccount[]
+  recent_events: ProxyAffinityEvent[]
+  last_run_at?: string
 }
 
 export interface ProxyAffinityCandidate {
@@ -67,6 +79,36 @@ export interface ProxyAffinityAssignment {
   dry_run: boolean
 }
 
+export interface ProxyAffinityAccountBinding extends ProxyAffinityCandidate {
+  proxy_id: number
+  proxy_name?: string
+  proxy_host?: string
+  proxy_port?: number
+  assigned_at?: string
+  assigned_by?: string
+  assign_reason?: string
+  health_status: 'healthy' | 'proxy_down' | 'proxy_paused' | 'proxy_missing' | 'account_ineligible' | string
+  health_reason?: string
+}
+
+export interface ProxyAffinityPendingAccount extends ProxyAffinityCandidate {
+  reason: string
+}
+
+export interface ProxyAffinityEvent {
+  id: string
+  occurred_at: string
+  source: string
+  action: string
+  account_id?: number
+  account_name?: string
+  proxy_id?: number
+  proxy_name?: string
+  reason?: string
+  dry_run: boolean
+  details?: Record<string, unknown>
+}
+
 export interface ProxyAffinityAssignRequest {
   dry_run?: boolean
   limit?: number
@@ -80,6 +122,19 @@ export interface ProxyAffinityAssignResult {
   released: number
   skipped: number
   assignments: ProxyAffinityAssignment[]
+}
+
+export interface ProxyAffinityBindRequest {
+  account_id: number
+  proxy_id: number
+  dry_run?: boolean
+  reason?: string
+}
+
+export interface ProxyAffinityReleaseRequest {
+  account_id: number
+  dry_run?: boolean
+  reason?: string
 }
 
 export async function getSettings(): Promise<ProxyAffinitySettings> {
@@ -102,11 +157,23 @@ export async function assign(payload: ProxyAffinityAssignRequest): Promise<Proxy
   return data
 }
 
+export async function bindAccount(payload: ProxyAffinityBindRequest): Promise<ProxyAffinityAssignment> {
+  const { data } = await apiClient.post<ProxyAffinityAssignment>('/admin/proxy-affinity/bind', payload)
+  return data
+}
+
+export async function releaseAccount(payload: ProxyAffinityReleaseRequest): Promise<ProxyAffinityAssignment> {
+  const { data } = await apiClient.post<ProxyAffinityAssignment>('/admin/proxy-affinity/release', payload)
+  return data
+}
+
 export const proxyAffinityAPI = {
   getSettings,
   updateSettings,
   getOverview,
-  assign
+  assign,
+  bindAccount,
+  releaseAccount
 }
 
 export default proxyAffinityAPI
