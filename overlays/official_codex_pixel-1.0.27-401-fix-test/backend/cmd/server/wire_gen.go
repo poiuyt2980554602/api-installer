@@ -135,6 +135,7 @@ func initializeApplication(buildInfo handler.BuildInfo) (*Application, error) {
 		return nil, err
 	}
 	proxyAffinityService := service.ProvideProxyAffinityService(settingRepository, proxyRepository, accountRepository, timingWheelService)
+	accountTestService.SetProxyAffinityService(proxyAffinityService)
 	accountBatchTaskRepository := repository.NewAccountBatchTaskRepository(db)
 	accountBatchTaskService := service.ProvideAccountBatchTaskService(accountBatchTaskRepository, timingWheelService)
 	userAccountHandler := handler.NewUserAccountHandler(accountService, accountUsageService, accountTestService, oAuthService, openAIOAuthService, geminiOAuthService, antigravityOAuthService, accountBatchTaskService)

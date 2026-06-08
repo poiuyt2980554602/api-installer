@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -27,6 +28,9 @@ const (
 
 	proxyAffinityStrategyLeastLoaded         = "least_loaded"
 	proxyAffinityStrategyWeightedLeastLoaded = "weighted_least_loaded"
+	proxyAffinityFallbackWait                = "wait"
+	proxyAffinityFallbackDirect              = "direct"
+	proxyAffinityFallbackReject              = "reject"
 
 	proxyAffinityExtraSource        = "proxy_affinity_source"
 	proxyAffinityExtraAssignedAt    = "proxy_affinity_assigned_at"
@@ -34,7 +38,18 @@ const (
 	proxyAffinityExtraProxyID       = "proxy_affinity_proxy_id"
 	proxyAffinityExtraReleasedAt    = "proxy_affinity_released_at"
 	proxyAffinityExtraReleaseReason = "proxy_affinity_release_reason"
+	proxyAffinityExtraPhase         = "proxy_affinity_phase"
+	proxyAffinityExtraValidationAt  = "proxy_affinity_last_validation_at"
+	proxyAffinityExtraValidationErr = "proxy_affinity_last_validation_error"
+	proxyAffinityExtraAttempts      = "proxy_affinity_validation_attempts"
+
+	proxyAffinityPhasePreValidation    = "pre_validation"
+	proxyAffinityPhaseValidated        = "validated"
+	proxyAffinityPhaseValidationFailed = "validation_failed"
+	proxyAffinityPhaseWaitingProxy     = "waiting_proxy"
 )
+
+var ErrProxyAffinityNoProxyAvailable = errors.New("proxy affinity validation requires a proxy but no proxy is available")
 
 type ProxyAffinitySettings struct {
 	Enabled                    bool          `json:"enabled"`
@@ -55,6 +70,13 @@ type ProxyAffinitySettings struct {
 	MaxStoredEvents            int           `json:"max_stored_events"`
 	PausedProxyIDs             []int64       `json:"paused_proxy_ids"`
 	ProxyWeights               map[int64]int `json:"proxy_weights"`
+	PreValidationEnabled       bool          `json:"pre_validation_enabled"`
+	EnforceValidationProxy     bool          `json:"enforce_validation_proxy"`
+	IncludePendingAccounts     bool          `json:"include_pending_accounts"`
+	ReleaseOnValidationFailure bool          `json:"release_on_validation_failure"`
+	RetryWithNewProxyOnFailure bool          `json:"retry_with_new_proxy_on_failure"`
+	MaxPreValidationRetries    int           `json:"max_pre_validation_retries"`
+	FallbackWhenNoProxy        string        `json:"fallback_when_no_proxy"`
 }
 
 type ProxyAffinityOverview struct {
@@ -64,6 +86,9 @@ type ProxyAffinityOverview struct {
 	FullProxies                int                           `json:"full_proxies"`
 	BoundAccounts              int64                         `json:"bound_accounts"`
 	UnassignedEligibleAccounts int64                         `json:"unassigned_eligible_accounts"`
+	PreValidationAccounts      int64                         `json:"pre_validation_accounts"`
+	WaitingProxyAccounts       int64                         `json:"waiting_proxy_accounts"`
+	ValidationFailedAccounts   int64                         `json:"validation_failed_accounts"`
 	SkippedAccounts            int64                         `json:"skipped_accounts"`
 	AverageLoad                float64                       `json:"average_load"`
 	ProxyLoads                 []ProxyAffinityProxyLoad      `json:"proxy_loads"`
@@ -124,13 +149,19 @@ type ProxyAffinityAccountBinding struct {
 	AssignedAt   string `json:"assigned_at,omitempty"`
 	AssignedBy   string `json:"assigned_by,omitempty"`
 	AssignReason string `json:"assign_reason,omitempty"`
+	Phase        string `json:"phase,omitempty"`
+	LastTestAt   string `json:"last_test_at,omitempty"`
+	LastTestErr  string `json:"last_test_error,omitempty"`
 	HealthStatus string `json:"health_status"`
 	HealthReason string `json:"health_reason,omitempty"`
 }
 
 type ProxyAffinityPendingAccount struct {
 	ProxyAffinityCandidate
-	Reason string `json:"reason"`
+	Reason      string `json:"reason"`
+	Phase       string `json:"phase,omitempty"`
+	LastTestAt  string `json:"last_test_at,omitempty"`
+	LastTestErr string `json:"last_test_error,omitempty"`
 }
 
 type ProxyAffinityEvent struct {
@@ -164,6 +195,17 @@ type ProxyAffinityReleaseRequest struct {
 	AccountID int64  `json:"account_id"`
 	DryRun    bool   `json:"dry_run"`
 	Reason    string `json:"reason"`
+}
+
+type ProxyAffinityPrebindRequest struct {
+	DryRun    bool     `json:"dry_run"`
+	Limit     int      `json:"limit"`
+	Platforms []string `json:"platforms"`
+}
+
+type ProxyAffinityValidationResult struct {
+	Success bool
+	Error   string
 }
 
 type ProxyAffinityAssignResult struct {
@@ -242,6 +284,13 @@ func DefaultProxyAffinitySettings() ProxyAffinitySettings {
 		MaxStoredEvents:            proxyAffinityDefaultMaxEvents,
 		PausedProxyIDs:             []int64{},
 		ProxyWeights:               map[int64]int{},
+		PreValidationEnabled:       true,
+		EnforceValidationProxy:     true,
+		IncludePendingAccounts:     true,
+		ReleaseOnValidationFailure: true,
+		RetryWithNewProxyOnFailure: false,
+		MaxPreValidationRetries:    1,
+		FallbackWhenNoProxy:        proxyAffinityFallbackWait,
 	}
 }
 
@@ -262,6 +311,7 @@ func (s *ProxyAffinityService) GetSettings(ctx context.Context) (ProxyAffinitySe
 		slog.Warn("failed to parse proxy affinity settings, using defaults", "error", err)
 		return DefaultProxyAffinitySettings(), nil
 	}
+	settings = applyProxyAffinityDefaultsForMissingFields(raw, settings)
 	return normalizeProxyAffinitySettings(settings), nil
 }
 
@@ -293,11 +343,20 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 	}
 	proxyByID := proxyAffinityProxyLoadMap(proxyLoads)
 
-	var bound, eligible, skipped int64
+	var bound, eligible, preValidation, waitingProxy, validationFailed, skipped int64
 	boundDetails := make([]ProxyAffinityAccountBinding, 0)
 	pendingAccounts := make([]ProxyAffinityPendingAccount, 0)
 	for i := range accounts {
 		account := &accounts[i]
+		phase := proxyAffinityPhaseFromAccount(account)
+		switch phase {
+		case proxyAffinityPhasePreValidation:
+			preValidation++
+		case proxyAffinityPhaseWaitingProxy:
+			waitingProxy++
+		case proxyAffinityPhaseValidationFailed:
+			validationFailed++
+		}
 		if account.ProxyID != nil {
 			bound++
 			boundDetails = append(boundDetails, s.accountBindingFromAccount(account, proxyByID, settings))
@@ -309,6 +368,9 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 			pendingAccounts = append(pendingAccounts, ProxyAffinityPendingAccount{
 				ProxyAffinityCandidate: candidate,
 				Reason:                 "符合规则，等待自动或手动分配",
+				Phase:                  phase,
+				LastTestAt:             proxyAffinityExtraString(account, proxyAffinityExtraValidationAt),
+				LastTestErr:            proxyAffinityExtraString(account, proxyAffinityExtraValidationErr),
 			})
 		} else {
 			skipped++
@@ -316,6 +378,9 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 				pendingAccounts = append(pendingAccounts, ProxyAffinityPendingAccount{
 					ProxyAffinityCandidate: candidate,
 					Reason:                 reason,
+					Phase:                  phase,
+					LastTestAt:             proxyAffinityExtraString(account, proxyAffinityExtraValidationAt),
+					LastTestErr:            proxyAffinityExtraString(account, proxyAffinityExtraValidationErr),
 				})
 			}
 		}
@@ -350,6 +415,9 @@ func (s *ProxyAffinityService) GetOverview(ctx context.Context) (*ProxyAffinityO
 		FullProxies:                full,
 		BoundAccounts:              bound,
 		UnassignedEligibleAccounts: eligible,
+		PreValidationAccounts:      preValidation,
+		WaitingProxyAccounts:       waitingProxy,
+		ValidationFailedAccounts:   validationFailed,
 		SkippedAccounts:            skipped,
 		AverageLoad:                averageLoad,
 		ProxyLoads:                 proxyLoads,
@@ -584,6 +652,247 @@ func (s *ProxyAffinityService) ReleaseAccount(ctx context.Context, req ProxyAffi
 	return assignment, nil
 }
 
+func (s *ProxyAffinityService) PrebindPendingAccounts(ctx context.Context, req ProxyAffinityPrebindRequest) (*ProxyAffinityAssignResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return nil, err
+	}
+	if !settings.Enabled || !settings.PreValidationEnabled {
+		return &ProxyAffinityAssignResult{DryRun: req.DryRun, Assignments: []ProxyAffinityAssignment{}}, nil
+	}
+	if len(req.Platforms) > 0 {
+		settings.Platforms = normalizeProxyAffinityPlatforms(req.Platforms)
+	}
+	limit := req.Limit
+	if limit <= 0 {
+		limit = settings.BatchSize
+	}
+	if limit <= 0 {
+		limit = proxyAffinityDefaultBatchSize
+	}
+	if limit > proxyAffinityMaxBatchSize {
+		limit = proxyAffinityMaxBatchSize
+	}
+
+	proxyLoads, err := s.loadProxyLoads(ctx, settings)
+	if err != nil {
+		return nil, err
+	}
+	assignable := proxyAffinityAssignableLoads(proxyLoads)
+	result := &ProxyAffinityAssignResult{DryRun: req.DryRun, Assignments: []ProxyAffinityAssignment{}}
+	if len(assignable) == 0 {
+		return result, nil
+	}
+
+	accounts, err := s.accountRepo.ListActive(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("list active accounts for proxy affinity prebind: %w", err)
+	}
+	sort.SliceStable(accounts, func(i, j int) bool { return accounts[i].ID < accounts[j].ID })
+	for i := range accounts {
+		if result.Assigned >= limit {
+			break
+		}
+		account := &accounts[i]
+		if account.ProxyID != nil {
+			continue
+		}
+		result.Scanned++
+		candidate := proxyAffinityCandidateFromAccount(account)
+		if ok, reason := s.isPreValidationEligibleAccount(account, settings); !ok {
+			result.Skipped++
+			result.Assignments = append(result.Assignments, ProxyAffinityAssignment{
+				Candidate: candidate,
+				Action:    "skipped",
+				Reason:    reason,
+				DryRun:    req.DryRun,
+			})
+			continue
+		}
+		chosen, ok := chooseProxyAffinityTarget(assignable, settings)
+		if !ok {
+			result.Skipped++
+			result.Assignments = append(result.Assignments, ProxyAffinityAssignment{
+				Candidate: candidate,
+				Action:    "skipped",
+				Reason:    "没有可用于校验前绑定的代理",
+				DryRun:    req.DryRun,
+			})
+			continue
+		}
+		assignment := ProxyAffinityAssignment{
+			Candidate: candidate,
+			ProxyID:   chosen.ProxyID,
+			ProxyName: chosen.Name,
+			Action:    "assigned",
+			Reason:    "校验前预绑定代理，账号检测将使用该代理出口",
+			DryRun:    req.DryRun,
+		}
+		if !req.DryRun {
+			if err := s.assignAccountToProxy(ctx, account, chosen.ProxyID, "pre_validation"); err != nil {
+				result.Skipped++
+				assignment.Action = "failed"
+				assignment.Reason = err.Error()
+				result.Assignments = append(result.Assignments, assignment)
+				continue
+			}
+		}
+		result.Assigned++
+		result.Assignments = append(result.Assignments, assignment)
+		for idx := range assignable {
+			if assignable[idx].ProxyID == chosen.ProxyID {
+				assignable[idx].AccountCount++
+				assignable[idx].EffectiveLoad = float64(assignable[idx].AccountCount) / float64(maxProxyAffinityWeight(assignable[idx].Weight))
+				assignable[idx].Assignable = settings.MaxAccountsPerProxy <= 0 || assignable[idx].AccountCount < settings.MaxAccountsPerProxy
+				break
+			}
+		}
+	}
+	if len(result.Assignments) > 0 && !req.DryRun {
+		_ = s.appendAssignmentEvents(ctx, result.Assignments, "pre_validation")
+	}
+	return result, nil
+}
+
+func (s *ProxyAffinityService) EnsurePreValidationBinding(ctx context.Context, accountID int64) (*Account, *ProxyAffinityAssignment, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, nil, err
+	}
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return account, nil, err
+	}
+	if !settings.Enabled || !settings.PreValidationEnabled {
+		return account, nil, nil
+	}
+	if account.ProxyID != nil {
+		proxy, proxyErr := s.proxyRepo.GetByID(ctx, *account.ProxyID)
+		if proxyErr != nil || proxy == nil || proxy.Status != StatusActive {
+			reason := "校验前发现已绑定代理不可用，释放后重新选择代理"
+			if err := s.releaseAccountProxy(ctx, account, reason); err != nil {
+				return account, nil, err
+			}
+			account, err = s.accountRepo.GetByID(ctx, accountID)
+			if err != nil {
+				return nil, nil, err
+			}
+		}
+	}
+	if account.ProxyID != nil {
+		if proxyAffinityPhaseFromAccount(account) == "" {
+			if err := s.setProxyAffinityPhase(ctx, account, proxyAffinityPhasePreValidation, ""); err != nil {
+				return account, nil, err
+			}
+			account, _ = s.accountRepo.GetByID(ctx, accountID)
+		}
+		return account, &ProxyAffinityAssignment{
+			Candidate: proxyAffinityCandidateFromAccount(account),
+			ProxyID:   int64Value(account.ProxyID),
+			Action:    "skipped",
+			Reason:    "账号已绑定代理，校验将复用现有代理",
+		}, nil
+	}
+	if ok, reason := s.isPreValidationEligibleAccount(account, settings); !ok {
+		return account, &ProxyAffinityAssignment{
+			Candidate: proxyAffinityCandidateFromAccount(account),
+			Action:    "skipped",
+			Reason:    reason,
+		}, nil
+	}
+	proxyLoads, err := s.loadProxyLoads(ctx, settings)
+	if err != nil {
+		return account, nil, err
+	}
+	assignable := proxyAffinityAssignableLoads(proxyLoads)
+	chosen, ok := chooseProxyAffinityTarget(assignable, settings)
+	if !ok {
+		reason := "没有可用于校验前绑定的代理"
+		_ = s.setProxyAffinityPhase(ctx, account, proxyAffinityPhaseWaitingProxy, reason)
+		assignment := &ProxyAffinityAssignment{
+			Candidate: proxyAffinityCandidateFromAccount(account),
+			Action:    "skipped",
+			Reason:    reason,
+		}
+		if settings.EnforceValidationProxy && settings.FallbackWhenNoProxy != proxyAffinityFallbackDirect {
+			return account, assignment, ErrProxyAffinityNoProxyAvailable
+		}
+		return account, assignment, nil
+	}
+	if err := s.assignAccountToProxy(ctx, account, chosen.ProxyID, "pre_validation"); err != nil {
+		return account, nil, err
+	}
+	assignment := &ProxyAffinityAssignment{
+		Candidate: proxyAffinityCandidateFromAccount(account),
+		ProxyID:   chosen.ProxyID,
+		ProxyName: chosen.Name,
+		Action:    "assigned",
+		Reason:    "校验前预绑定代理，账号检测将使用该代理出口",
+	}
+	_ = s.appendAssignmentEvents(ctx, []ProxyAffinityAssignment{*assignment}, "pre_validation")
+	account, err = s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return nil, assignment, err
+	}
+	return account, assignment, nil
+}
+
+func (s *ProxyAffinityService) HandleValidationResult(ctx context.Context, accountID int64, result ProxyAffinityValidationResult) error {
+	if s == nil || accountID <= 0 {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	settings, err := s.GetSettings(ctx)
+	if err != nil {
+		return err
+	}
+	if !settings.Enabled || !settings.PreValidationEnabled {
+		return nil
+	}
+	account, err := s.accountRepo.GetByID(ctx, accountID)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	if result.Success {
+		return s.updateProxyAffinityExtra(ctx, account, map[string]any{
+			proxyAffinityExtraPhase:         proxyAffinityPhaseValidated,
+			proxyAffinityExtraValidationAt:  now.Format(time.RFC3339),
+			proxyAffinityExtraValidationErr: "",
+		})
+	}
+
+	errMsg := strings.TrimSpace(result.Error)
+	if errMsg == "" {
+		errMsg = "account validation failed"
+	}
+	attempts := intFromAny(account.Extra[proxyAffinityExtraAttempts]) + 1
+	if settings.ReleaseOnValidationFailure && account.ProxyID != nil && proxyAffinityShouldReleaseOnValidationFailure(errMsg) {
+		reason := "账号校验失败，释放校验前代理绑定"
+		if releaseErr := s.releaseAccountProxy(ctx, account, reason); releaseErr != nil {
+			return releaseErr
+		}
+		account, err = s.accountRepo.GetByID(ctx, accountID)
+		if err != nil {
+			return err
+		}
+	}
+	return s.updateProxyAffinityExtra(ctx, account, map[string]any{
+		proxyAffinityExtraPhase:         proxyAffinityPhaseValidationFailed,
+		proxyAffinityExtraValidationAt:  now.Format(time.RFC3339),
+		proxyAffinityExtraValidationErr: errMsg,
+		proxyAffinityExtraAttempts:      attempts,
+	})
+}
+
 func (s *ProxyAffinityService) maintenanceTick() {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -608,6 +917,14 @@ func (s *ProxyAffinityService) maintenanceTick() {
 		}
 	}
 
+	prebindResult, prebindErr := s.PrebindPendingAccounts(ctx, ProxyAffinityPrebindRequest{
+		DryRun: false,
+		Limit:  settings.BatchSize,
+	})
+	if prebindErr != nil {
+		slog.Warn("proxy affinity maintenance pre-validation binding failed", "error", prebindErr)
+	}
+
 	result, err := s.AssignUnassigned(ctx, ProxyAffinityAssignRequest{
 		DryRun: false,
 		Limit:  settings.BatchSize,
@@ -617,8 +934,12 @@ func (s *ProxyAffinityService) maintenanceTick() {
 		return
 	}
 	_ = s.settingRepo.Set(ctx, SettingKeyProxyAffinityLastRunAt, now.Format(time.RFC3339))
-	if result.Assigned > 0 || result.Released > 0 {
-		slog.Info("proxy affinity maintenance completed", "assigned", result.Assigned, "released", result.Released, "scanned", result.Scanned)
+	prebound := 0
+	if prebindResult != nil {
+		prebound = prebindResult.Assigned
+	}
+	if prebound > 0 || result.Assigned > 0 || result.Released > 0 {
+		slog.Info("proxy affinity maintenance completed", "prebound", prebound, "assigned", result.Assigned, "released", result.Released, "scanned", result.Scanned)
 	}
 }
 
@@ -682,6 +1003,16 @@ func (s *ProxyAffinityService) loadProxyLoads(ctx context.Context, settings Prox
 	return out, nil
 }
 
+func proxyAffinityAssignableLoads(loads []ProxyAffinityProxyLoad) []ProxyAffinityProxyLoad {
+	assignable := make([]ProxyAffinityProxyLoad, 0, len(loads))
+	for _, load := range loads {
+		if load.Assignable {
+			assignable = append(assignable, load)
+		}
+	}
+	return assignable
+}
+
 func (s *ProxyAffinityService) isEligibleAccount(account *Account, settings ProxyAffinitySettings) (bool, string) {
 	if account == nil {
 		return false, "账号为空"
@@ -725,6 +1056,60 @@ func (s *ProxyAffinityService) isEligibleAccount(account *Account, settings Prox
 			return false, "公有账号尚未审核通过"
 		}
 		return true, ""
+	}
+	if !settings.PrivateAccountsEnabled {
+		return false, "私有账号未开启参与"
+	}
+	return true, ""
+}
+
+func (s *ProxyAffinityService) isPreValidationEligibleAccount(account *Account, settings ProxyAffinitySettings) (bool, string) {
+	if account == nil {
+		return false, "账号为空"
+	}
+	if account.ProxyID != nil {
+		return false, "账号已经绑定代理"
+	}
+	if !account.IsSchedulable() {
+		return false, "账号当前不可调度"
+	}
+	if !proxyAffinityPlatformAllowed(account.Platform, settings.Platforms) {
+		return false, "账号平台不在代理亲和调度范围内"
+	}
+	switch account.Type {
+	case AccountTypeAPIKey:
+		if !settings.IncludeAPIKeyAccounts {
+			return false, "API Key 账号未开启参与"
+		}
+	case AccountTypeOAuth, AccountTypeSetupToken:
+		if !settings.IncludeOAuthAccounts {
+			return false, "OAuth 账号未开启参与"
+		}
+	default:
+		return false, "账号类型不支持代理自动分配"
+	}
+	if account.OwnerUserID == nil {
+		if !settings.AdminAccountsEnabled {
+			return false, "管理员账号未开启参与"
+		}
+		return true, ""
+	}
+	if !settings.UserOwnedEnabled {
+		return false, "用户上传账号未开启参与"
+	}
+	shareMode := NormalizeAccountShareMode(account.ShareMode)
+	if shareMode == AccountShareModePublic {
+		if !settings.PublicAccountsEnabled {
+			return false, "公有账号未开启参与"
+		}
+		shareStatus := NormalizeAccountShareStatus(account.ShareStatus)
+		if shareStatus == AccountShareStatusApproved {
+			return true, ""
+		}
+		if settings.IncludePendingAccounts && shareStatus == AccountShareStatusPending {
+			return true, ""
+		}
+		return false, "公有账号尚未审核通过"
 	}
 	if !settings.PrivateAccountsEnabled {
 		return false, "私有账号未开启参与"
@@ -863,6 +1248,11 @@ func (s *ProxyAffinityService) isEligibleBoundAccount(account *Account, settings
 			return false, "公有账号未开启参与，释放代理绑定"
 		}
 		if settings.OnlyApprovedPublicAccounts && NormalizeAccountShareStatus(account.ShareStatus) != AccountShareStatusApproved {
+			phase := proxyAffinityPhaseFromAccount(account)
+			if settings.IncludePendingAccounts && NormalizeAccountShareStatus(account.ShareStatus) == AccountShareStatusPending &&
+				(phase == proxyAffinityPhasePreValidation || phase == proxyAffinityPhaseValidated) {
+				return true, ""
+			}
 			return false, "公有账号尚未审核通过，释放代理绑定"
 		}
 		return true, ""
@@ -888,6 +1278,11 @@ func (s *ProxyAffinityService) assignAccountToProxy(ctx context.Context, account
 	extra[proxyAffinityExtraAssignedAt] = time.Now().UTC().Format(time.RFC3339)
 	extra[proxyAffinityExtraReason] = reason
 	extra[proxyAffinityExtraProxyID] = proxyID
+	if reason == "pre_validation" {
+		extra[proxyAffinityExtraPhase] = proxyAffinityPhasePreValidation
+	} else if proxyAffinityStringFromAny(extra[proxyAffinityExtraPhase]) == "" {
+		extra[proxyAffinityExtraPhase] = proxyAffinityPhaseValidated
+	}
 	account.Extra = extra
 	account.ProxyID = &proxyID
 	if err := s.accountRepo.Update(ctx, account); err != nil {
@@ -913,6 +1308,34 @@ func (s *ProxyAffinityService) releaseAccountProxy(ctx context.Context, account 
 	account.ProxyID = nil
 	if err := s.accountRepo.Update(ctx, account); err != nil {
 		return fmt.Errorf("释放代理绑定失败: %w", err)
+	}
+	return nil
+}
+
+func (s *ProxyAffinityService) setProxyAffinityPhase(ctx context.Context, account *Account, phase, reason string) error {
+	updates := map[string]any{
+		proxyAffinityExtraPhase: phase,
+	}
+	if strings.TrimSpace(reason) != "" {
+		updates[proxyAffinityExtraValidationErr] = strings.TrimSpace(reason)
+	}
+	return s.updateProxyAffinityExtra(ctx, account, updates)
+}
+
+func (s *ProxyAffinityService) updateProxyAffinityExtra(ctx context.Context, account *Account, updates map[string]any) error {
+	if account == nil {
+		return ErrAccountNilInput
+	}
+	extra := make(map[string]any, len(account.Extra)+len(updates))
+	for k, v := range account.Extra {
+		extra[k] = v
+	}
+	for k, v := range updates {
+		extra[k] = v
+	}
+	account.Extra = extra
+	if err := s.accountRepo.Update(ctx, account); err != nil {
+		return fmt.Errorf("更新代理亲和状态失败: %w", err)
 	}
 	return nil
 }
@@ -946,9 +1369,12 @@ func (s *ProxyAffinityService) accountBindingFromAccount(account *Account, proxy
 		binding.HealthReason = reason
 	}
 	if account.Extra != nil {
-		binding.AssignedAt = stringFromAny(account.Extra[proxyAffinityExtraAssignedAt])
-		binding.AssignedBy = stringFromAny(account.Extra[proxyAffinityExtraSource])
-		binding.AssignReason = stringFromAny(account.Extra[proxyAffinityExtraReason])
+		binding.AssignedAt = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraAssignedAt])
+		binding.AssignedBy = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraSource])
+		binding.AssignReason = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraReason])
+		binding.Phase = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraPhase])
+		binding.LastTestAt = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraValidationAt])
+		binding.LastTestErr = proxyAffinityStringFromAny(account.Extra[proxyAffinityExtraValidationErr])
 	}
 	return binding
 }
@@ -1087,7 +1513,7 @@ func proxyAffinityIDSet(ids []int64) map[int64]struct{} {
 	return out
 }
 
-func stringFromAny(v any) string {
+func proxyAffinityStringFromAny(v any) string {
 	switch value := v.(type) {
 	case string:
 		return value
@@ -1098,7 +1524,107 @@ func stringFromAny(v any) string {
 	}
 }
 
+func intFromAny(v any) int {
+	switch value := v.(type) {
+	case int:
+		return value
+	case int64:
+		return int(value)
+	case float64:
+		return int(value)
+	case json.Number:
+		n, _ := value.Int64()
+		return int(n)
+	default:
+		return 0
+	}
+}
+
+func int64Value(v *int64) int64 {
+	if v == nil {
+		return 0
+	}
+	return *v
+}
+
+func maxProxyAffinityWeight(weight int) int {
+	if weight <= 0 {
+		return 1
+	}
+	return weight
+}
+
+func proxyAffinityExtraString(account *Account, key string) string {
+	if account == nil || account.Extra == nil {
+		return ""
+	}
+	return proxyAffinityStringFromAny(account.Extra[key])
+}
+
+func proxyAffinityPhaseFromAccount(account *Account) string {
+	return proxyAffinityExtraString(account, proxyAffinityExtraPhase)
+}
+
+func proxyAffinityShouldReleaseOnValidationFailure(errMsg string) bool {
+	normalized := strings.ToLower(strings.TrimSpace(errMsg))
+	if normalized == "" {
+		return true
+	}
+	temporaryMarkers := []string{
+		"429",
+		"rate limit",
+		"rate_limit",
+		"temporarily",
+		"timeout",
+		"context deadline",
+		"deadline exceeded",
+		"connection reset",
+		"connection refused",
+		"no such host",
+		"proxyconnect",
+		"tls handshake timeout",
+		"too many requests",
+	}
+	for _, marker := range temporaryMarkers {
+		if strings.Contains(normalized, marker) {
+			return false
+		}
+	}
+	return true
+}
+
+func applyProxyAffinityDefaultsForMissingFields(raw string, settings ProxyAffinitySettings) ProxyAffinitySettings {
+	var present map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(raw), &present); err != nil {
+		return settings
+	}
+	defaults := DefaultProxyAffinitySettings()
+	if _, ok := present["pre_validation_enabled"]; !ok {
+		settings.PreValidationEnabled = defaults.PreValidationEnabled
+	}
+	if _, ok := present["enforce_validation_proxy"]; !ok {
+		settings.EnforceValidationProxy = defaults.EnforceValidationProxy
+	}
+	if _, ok := present["include_pending_accounts"]; !ok {
+		settings.IncludePendingAccounts = defaults.IncludePendingAccounts
+	}
+	if _, ok := present["release_on_validation_failure"]; !ok {
+		settings.ReleaseOnValidationFailure = defaults.ReleaseOnValidationFailure
+	}
+	if _, ok := present["retry_with_new_proxy_on_failure"]; !ok {
+		settings.RetryWithNewProxyOnFailure = defaults.RetryWithNewProxyOnFailure
+	}
+	if _, ok := present["max_pre_validation_retries"]; !ok {
+		settings.MaxPreValidationRetries = defaults.MaxPreValidationRetries
+	}
+	if _, ok := present["fallback_when_no_proxy"]; !ok {
+		settings.FallbackWhenNoProxy = defaults.FallbackWhenNoProxy
+	}
+	return settings
+}
+
 func normalizeProxyAffinitySettings(settings ProxyAffinitySettings) ProxyAffinitySettings {
+	defaults := DefaultProxyAffinitySettings()
 	if settings.BatchSize <= 0 {
 		settings.BatchSize = proxyAffinityDefaultBatchSize
 	}
@@ -1128,10 +1654,25 @@ func normalizeProxyAffinitySettings(settings ProxyAffinitySettings) ProxyAffinit
 	}
 	settings.Platforms = normalizeProxyAffinityPlatforms(settings.Platforms)
 	if len(settings.Platforms) == 0 {
-		settings.Platforms = DefaultProxyAffinitySettings().Platforms
+		settings.Platforms = defaults.Platforms
 	}
 	settings.PausedProxyIDs = normalizeProxyAffinityIDs(settings.PausedProxyIDs)
 	settings.ProxyWeights = normalizeProxyAffinityWeights(settings.ProxyWeights)
+	if strings.TrimSpace(settings.FallbackWhenNoProxy) == "" {
+		settings.FallbackWhenNoProxy = defaults.FallbackWhenNoProxy
+	}
+	switch strings.ToLower(strings.TrimSpace(settings.FallbackWhenNoProxy)) {
+	case proxyAffinityFallbackWait, proxyAffinityFallbackDirect, proxyAffinityFallbackReject:
+		settings.FallbackWhenNoProxy = strings.ToLower(strings.TrimSpace(settings.FallbackWhenNoProxy))
+	default:
+		settings.FallbackWhenNoProxy = proxyAffinityFallbackWait
+	}
+	if settings.MaxPreValidationRetries < 0 {
+		settings.MaxPreValidationRetries = 0
+	}
+	if settings.MaxPreValidationRetries > 10 {
+		settings.MaxPreValidationRetries = 10
+	}
 	return settings
 }
 

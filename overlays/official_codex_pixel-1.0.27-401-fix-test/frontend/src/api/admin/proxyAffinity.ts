@@ -19,6 +19,13 @@ export interface ProxyAffinitySettings {
   max_stored_events: number
   paused_proxy_ids: number[]
   proxy_weights: Record<number, number>
+  pre_validation_enabled: boolean
+  enforce_validation_proxy: boolean
+  include_pending_accounts: boolean
+  release_on_validation_failure: boolean
+  retry_with_new_proxy_on_failure: boolean
+  max_pre_validation_retries: number
+  fallback_when_no_proxy: 'wait' | 'direct' | 'reject'
 }
 
 export interface ProxyAffinityProxyLoad {
@@ -50,6 +57,9 @@ export interface ProxyAffinityOverview {
   full_proxies: number
   bound_accounts: number
   unassigned_eligible_accounts: number
+  pre_validation_accounts: number
+  waiting_proxy_accounts: number
+  validation_failed_accounts: number
   skipped_accounts: number
   average_load: number
   proxy_loads: ProxyAffinityProxyLoad[]
@@ -87,12 +97,18 @@ export interface ProxyAffinityAccountBinding extends ProxyAffinityCandidate {
   assigned_at?: string
   assigned_by?: string
   assign_reason?: string
+  phase?: string
+  last_test_at?: string
+  last_test_error?: string
   health_status: 'healthy' | 'proxy_down' | 'proxy_paused' | 'proxy_missing' | 'account_ineligible' | string
   health_reason?: string
 }
 
 export interface ProxyAffinityPendingAccount extends ProxyAffinityCandidate {
   reason: string
+  phase?: string
+  last_test_at?: string
+  last_test_error?: string
 }
 
 export interface ProxyAffinityEvent {
@@ -114,6 +130,8 @@ export interface ProxyAffinityAssignRequest {
   limit?: number
   platforms?: string[]
 }
+
+export type ProxyAffinityPrebindRequest = ProxyAffinityAssignRequest
 
 export interface ProxyAffinityAssignResult {
   dry_run: boolean
@@ -157,6 +175,11 @@ export async function assign(payload: ProxyAffinityAssignRequest): Promise<Proxy
   return data
 }
 
+export async function prebind(payload: ProxyAffinityPrebindRequest): Promise<ProxyAffinityAssignResult> {
+  const { data } = await apiClient.post<ProxyAffinityAssignResult>('/admin/proxy-affinity/prebind', payload)
+  return data
+}
+
 export async function bindAccount(payload: ProxyAffinityBindRequest): Promise<ProxyAffinityAssignment> {
   const { data } = await apiClient.post<ProxyAffinityAssignment>('/admin/proxy-affinity/bind', payload)
   return data
@@ -172,6 +195,7 @@ export const proxyAffinityAPI = {
   updateSettings,
   getOverview,
   assign,
+  prebind,
   bindAccount,
   releaseAccount
 }

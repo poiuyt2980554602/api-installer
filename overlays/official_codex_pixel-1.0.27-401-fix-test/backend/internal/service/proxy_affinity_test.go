@@ -200,6 +200,80 @@ func TestProxyAffinityManualBindAndRelease(t *testing.T) {
 	require.Nil(t, accountRepo.updated[1].ProxyID)
 }
 
+func TestProxyAffinityPrebindPendingPublicAccount(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "pending-public", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePublic, ShareStatus: AccountShareStatusPending},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{{Proxy: Proxy{ID: 10, Name: "proxy", Status: StatusActive}, AccountCount: 0}},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.Enabled = true
+	settings.OnlyApprovedPublicAccounts = true
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	result, err := svc.PrebindPendingAccounts(ctx, ProxyAffinityPrebindRequest{Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, 1, result.Assigned)
+	require.Len(t, accountRepo.updated, 1)
+	require.Equal(t, int64(10), *accountRepo.updated[0].ProxyID)
+	require.Equal(t, proxyAffinityPhasePreValidation, accountRepo.updated[0].Extra[proxyAffinityExtraPhase])
+}
+
+func TestProxyAffinityValidationFailureReleasesPreboundProxy(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "pending-public", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePublic, ShareStatus: AccountShareStatusPending, ProxyID: ptrInt64(10), Extra: map[string]any{proxyAffinityExtraPhase: proxyAffinityPhasePreValidation}},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{{Proxy: Proxy{ID: 10, Name: "proxy", Status: StatusActive}, AccountCount: 1}},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.Enabled = true
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	err = svc.HandleValidationResult(ctx, 1, ProxyAffinityValidationResult{Success: false, Error: "401 invalid token"})
+	require.NoError(t, err)
+	require.Len(t, accountRepo.updated, 2)
+	require.Nil(t, accountRepo.updated[0].ProxyID)
+	require.Nil(t, accountRepo.updated[1].ProxyID)
+	require.Equal(t, proxyAffinityPhaseValidationFailed, accountRepo.updated[1].Extra[proxyAffinityExtraPhase])
+	require.Equal(t, "401 invalid token", accountRepo.updated[1].Extra[proxyAffinityExtraValidationErr])
+}
+
+func TestProxyAffinityEnsurePreValidationKeepsActiveBoundProxyWithoutPreload(t *testing.T) {
+	ctx := context.Background()
+	accountRepo := &proxyAffinityAccountRepoStub{
+		accounts: []Account{
+			{ID: 1, Name: "bound", Platform: PlatformOpenAI, Type: AccountTypeOAuth, Status: StatusActive, Schedulable: true, OwnerUserID: ptrInt64(7), ShareMode: AccountShareModePrivate, ShareStatus: AccountShareStatusApproved, ProxyID: ptrInt64(10)},
+		},
+	}
+	svc := NewProxyAffinityService(&proxyAffinitySettingRepoStub{}, &proxyAffinityProxyRepoStub{
+		proxies: []ProxyWithAccountCount{{Proxy: Proxy{ID: 10, Name: "proxy", Status: StatusActive}, AccountCount: 1}},
+	}, accountRepo)
+	settings := DefaultProxyAffinitySettings()
+	settings.Enabled = true
+	_, err := svc.UpdateSettings(ctx, settings)
+	require.NoError(t, err)
+
+	account, assignment, err := svc.EnsurePreValidationBinding(ctx, 1)
+	require.NoError(t, err)
+	require.NotNil(t, account)
+	require.NotNil(t, assignment)
+	require.Equal(t, "skipped", assignment.Action)
+	require.Equal(t, int64(10), *account.ProxyID)
+	require.Len(t, accountRepo.updated, 1)
+	require.Equal(t, int64(10), *accountRepo.updated[0].ProxyID)
+	require.Equal(t, proxyAffinityPhasePreValidation, accountRepo.updated[0].Extra[proxyAffinityExtraPhase])
+}
+
 func ptrInt64(v int64) *int64 {
 	return &v
 }
@@ -356,6 +430,12 @@ func (r *proxyAffinityAccountRepoStub) Update(ctx context.Context, account *Acco
 		}
 	}
 	r.updated = append(r.updated, &cp)
+	for i := range r.accounts {
+		if r.accounts[i].ID == account.ID {
+			r.accounts[i] = cp
+			break
+		}
+	}
 	return nil
 }
 func (r *proxyAffinityAccountRepoStub) Delete(ctx context.Context, id int64) error { return nil }

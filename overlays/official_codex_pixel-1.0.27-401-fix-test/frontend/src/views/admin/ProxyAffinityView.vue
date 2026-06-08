@@ -18,6 +18,9 @@
             <button type="button" class="btn border-white/20 bg-white/10 text-white hover:bg-white/20" :disabled="assigning" @click="runAssign(true)">
               预览分配
             </button>
+            <button type="button" class="btn border-white/20 bg-white/10 text-white hover:bg-white/20" :disabled="assigning" @click="runPrebind(false)">
+              预绑定待校验账号
+            </button>
             <button type="button" class="btn bg-cyan-500 text-white hover:bg-cyan-400" :disabled="assigning" @click="runAssign(false)">
               执行分配
             </button>
@@ -109,6 +112,40 @@
 
               <div class="rounded-lg border border-cyan-200 bg-cyan-50 p-3 text-xs leading-5 text-cyan-900 dark:border-cyan-900/60 dark:bg-cyan-900/20 dark:text-cyan-200">
                 稳定性规则：账号一旦绑定代理，不会因为负载变化自动迁移；代理失效或账号长期不合规时才按开关释放。短期限流、过载、5 小时额度保护不会释放绑定。
+              </div>
+
+              <div class="rounded-xl border border-amber-200 bg-amber-50 p-4 text-sm dark:border-amber-900/60 dark:bg-amber-900/20">
+                <div class="flex items-start justify-between gap-3">
+                  <div>
+                    <h3 class="font-semibold text-amber-950 dark:text-amber-100">校验前预绑定</h3>
+                    <p class="mt-1 text-xs leading-5 text-amber-900 dark:text-amber-200">
+                      用户上传账号后先绑定代理，再用该代理检测账号，避免检测阶段走主站 IP。关闭代理亲和模块时此能力不会生效。
+                    </p>
+                  </div>
+                  <input v-model="settings.pre_validation_enabled" type="checkbox" class="mt-1" />
+                </div>
+                <div class="mt-3 grid grid-cols-1 gap-2 sm:grid-cols-2">
+                  <label class="flex items-center gap-2 rounded-lg bg-white/70 px-3 py-2 text-xs text-amber-950 dark:bg-dark-700/60 dark:text-amber-100">
+                    <input v-model="settings.enforce_validation_proxy" type="checkbox" />
+                    检测必须走绑定代理
+                  </label>
+                  <label class="flex items-center gap-2 rounded-lg bg-white/70 px-3 py-2 text-xs text-amber-950 dark:bg-dark-700/60 dark:text-amber-100">
+                    <input v-model="settings.include_pending_accounts" type="checkbox" />
+                    公有待审核账号也预绑定
+                  </label>
+                  <label class="flex items-center gap-2 rounded-lg bg-white/70 px-3 py-2 text-xs text-amber-950 dark:bg-dark-700/60 dark:text-amber-100">
+                    <input v-model="settings.release_on_validation_failure" type="checkbox" />
+                    校验明确失败后释放代理
+                  </label>
+                  <label class="form-field">
+                    <span class="form-label text-amber-950 dark:text-amber-100">无可用代理时</span>
+                    <select v-model="settings.fallback_when_no_proxy" class="input">
+                      <option value="wait">等待代理，不直连</option>
+                      <option value="reject">拒绝检测</option>
+                      <option value="direct">允许直连检测</option>
+                    </select>
+                  </label>
+                </div>
               </div>
 
               <div class="flex justify-end gap-2 pt-2">
@@ -268,8 +305,11 @@
                     </td>
                     <td class="px-5 py-4 text-xs text-gray-500">
                       <div>来源：{{ sourceLabel(account.assigned_by) }}</div>
+                      <div>阶段：{{ phaseLabel(account.phase) }}</div>
                       <div>时间：{{ formatDate(account.assigned_at) }}</div>
+                      <div v-if="account.last_test_at">最近校验：{{ formatDate(account.last_test_at) }}</div>
                       <div v-if="account.assign_reason">原因：{{ account.assign_reason }}</div>
+                      <div v-if="account.last_test_error" class="text-amber-600 dark:text-amber-300">校验信息：{{ account.last_test_error }}</div>
                     </td>
                     <td class="px-5 py-4">
                       <span class="badge" :class="account.health_status === 'healthy' ? 'badge-success' : 'badge-warning'">
@@ -314,8 +354,13 @@
                       </td>
                       <td class="px-5 py-4 text-xs text-gray-500">
                         {{ shareLabel(account.share_mode, account.share_status) }} · {{ levelLabel(account.account_level) }}
+                        <div v-if="account.phase">阶段：{{ phaseLabel(account.phase) }}</div>
+                        <div v-if="account.last_test_at">最近校验：{{ formatDate(account.last_test_at) }}</div>
                       </td>
-                      <td class="px-5 py-4 text-gray-600 dark:text-gray-300">{{ account.reason }}</td>
+                      <td class="px-5 py-4 text-gray-600 dark:text-gray-300">
+                        <div>{{ account.reason }}</div>
+                        <div v-if="account.last_test_error" class="mt-1 text-xs text-amber-600 dark:text-amber-300">{{ account.last_test_error }}</div>
+                      </td>
                     </tr>
                   </tbody>
                 </table>
@@ -464,7 +509,14 @@ const settings = reactive<ProxyAffinitySettings>({
   strategy: 'weighted_least_loaded',
   max_stored_events: 200,
   paused_proxy_ids: [],
-  proxy_weights: {}
+  proxy_weights: {},
+  pre_validation_enabled: true,
+  enforce_validation_proxy: true,
+  include_pending_accounts: true,
+  release_on_validation_failure: true,
+  retry_with_new_proxy_on_failure: false,
+  max_pre_validation_retries: 1,
+  fallback_when_no_proxy: 'wait'
 })
 
 const switchItems: Array<{ key: keyof ProxyAffinitySettings; label: string }> = [
@@ -489,9 +541,9 @@ const platformOptions = [
 const statCards = computed(() => [
   { label: '代理总数', value: overview.value?.total_proxies ?? 0, hint: `可分配 ${overview.value?.available_proxies ?? 0}` },
   { label: '已绑定账号', value: overview.value?.bound_accounts ?? 0, hint: '已有固定代理的账号' },
-  { label: '待分配账号', value: overview.value?.unassigned_eligible_accounts ?? 0, hint: '符合规则但未绑定' },
-  { label: '跳过账号', value: overview.value?.skipped_accounts ?? 0, hint: '不符合当前规则' },
-  { label: '已满代理', value: overview.value?.full_proxies ?? 0, hint: '达到单代理上限' },
+  { label: '校验前绑定', value: overview.value?.pre_validation_accounts ?? 0, hint: '已绑定代理，等待检测结果' },
+  { label: '等待代理', value: overview.value?.waiting_proxy_accounts ?? 0, hint: '没有可用代理时暂挂' },
+  { label: '校验失败', value: overview.value?.validation_failed_accounts ?? 0, hint: '需要处理账号或代理' },
   { label: '上次运行', value: formatShortDate(overview.value?.last_run_at), hint: '自动任务最近执行时间' }
 ])
 
@@ -507,7 +559,14 @@ function applySettings(next: ProxyAffinitySettings): void {
     paused_proxy_ids: Array.isArray(next.paused_proxy_ids) ? [...next.paused_proxy_ids] : [],
     proxy_weights: { ...(next.proxy_weights || {}) },
     strategy: next.strategy || 'weighted_least_loaded',
-    max_stored_events: next.max_stored_events || 200
+    max_stored_events: next.max_stored_events || 200,
+    pre_validation_enabled: next.pre_validation_enabled ?? true,
+    enforce_validation_proxy: next.enforce_validation_proxy ?? true,
+    include_pending_accounts: next.include_pending_accounts ?? true,
+    release_on_validation_failure: next.release_on_validation_failure ?? true,
+    retry_with_new_proxy_on_failure: next.retry_with_new_proxy_on_failure ?? false,
+    max_pre_validation_retries: next.max_pre_validation_retries ?? 1,
+    fallback_when_no_proxy: next.fallback_when_no_proxy || 'wait'
   })
   assignLimit.value = next.batch_size || 100
 }
@@ -558,6 +617,25 @@ async function runAssign(dryRun: boolean): Promise<void> {
     }
   } catch (error: any) {
     appStore.showError(error?.message || '分配失败')
+  } finally {
+    assigning.value = false
+  }
+}
+
+async function runPrebind(dryRun: boolean): Promise<void> {
+  assigning.value = true
+  try {
+    lastResult.value = await adminAPI.proxyAffinity.prebind({
+      dry_run: dryRun,
+      limit: assignLimit.value || settings.batch_size,
+      platforms: [...settings.platforms]
+    })
+    appStore.showSuccess(dryRun ? '预绑定预览完成，未写入数据库' : `预绑定完成：绑定 ${lastResult.value.assigned} 个，跳过 ${lastResult.value.skipped} 个`)
+    if (!dryRun) {
+      await loadAll()
+    }
+  } catch (error: any) {
+    appStore.showError(error?.message || '预绑定失败')
   } finally {
     assigning.value = false
   }
@@ -702,8 +780,19 @@ function shareLabel(mode: string, status: string): string {
 function sourceLabel(source?: string): string {
   if (source === 'manual') return '手动'
   if (source === 'auto') return '自动'
+  if (source === 'pre_validation') return '校验前预绑定'
   if (source === 'proxy_affinity') return '代理亲和'
   return source || '-'
+}
+
+function phaseLabel(phase?: string): string {
+  const map: Record<string, string> = {
+    pre_validation: '校验前已绑定',
+    validated: '已校验',
+    validation_failed: '校验失败',
+    waiting_proxy: '等待可用代理'
+  }
+  return map[phase || ''] || phase || '-'
 }
 
 function healthLabel(status: string): string {
