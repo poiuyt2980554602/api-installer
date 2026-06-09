@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.29"
+        default: "1.0.29.6"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -31,7 +31,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.29.6' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'codex/pixel-1.0.27-401-fix-test' }}
       RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
@@ -81,13 +81,7 @@ jobs:
           set -euo pipefail
           overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           if [ "${RELEASE_FLAVOR}" = "official" ]; then
-            official_overlay_dir="overlays/official_${overlay_key}"
-            if [ -d "$official_overlay_dir" ]; then
-              echo "Using upstream ${PIXEL_SOURCE_VERSION} with official overlay official_${overlay_key}."
-              cp -a "${official_overlay_dir}/." pixel-src/
-            else
-              echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
-            fi
+            echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
             exit 0
           fi
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
