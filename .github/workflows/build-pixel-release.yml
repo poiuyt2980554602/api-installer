@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.1.28"
+        default: "1.1.28.1"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -31,7 +31,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.1.28' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.1.28.1' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.1.28' }}
       RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
@@ -61,6 +61,8 @@ jobs:
             source_version="codex/pixel-1.0.27-401-fix-test"
           elif printf '%s\n' "${version}" | grep -Eq '^1\.0\.32(\.[0-9]+)?$'; then
             source_version="codex/pixel-1.0.27-401-fix-test"
+          elif printf '%s\n' "${version}" | grep -Eq '^1\.1\.28\.[0-9]+$'; then
+            source_version="1.1.28"
           fi
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
           echo "PIXEL_SOURCE_VERSION=${source_version}" >> "$GITHUB_ENV"
@@ -83,7 +85,13 @@ jobs:
           set -euo pipefail
           overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
           if [ "${RELEASE_FLAVOR}" = "official" ]; then
-            echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
+            hotfix_patch="patches/pixel-${PIXEL_SOURCE_VERSION}-official-${PIXEL_VERSION}.patch"
+            if [ -f "$hotfix_patch" ]; then
+              echo "Applying official hotfix patch ${hotfix_patch}."
+              git apply --directory=pixel-src "$hotfix_patch"
+            else
+              echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
+            fi
             exit 0
           fi
           patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"

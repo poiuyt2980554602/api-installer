@@ -1,0 +1,180 @@
+diff --git a/backend/internal/config/config.go b/backend/internal/config/config.go
+index 5e17f771..e802b3a8 100644
+--- a/backend/internal/config/config.go
++++ b/backend/internal/config/config.go
+@@ -31,7 +31,7 @@ const (
+ 
+ // DefaultCSPPolicy is the default Content-Security-Policy with nonce support
+ // __CSP_NONCE__ will be replaced with actual nonce at request time by the SecurityHeaders middleware
+-const DefaultCSPPolicy = "default-src 'self'; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://static.cloudflareinsights.com https://*.stripe.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https:; frame-src https://challenges.cloudflare.com https://*.stripe.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
++const DefaultCSPPolicy = "default-src 'self'; script-src 'self' __CSP_NONCE__ https://challenges.cloudflare.com https://static.cloudflareinsights.com https://*.stripe.com https://*.airwallex.com; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; img-src 'self' data: https:; font-src 'self' data: https://fonts.gstatic.com; connect-src 'self' https:; frame-src https://challenges.cloudflare.com https://*.stripe.com https://*.airwallex.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'"
+ 
+ // UMQ（用户消息队列）模式常量
+ const (
+diff --git a/backend/internal/server/middleware/security_headers.go b/backend/internal/server/middleware/security_headers.go
+index 398c0351..28fb65d7 100644
+--- a/backend/internal/server/middleware/security_headers.go
++++ b/backend/internal/server/middleware/security_headers.go
+@@ -20,6 +20,8 @@ const (
+ 	CloudflareInsightsDomain = "https://static.cloudflareinsights.com"
+ 	// StripeDomain is the domain for Stripe.js SDK
+ 	StripeDomain = "https://*.stripe.com"
++	// AirwallexDomain is the domain for Airwallex checkout/static SDKs.
++	AirwallexDomain = "https://*.airwallex.com"
+ )
+ 
+ // GenerateNonce generates a cryptographically secure random nonce.
+@@ -101,7 +103,7 @@ func isAPIRoutePath(c *gin.Context) bool {
+ }
+ 
+ // enhanceCSPPolicy ensures the CSP policy includes nonce support, Cloudflare Insights,
+-// and Stripe.js domains. This allows the application to work correctly even if the
++// Stripe.js, and Airwallex domains. This allows the application to work correctly even if the
+ // config file has an older CSP policy.
+ func enhanceCSPPolicy(policy string) string {
+ 	// Add nonce placeholder to script-src if not present
+@@ -120,6 +122,12 @@ func enhanceCSPPolicy(policy string) string {
+ 		policy = addToDirective(policy, "frame-src", StripeDomain)
+ 	}
+ 
++	// Add Airwallex SDK/checkout domains to script-src and frame-src if not present.
++	if !strings.Contains(policy, "airwallex.com") {
++		policy = addToDirective(policy, "script-src", AirwallexDomain)
++		policy = addToDirective(policy, "frame-src", AirwallexDomain)
++	}
++
+ 	return policy
+ }
+ 
+diff --git a/backend/internal/server/middleware/security_headers_test.go b/backend/internal/server/middleware/security_headers_test.go
+index 031385d0..9892525e 100644
+--- a/backend/internal/server/middleware/security_headers_test.go
++++ b/backend/internal/server/middleware/security_headers_test.go
+@@ -129,6 +129,7 @@ func TestSecurityHeaders(t *testing.T) {
+ 		assert.Contains(t, csp, "default-src 'self'")
+ 		assert.Contains(t, csp, "'nonce-")
+ 		assert.Contains(t, csp, CloudflareInsightsDomain)
++		assert.Contains(t, csp, AirwallexDomain)
+ 	})
+ 
+ 	t.Run("api_route_skips_csp_nonce_generation", func(t *testing.T) {
+@@ -313,6 +314,23 @@ func TestEnhanceCSPPolicy(t *testing.T) {
+ 		assert.Equal(t, 1, count)
+ 	})
+ 
++	t.Run("adds_airwallex_domains_for_payment_sdk", func(t *testing.T) {
++		policy := "default-src 'self'; script-src 'self'; frame-src 'self'"
++		enhanced := enhanceCSPPolicy(policy)
++
++		assert.Contains(t, enhanced, "script-src 'self'")
++		assert.Contains(t, enhanced, "frame-src 'self'")
++		assert.Contains(t, enhanced, AirwallexDomain)
++	})
++
++	t.Run("does_not_duplicate_airwallex_domain", func(t *testing.T) {
++		policy := "default-src 'self'; script-src 'self' https://*.airwallex.com; frame-src 'self' https://*.airwallex.com"
++		enhanced := enhanceCSPPolicy(policy)
++
++		count := strings.Count(enhanced, AirwallexDomain)
++		assert.Equal(t, 2, count)
++	})
++
+ 	t.Run("handles_policy_without_script_src", func(t *testing.T) {
+ 		policy := "default-src 'self'"
+ 		enhanced := enhanceCSPPolicy(policy)
+diff --git a/frontend/src/components/layout/AppLayout.vue b/frontend/src/components/layout/AppLayout.vue
+index 4c5b0c5d..26614d86 100644
+--- a/frontend/src/components/layout/AppLayout.vue
++++ b/frontend/src/components/layout/AppLayout.vue
+@@ -25,6 +25,7 @@
+ <script setup lang="ts">
+ import '@/styles/onboarding.css'
+ import { computed, onMounted } from 'vue'
++import { useRoute } from 'vue-router'
+ import { useAppStore } from '@/stores'
+ import { useAuthStore } from '@/stores/auth'
+ import { useOnboardingTour } from '@/composables/useOnboardingTour'
+@@ -34,12 +35,16 @@ import AppHeader from './AppHeader.vue'
+ 
+ const appStore = useAppStore()
+ const authStore = useAuthStore()
++const route = useRoute()
+ const sidebarCollapsed = computed(() => appStore.sidebarCollapsed)
+ const isAdmin = computed(() => authStore.user?.role === 'admin')
++const shouldAutoStartOnboarding = () => route.path === '/admin/dashboard'
+ 
+ const { replayTour } = useOnboardingTour({
+   storageKey: isAdmin.value ? 'admin_guide' : 'user_guide',
+-  autoStart: true
++  // Only auto-start on the admin dashboard. Deep links such as settings must
++  // remain immediately usable; the guide can still be replayed from the header.
++  autoStart: shouldAutoStartOnboarding
+ })
+ 
+ const onboardingStore = useOnboardingStore()
+diff --git a/frontend/src/composables/useOnboardingTour.ts b/frontend/src/composables/useOnboardingTour.ts
+index 40d841cd..95999d7d 100644
+--- a/frontend/src/composables/useOnboardingTour.ts
++++ b/frontend/src/composables/useOnboardingTour.ts
+@@ -8,7 +8,7 @@ import { getAdminSteps, getUserSteps } from '@/components/Guide/steps'
+ 
+ export interface OnboardingOptions {
+   storageKey?: string
+-  autoStart?: boolean
++  autoStart?: boolean | (() => boolean)
+ }
+ 
+ export function useOnboardingTour(options: OnboardingOptions) {
+@@ -68,6 +68,13 @@ export function useOnboardingTour(options: OnboardingOptions) {
+     return localStorage.getItem(getStorageKey()) === 'true'
+   }
+ 
++  const shouldAutoStart = () => {
++    if (typeof options.autoStart === 'function') {
++      return options.autoStart()
++    }
++    return options.autoStart !== false
++  }
++
+   const markAsSeen = () => {
+     localStorage.setItem(getStorageKey(), 'true')
+   }
+@@ -542,8 +549,11 @@ export function useOnboardingTour(options: OnboardingOptions) {
+       return
+     }
+ 
+-    if (!options.autoStart || hasSeen()) return
++    if (!shouldAutoStart() || hasSeen()) return
+     autoStartTimer = setTimeout(() => {
++      if (!shouldAutoStart()) {
++        return
++      }
+       void startTour()
+     }, TIMING.AUTO_START_DELAY_MS)
+   })
+diff --git a/frontend/src/i18n/locales/en.ts b/frontend/src/i18n/locales/en.ts
+index 5ef6f401..6f424e01 100644
+--- a/frontend/src/i18n/locales/en.ts
++++ b/frontend/src/i18n/locales/en.ts
+@@ -6509,7 +6509,7 @@ export default {
+         claudeOAuthSystemPrompt: 'Expansion prompt',
+         claudeOAuthSystemPromptPlaceholder: 'Leave empty to use the built-in Claude Code expansion prompt.',
+         claudeOAuthSystemPromptBlocks: 'Blocks JSON',
+-        claudeOAuthSystemPromptBlocksPlaceholder: 'Leave empty for default blocks, or provide {"blocks":[{"type":"text","text":"{billing_header}"}]}',
++        claudeOAuthSystemPromptBlocksPlaceholder: 'Leave empty for default blocks, or provide {\'{"blocks":[{"type":"text","text":"{billing_header}"}]}\'}',
+         anthropicCacheTTL1hInjection: 'Anthropic Cache TTL Injection',
+         anthropicCacheTTL1hInjectionHint: 'When enabled, existing ephemeral cache_control blocks in Anthropic OAuth/Setup Token request bodies are forced to 1h; response usage is billed back as 5m by default, with account-level TTL billing override taking priority.',
+       },
+diff --git a/frontend/src/i18n/locales/zh.ts b/frontend/src/i18n/locales/zh.ts
+index fe964aa2..6a3af01d 100644
+--- a/frontend/src/i18n/locales/zh.ts
++++ b/frontend/src/i18n/locales/zh.ts
+@@ -6660,7 +6660,7 @@ export default {
+         claudeOAuthSystemPrompt: '扩展 Prompt',
+         claudeOAuthSystemPromptPlaceholder: '留空使用内置 Claude Code 扩展 prompt。',
+         claudeOAuthSystemPromptBlocks: 'Blocks JSON',
+-        claudeOAuthSystemPromptBlocksPlaceholder: '留空使用默认 blocks，或填写 {"blocks":[{"type":"text","text":"{billing_header}"}]}',
++        claudeOAuthSystemPromptBlocksPlaceholder: '留空使用默认 blocks，或填写 {\'{"blocks":[{"type":"text","text":"{billing_header}"}]}\'}',
+         anthropicCacheTTL1hInjection: 'Anthropic 缓存 TTL 注入',
+         anthropicCacheTTL1hInjectionHint: '开启后，对 Anthropic OAuth/Setup Token 请求体中已有的 ephemeral 缓存块强制写入 1h；响应 usage 默认按 5m 回写计费，账号级 TTL 计费设置优先。',
+       },
