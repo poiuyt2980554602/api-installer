@@ -14,7 +14,7 @@ on:
       pixel_source_version:
         description: Upstream Pixel source tag or branch
         required: true
-        default: "codex/pixel-1.0.27-401-fix-test"
+        default: "1.1.28"
       release_flavor:
         description: "Release flavor: official or forwarder"
         required: true
@@ -33,7 +33,7 @@ jobs:
     env:
       PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.1.28' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
-      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'codex/pixel-1.0.27-401-fix-test' }}
+      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '1.1.28' }}
       RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
     steps:
       - name: Download installer repo
