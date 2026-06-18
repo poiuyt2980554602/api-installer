@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.0.32"
+        default: "1.1.28"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -31,7 +31,7 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.0.32' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.1.28' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
       PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'codex/pixel-1.0.27-401-fix-test' }}
       RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
@@ -150,7 +150,7 @@ jobs:
           for arch in amd64 arm64; do
             out="package-${arch}"
             agent_out="subsite-agent-package-${arch}"
-            mkdir -p "$out" "$agent_out"
+            mkdir -p "$out"
             echo "::group::Build server linux/${arch}"
             (
               cd pixel-src/backend
@@ -163,28 +163,32 @@ jobs:
                 ./cmd/server
             )
             echo "::endgroup::"
-            echo "::group::Build subsite agent linux/${arch}"
-            (
-              cd pixel-src/backend
-              GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
-                -p=1 \
-                -trimpath \
-                -ldflags="-s -w" \
-                -o "../../${agent_out}/sub2api-subsite-agent" \
-                ./cmd/subsite-agent
-            )
-            echo "::endgroup::"
             cp -R pixel-src/deploy "$out/deploy"
             cp pixel-src/README.md "$out/README.md"
             cp pixel-src/LICENSE "$out/LICENSE"
             tar -C "$out" -czf "dist/sub2api_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
 
-            mkdir -p "$agent_out/deploy"
-            cp pixel-src/deploy/sub2api-subsite-agent.service "$agent_out/deploy/sub2api-subsite-agent.service"
-            cp pixel-src/deploy/subsite-agent.env.example "$agent_out/deploy/subsite-agent.env.example"
-            cp pixel-src/README.md "$agent_out/README.md"
-            cp pixel-src/LICENSE "$agent_out/LICENSE"
-            tar -C "$agent_out" -czf "dist/sub2api-subsite-agent_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
+            if [ -d pixel-src/backend/cmd/subsite-agent ]; then
+              mkdir -p "$agent_out/deploy"
+              echo "::group::Build subsite agent linux/${arch}"
+              (
+                cd pixel-src/backend
+                GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
+                  -p=1 \
+                  -trimpath \
+                  -ldflags="-s -w" \
+                  -o "../../${agent_out}/sub2api-subsite-agent" \
+                  ./cmd/subsite-agent
+              )
+              echo "::endgroup::"
+              cp pixel-src/deploy/sub2api-subsite-agent.service "$agent_out/deploy/sub2api-subsite-agent.service"
+              cp pixel-src/deploy/subsite-agent.env.example "$agent_out/deploy/subsite-agent.env.example"
+              cp pixel-src/README.md "$agent_out/README.md"
+              cp pixel-src/LICENSE "$agent_out/LICENSE"
+              tar -C "$agent_out" -czf "dist/sub2api-subsite-agent_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
+            else
+              echo "Skipping subsite agent linux/${arch}: pixel-src/backend/cmd/subsite-agent is not present in ${PIXEL_SOURCE_VERSION}."
+            fi
           done
           (
             cd dist
