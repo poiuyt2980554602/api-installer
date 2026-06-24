@@ -1,0 +1,181 @@
+diff --git a/src/App.tsx b/src/App.tsx
+index 5fc1614..72692db 100644
+--- a/src/App.tsx
++++ b/src/App.tsx
+@@ -1,7 +1,7 @@
+ import { useEffect } from 'react'
+ import { initStore } from './store'
+ import { useStore } from './store'
+-import { activateFirstImportedProfile, buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './lib/urlSettings'
++import { activateFirstImportedProfile, buildSettingsFromUrlParams, buildUrlSettingParamsFromLocation, clearUrlSettingParams, hasPixelImportHash, hasUrlSettingParams } from './lib/urlSettings'
+ import { isDefaultConfigOnlyEnabled, mergeImportedSettings } from './lib/apiProfiles'
+ import { getCustomProviderConfigUrl, loadCustomProviderSettingsFromUrl } from './lib/customProviderConfigUrl'
+ import { useDockerApiUrlMigrationNotice } from './hooks/useDockerApiUrlMigrationNotice'
+@@ -33,7 +33,7 @@ export default function App() {
+   useGlobalClickSuppression()
+ 
+   useEffect(() => {
+-    const searchParams = new URLSearchParams(window.location.search)
++    const searchParams = buildUrlSettingParamsFromLocation(window.location)
+     const customProviderConfigUrl = getCustomProviderConfigUrl()
+     const defaultConfigOnly = isDefaultConfigOnlyEnabled()
+ 
+@@ -43,12 +43,14 @@ export default function App() {
+     }
+ 
+     const clearAppliedUrlSettings = () => {
+-      if (!hasUrlSettingParams(searchParams)) return
++      const hasPixelImport = hasPixelImportHash(window.location.hash)
++      if (!hasUrlSettingParams(searchParams) && !hasPixelImport) return
+ 
+       clearUrlSettingParams(searchParams)
+ 
+       const nextSearch = searchParams.toString()
+-      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`
++      const nextHash = hasPixelImport ? '' : window.location.hash
++      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${nextHash}`
+       window.history.replaceState(null, '', nextUrl)
+     }
+ 
+diff --git a/src/lib/urlSettings.test.ts b/src/lib/urlSettings.test.ts
+index 04d55f3..f16572b 100644
+--- a/src/lib/urlSettings.test.ts
++++ b/src/lib/urlSettings.test.ts
+@@ -6,7 +6,7 @@ import {
+   DEFAULT_SETTINGS,
+   normalizeSettings,
+ } from './apiProfiles'
+-import { buildSettingsFromUrlParams, clearUrlSettingParams, hasUrlSettingParams } from './urlSettings'
++import { buildSettingsFromUrlParams, buildUrlSettingParamsFromLocation, clearUrlSettingParams, hasPixelImportHash, hasUrlSettingParams } from './urlSettings'
+ 
+ afterEach(() => {
+   vi.unstubAllEnvs()
+@@ -20,6 +20,13 @@ async function importDefaultConfigOnlyUrlSettings() {
+ }
+ 
+ describe('URL settings params', () => {
++  function encodeBase64UrlUtf8(value: string): string {
++    const bytes = new TextEncoder().encode(value)
++    let binary = ''
++    for (const byte of bytes) binary += String.fromCharCode(byte)
++    return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '')
++  }
++
+   it('creates and activates a new OpenAI profile for legacy URL params', () => {
+     const current = normalizeSettings(DEFAULT_SETTINGS)
+     const next = normalizeSettings({
+@@ -38,6 +45,41 @@ describe('URL settings params', () => {
+     })
+   })
+ 
++  it('creates and activates an OpenAI image profile from Pixel import hash', () => {
++    const payload = encodeBase64UrlUtf8(JSON.stringify({
++      version: 1,
++      source: 'pixel-api',
++      sourceName: 'My Pixel',
++      apiBaseUrl: 'https://pixel.example.com',
++      apiKey: 'sk-pixel',
++      keyId: 12,
++      keyName: 'Image Key',
++      provider: 'pixel',
++      model: 'gpt-image-2',
++      issuedAt: 1,
++    }))
++    const params = buildUrlSettingParamsFromLocation({
++      search: '',
++      hash: `#/import/pixel?payload=${payload}`,
++    } as Location)
++    const current = normalizeSettings(DEFAULT_SETTINGS)
++    const next = normalizeSettings({
++      ...current,
++      ...buildSettingsFromUrlParams(current, params),
++    })
++
++    expect(hasPixelImportHash(`#/import/pixel?payload=${payload}`)).toBe(true)
++    expect(next.profiles).toHaveLength(2)
++    expect(next.profiles.find((profile) => profile.id === next.activeProfileId)).toMatchObject({
++      name: 'My Pixel - Image Key',
++      provider: 'openai',
++      baseUrl: 'https://pixel.example.com',
++      apiKey: 'sk-pixel',
++      model: 'gpt-image-2',
++      apiMode: 'images',
++    })
++  })
++
+   it('uses model from URL params for OpenAI profiles', () => {
+     const current = normalizeSettings(DEFAULT_SETTINGS)
+     const next = normalizeSettings({
+diff --git a/src/lib/urlSettings.ts b/src/lib/urlSettings.ts
+index aeb2a9a..b491ecb 100644
+--- a/src/lib/urlSettings.ts
++++ b/src/lib/urlSettings.ts
+@@ -12,6 +12,7 @@ import {
+ } from './apiProfiles'
+ 
+ const URL_SETTING_KEYS = ['settings', 'apiUrl', 'apiKey', 'codexCli', 'apiMode', 'model', 'profileName', 'streamImages', 'streamPartialImages']
++const PIXEL_IMPORT_HASH_PATH = '/import/pixel'
+ 
+ function getProfileDedupKey(profile: Pick<AppSettings['profiles'][number], 'provider' | 'baseUrl' | 'apiKey' | 'model' | 'apiMode' | 'codexCli' | 'streamImages' | 'streamPartialImages'>) {
+   return JSON.stringify([
+@@ -58,6 +59,60 @@ function getUrlSettingsPayload(searchParams: URLSearchParams): unknown | null {
+   }
+ }
+ 
++function decodeBase64UrlUtf8(value: string): string {
++  const normalized = value.replace(/-/g, '+').replace(/_/g, '/')
++  const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, '=')
++  const binary = atob(padded)
++  const bytes = Uint8Array.from(binary, (char) => char.charCodeAt(0))
++  return new TextDecoder().decode(bytes)
++}
++
++function getPixelImportPayload(hash: string): Record<string, unknown> | null {
++  const route = hash.trim().replace(/^#/, '')
++  if (!route.startsWith(PIXEL_IMPORT_HASH_PATH)) return null
++
++  const queryIndex = route.indexOf('?')
++  if (queryIndex < 0) return null
++
++  const payload = new URLSearchParams(route.slice(queryIndex + 1)).get('payload')
++  if (!payload) return null
++
++  try {
++    const parsed = JSON.parse(decodeBase64UrlUtf8(payload))
++    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return null
++    return parsed as Record<string, unknown>
++  } catch {
++    return null
++  }
++}
++
++function getPixelImportProfileName(payload: Record<string, unknown>): string {
++  const sourceName = typeof payload.sourceName === 'string' ? payload.sourceName.trim() : ''
++  const keyName = typeof payload.keyName === 'string' ? payload.keyName.trim() : ''
++  return [sourceName, keyName].filter(Boolean).join(' - ') || 'Pixel API'
++}
++
++export function hasPixelImportHash(hash: string): boolean {
++  return getPixelImportPayload(hash) !== null
++}
++
++export function buildUrlSettingParamsFromLocation(location: Pick<Location, 'search' | 'hash'>): URLSearchParams {
++  const searchParams = new URLSearchParams(location.search)
++  const pixelPayload = getPixelImportPayload(location.hash)
++  if (!pixelPayload) return searchParams
++
++  const apiBaseUrl = typeof pixelPayload.apiBaseUrl === 'string' ? pixelPayload.apiBaseUrl.trim() : ''
++  const apiKey = typeof pixelPayload.apiKey === 'string' ? pixelPayload.apiKey.trim() : ''
++  const model = typeof pixelPayload.model === 'string' ? pixelPayload.model.trim() : ''
++  if (apiBaseUrl) searchParams.set('apiUrl', apiBaseUrl)
++  if (apiKey) searchParams.set('apiKey', apiKey)
++  if (model) searchParams.set('model', model)
++  searchParams.set('apiMode', 'images')
++  searchParams.set('profileName', getPixelImportProfileName(pixelPayload))
++
++  return searchParams
++}
++
+ export function activateFirstImportedProfile(settings: AppSettings, importedSettings: unknown): AppSettings {
+   if (!importedSettings || typeof importedSettings !== 'object' || Array.isArray(importedSettings)) return settings
+ 

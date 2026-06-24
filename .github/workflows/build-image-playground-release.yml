@@ -1,0 +1,214 @@
+name: Build Pixel Image Playground Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      playground_version:
+        description: Release version to publish
+        required: true
+        default: "0.6.10.1"
+      upstream_repo:
+        description: Upstream image playground repository
+        required: true
+        default: "CookSleep/gpt_image_playground"
+      upstream_version:
+        description: Upstream image playground tag or branch
+        required: true
+        default: "v0.6.10"
+  push:
+    tags:
+      - "v*-image-playground"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      PLAYGROUND_VERSION: ${{ github.event.inputs.playground_version || '0.6.10.1' }}
+      UPSTREAM_REPO: ${{ github.event.inputs.upstream_repo || 'CookSleep/gpt_image_playground' }}
+      UPSTREAM_VERSION: ${{ github.event.inputs.upstream_version || 'v0.6.10' }}
+    steps:
+      - name: Download installer repo
+        run: |
+          curl -fsSL "https://github.com/${GITHUB_REPOSITORY}/archive/${GITHUB_SHA}.tar.gz" -o installer.tar.gz
+          tar -xzf installer.tar.gz --strip-components=1
+
+      - name: Resolve version from tag
+        if: startsWith(github.ref, 'refs/tags/')
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          version="${tag#v}"
+          version="${version%-image-playground}"
+          echo "PLAYGROUND_VERSION=${version}" >> "$GITHUB_ENV"
+          case "${version}" in
+            0.6.10.*) echo "UPSTREAM_VERSION=v0.6.10" >> "$GITHUB_ENV" ;;
+          esac
+
+      - name: Download upstream image playground
+        run: |
+          set -euo pipefail
+          if curl -fsSL "https://github.com/${UPSTREAM_REPO}/archive/refs/tags/${UPSTREAM_VERSION}.tar.gz" -o playground.tar.gz; then
+            echo "Downloaded upstream tag ${UPSTREAM_VERSION}"
+          else
+            curl -fsSL "https://github.com/${UPSTREAM_REPO}/archive/refs/heads/${UPSTREAM_VERSION}.tar.gz" -o playground.tar.gz
+            echo "Downloaded upstream branch ${UPSTREAM_VERSION}"
+          fi
+          mkdir playground-src
+          tar -xzf playground.tar.gz -C playground-src --strip-components=1
+
+      - name: Apply Pixel import compatibility patch
+        run: |
+          set -euo pipefail
+          patch_file="image-playground/patches/gpt-image-playground-0.6.10-pixel-import.patch"
+          git apply --directory=playground-src "$patch_file"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: playground-src/package-lock.json
+
+      - name: Build image playground frontend
+        run: |
+          npm --prefix playground-src ci
+          npm --prefix playground-src test
+          npm --prefix playground-src run build
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: image-playground/go.mod
+          cache-dependency-path: image-playground/go.mod
+
+      - name: Build Linux binaries
+        env:
+          CGO_ENABLED: "0"
+        run: |
+          set -euo pipefail
+          rm -rf image-playground/cmd/image-playground/web
+          mkdir -p image-playground/cmd/image-playground/web
+          cp -a playground-src/dist/. image-playground/cmd/image-playground/web/
+          mkdir -p dist
+          built_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          for arch in amd64 arm64; do
+            out="pixel-image-playground-package-${arch}"
+            mkdir -p "$out"
+            (
+              cd image-playground
+              GOOS=linux GOARCH="$arch" go build \
+                -trimpath \
+                -ldflags="-s -w -X main.Version=${PLAYGROUND_VERSION} -X main.UpstreamVersion=${UPSTREAM_VERSION} -X main.BuiltAt=${built_at}" \
+                -o "../${out}/pixel-image-playground" \
+                ./cmd/image-playground
+            )
+            cp image-playground/README.md "$out/README.md"
+            cp playground-src/LICENSE "$out/LICENSE"
+            tar -C "$out" -czf "dist/pixel-image-playground_${PLAYGROUND_VERSION}_linux_${arch}.tar.gz" .
+          done
+          (
+            cd dist
+            sha256sum *.tar.gz > checksums.txt
+          )
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="v${PLAYGROUND_VERSION}-image-playground"
+          body_file="$(mktemp)"
+          cat > "$body_file" <<EOF
+          Pixel Image Playground ${PLAYGROUND_VERSION}, built from \`${UPSTREAM_REPO}\` source \`${UPSTREAM_VERSION}\` with Pixel API key import compatibility.
+
+          Install:
+          \`\`\`bash
+          curl -sSL https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/main/deploy/install-image-playground.sh | sudo bash
+          \`\`\`
+          EOF
+          python3 - "$tag" "Pixel Image Playground ${PLAYGROUND_VERSION}" "$body_file" dist/*.tar.gz dist/checksums.txt <<'PY'
+          import json
+          import mimetypes
+          import os
+          import pathlib
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          tag, title, body_path, *assets = sys.argv[1:]
+          repo = os.environ["GITHUB_REPOSITORY"]
+          token = os.environ["GH_TOKEN"]
+          api = f"https://api.github.com/repos/{repo}"
+
+          def request(method, url, data=None, headers=None, expected=(200, 201, 204)):
+              payload = None
+              merged_headers = {
+                  "Authorization": f"Bearer {token}",
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+                  "User-Agent": "pixel-image-playground-release-publisher",
+              }
+              if headers:
+                  merged_headers.update(headers)
+              if data is not None:
+                  payload = data if isinstance(data, bytes) else json.dumps(data).encode()
+                  merged_headers.setdefault("Content-Type", "application/json")
+              req = urllib.request.Request(url, data=payload, headers=merged_headers, method=method)
+              try:
+                  with urllib.request.urlopen(req) as response:
+                      body = response.read()
+                      if response.status not in expected:
+                          raise RuntimeError(f"{method} {url} returned {response.status}: {body[:500]!r}")
+                      return json.loads(body) if body else None
+              except urllib.error.HTTPError as exc:
+                  detail = exc.read().decode(errors="replace")
+                  if exc.code not in expected:
+                      raise RuntimeError(f"{method} {url} failed with {exc.code}: {detail}") from exc
+                  return None
+
+          def get_release():
+              try:
+                  return request("GET", f"{api}/releases/tags/{urllib.parse.quote(tag)}")
+              except RuntimeError as exc:
+                  if "failed with 404" in str(exc):
+                      return None
+                  raise
+
+          release = get_release()
+          if release is not None:
+              request("DELETE", f"{api}/releases/{release['id']}")
+
+          release = request(
+              "POST",
+              f"{api}/releases",
+              {
+                  "tag_name": tag,
+                  "target_commitish": os.environ["GITHUB_SHA"],
+                  "name": title,
+                  "body": pathlib.Path(body_path).read_text(),
+                  "draft": False,
+                  "prerelease": False,
+              },
+          )
+
+          upload_url = release["upload_url"].split("{", 1)[0]
+          for asset_path in assets:
+              path = pathlib.Path(asset_path)
+              content_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+              request(
+                  "POST",
+                  f"{upload_url}?name={urllib.parse.quote(path.name)}",
+                  path.read_bytes(),
+                  headers={"Content-Type": content_type},
+              )
+              print(f"uploaded {path.name}")
+
+          refreshed = request("GET", f"{api}/releases/{release['id']}")
+          uploaded = {asset["name"] for asset in refreshed.get("assets", [])}
+          missing = [pathlib.Path(asset).name for asset in assets if pathlib.Path(asset).name not in uploaded]
+          if missing:
+              raise RuntimeError(f"release asset upload did not persist: {missing}")
+          PY
