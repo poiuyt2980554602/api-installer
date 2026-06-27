@@ -14,8 +14,9 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.1}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.2}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
+IMAGE_PLAYGROUND_URL="${IMAGE_PLAYGROUND_URL:-https://tp.kelisiai.pro}"
 
 APP_NAME="sub2api"
 SERVICE_NAME="sub2api"
@@ -126,6 +127,7 @@ Options:
 Environment overrides:
   RELEASE_REPO=${RELEASE_REPO}
   RELEASE_TAG=${RELEASE_TAG}
+  IMAGE_PLAYGROUND_URL=${IMAGE_PLAYGROUND_URL}
   SERVER_HOST=${SERVER_HOST}
   SERVER_PORT=${SERVER_PORT}
 EOF
@@ -275,6 +277,136 @@ install_files() {
     print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
+ensure_image_playground_cors() {
+    local origin="${IMAGE_PLAYGROUND_URL%/}"
+    local config_file="${CONFIG_DIR}/config.yaml"
+
+    if [ -z "$origin" ]; then
+        print_info "Image playground CORS origin is empty; skipping CORS update"
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+
+    if [ ! -f "$config_file" ]; then
+        cat > "$config_file" <<EOF
+cors:
+    allowed_origins:
+        - ${origin}
+    allow_credentials: true
+EOF
+        chown "${SERVICE_USER}:${SERVICE_USER}" "$config_file" 2>/dev/null || true
+        print_success "Created ${config_file} with image playground CORS origin: ${origin}"
+        return 0
+    fi
+
+    if grep -Fq -- "- ${origin}" "$config_file"; then
+        print_info "Image playground CORS origin already configured: ${origin}"
+        return 0
+    fi
+
+    cp "$config_file" "${config_file}.backup.$(date +%Y%m%d%H%M%S)"
+
+    if command_exists python3; then
+        ORIGIN="$origin" python3 - "$config_file" <<'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+config_path = Path(sys.argv[1])
+origin = os.environ["ORIGIN"].strip().rstrip("/")
+text = config_path.read_text(encoding="utf-8")
+lines = text.splitlines(True)
+
+def line_indent(line: str) -> str:
+    return line[: len(line) - len(line.lstrip(" "))]
+
+def is_top_level_key(line: str) -> bool:
+    stripped = line.strip()
+    return bool(stripped and not line.startswith((" ", "\t", "#")) and ":" in stripped)
+
+if any(re.match(rf"^\s*-\s*{re.escape(origin)}\s*(#.*)?$", line) for line in lines):
+    sys.exit(0)
+
+cors_idx = next((i for i, line in enumerate(lines) if re.match(r"^cors\s*:\s*(#.*)?$", line)), None)
+if cors_idx is None:
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+    if lines and lines[-1].strip():
+        lines.append("\n")
+    lines.extend([
+        "cors:\n",
+        "    allowed_origins:\n",
+        f"        - {origin}\n",
+        "    allow_credentials: true\n",
+    ])
+    config_path.write_text("".join(lines), encoding="utf-8")
+    sys.exit(0)
+
+block_end = len(lines)
+for i in range(cors_idx + 1, len(lines)):
+    if is_top_level_key(lines[i]):
+        block_end = i
+        break
+
+allowed_idx = None
+for i in range(cors_idx + 1, block_end):
+    if re.match(r"^\s*allowed_origins\s*:", lines[i]):
+        allowed_idx = i
+        break
+
+if allowed_idx is None:
+    lines.insert(cors_idx + 1, f"    allow_credentials: true\n")
+    lines.insert(cors_idx + 1, f"        - {origin}\n")
+    lines.insert(cors_idx + 1, "    allowed_origins:\n")
+    config_path.write_text("".join(lines), encoding="utf-8")
+    sys.exit(0)
+
+allowed_line = lines[allowed_idx]
+allowed_indent = line_indent(allowed_line)
+list_indent = allowed_indent + "    "
+
+if re.search(r"allowed_origins\s*:\s*\[\s*\]", allowed_line):
+    lines[allowed_idx] = f"{allowed_indent}allowed_origins:\n"
+    lines.insert(allowed_idx + 1, f"{list_indent}- {origin}\n")
+    config_path.write_text("".join(lines), encoding="utf-8")
+    sys.exit(0)
+
+insert_idx = allowed_idx + 1
+for i in range(allowed_idx + 1, block_end):
+    stripped = lines[i].strip()
+    if not stripped or stripped.startswith("#"):
+        insert_idx = i + 1
+        continue
+    current_indent = len(lines[i]) - len(lines[i].lstrip(" "))
+    allowed_indent_len = len(allowed_indent)
+    if current_indent <= allowed_indent_len and not stripped.startswith("-"):
+        break
+    if stripped.startswith("-"):
+        list_indent = line_indent(lines[i])
+        insert_idx = i + 1
+        continue
+    insert_idx = i + 1
+
+lines.insert(insert_idx, f"{list_indent}- {origin}\n")
+config_path.write_text("".join(lines), encoding="utf-8")
+PY
+    else
+        cat >> "$config_file" <<EOF
+
+cors:
+    allowed_origins:
+        - ${origin}
+    allow_credentials: true
+EOF
+        print_warning "python3 not found; appended CORS block to ${config_file}"
+    fi
+
+    chown "${SERVICE_USER}:${SERVICE_USER}" "$config_file" 2>/dev/null || true
+    print_success "Configured image playground CORS origin: ${origin}"
+}
+
 verify_binary() {
     local binary_path="${INSTALL_DIR}/${APP_NAME}"
     local version_output=""
@@ -382,6 +514,7 @@ do_install() {
     download_and_extract
     create_user_if_needed
     install_files
+    ensure_image_playground_cors
     verify_binary
     install_service
     start_service
