@@ -14,9 +14,10 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.3}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.4}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
 IMAGE_PLAYGROUND_URL="${IMAGE_PLAYGROUND_URL:-https://tp.kelisiai.pro}"
+EXTRA_CORS_ORIGINS="${EXTRA_CORS_ORIGINS:-http://wails.localhost}"
 
 APP_NAME="sub2api"
 SERVICE_NAME="sub2api"
@@ -128,6 +129,7 @@ Environment overrides:
   RELEASE_REPO=${RELEASE_REPO}
   RELEASE_TAG=${RELEASE_TAG}
   IMAGE_PLAYGROUND_URL=${IMAGE_PLAYGROUND_URL}
+  EXTRA_CORS_ORIGINS=${EXTRA_CORS_ORIGINS}
   SERVER_HOST=${SERVER_HOST}
   SERVER_PORT=${SERVER_PORT}
 EOF
@@ -409,6 +411,8 @@ ensure_image_playground_cors() {
     local origin="${IMAGE_PLAYGROUND_URL%/}"
     local etc_config="${CONFIG_DIR}/config.yaml"
     local install_config="${INSTALL_DIR}/config.yaml"
+    local origins=()
+    local extra_origin=""
 
     if [ -z "$origin" ]; then
         print_info "Image playground CORS origin is empty; skipping CORS update"
@@ -417,11 +421,26 @@ ensure_image_playground_cors() {
 
     mkdir -p "$CONFIG_DIR"
 
-    patch_image_playground_cors_file "$etc_config" "$origin" "true"
+    origins+=("$origin")
+    if [ -n "$EXTRA_CORS_ORIGINS" ]; then
+        IFS=',' read -r -a extra_origins <<< "$EXTRA_CORS_ORIGINS"
+        for extra_origin in "${extra_origins[@]}"; do
+            extra_origin="$(printf '%s' "$extra_origin" | xargs)"
+            if [ -n "$extra_origin" ]; then
+                origins+=("${extra_origin%/}")
+            fi
+        done
+    fi
+
+    for origin in "${origins[@]}"; do
+        patch_image_playground_cors_file "$etc_config" "$origin" "true"
+    done
 
     if [ -f "$install_config" ]; then
         print_warning "${install_config} exists and can take precedence over ${etc_config}; updating it too."
-        patch_image_playground_cors_file "$install_config" "$origin" "false"
+        for origin in "${origins[@]}"; do
+            patch_image_playground_cors_file "$install_config" "$origin" "false"
+        done
     fi
 }
 
