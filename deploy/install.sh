@@ -14,7 +14,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 RELEASE_REPO="${RELEASE_REPO:-poiuyt2980554602/api-installer}"
-PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.2}"
+PIXEL_VERSION="${PIXEL_VERSION:-1.1.50.3}"
 RELEASE_TAG="${RELEASE_TAG:-v${PIXEL_VERSION}-pixel}"
 IMAGE_PLAYGROUND_URL="${IMAGE_PLAYGROUND_URL:-https://tp.kelisiai.pro}"
 
@@ -277,18 +277,16 @@ install_files() {
     print_success "Binary installed to ${INSTALL_DIR}/${APP_NAME}"
 }
 
-ensure_image_playground_cors() {
-    local origin="${IMAGE_PLAYGROUND_URL%/}"
-    local config_file="${CONFIG_DIR}/config.yaml"
-
-    if [ -z "$origin" ]; then
-        print_info "Image playground CORS origin is empty; skipping CORS update"
-        return 0
-    fi
-
-    mkdir -p "$CONFIG_DIR"
+patch_image_playground_cors_file() {
+    local config_file="$1"
+    local origin="$2"
+    local create_if_missing="${3:-false}"
 
     if [ ! -f "$config_file" ]; then
+        if [ "$create_if_missing" != "true" ]; then
+            return 0
+        fi
+        mkdir -p "$(dirname "$config_file")"
         cat > "$config_file" <<EOF
 cors:
     allowed_origins:
@@ -404,7 +402,27 @@ EOF
     fi
 
     chown "${SERVICE_USER}:${SERVICE_USER}" "$config_file" 2>/dev/null || true
-    print_success "Configured image playground CORS origin: ${origin}"
+    print_success "Configured image playground CORS origin in ${config_file}: ${origin}"
+}
+
+ensure_image_playground_cors() {
+    local origin="${IMAGE_PLAYGROUND_URL%/}"
+    local etc_config="${CONFIG_DIR}/config.yaml"
+    local install_config="${INSTALL_DIR}/config.yaml"
+
+    if [ -z "$origin" ]; then
+        print_info "Image playground CORS origin is empty; skipping CORS update"
+        return 0
+    fi
+
+    mkdir -p "$CONFIG_DIR"
+
+    patch_image_playground_cors_file "$etc_config" "$origin" "true"
+
+    if [ -f "$install_config" ]; then
+        print_warning "${install_config} exists and can take precedence over ${etc_config}; updating it too."
+        patch_image_playground_cors_file "$install_config" "$origin" "false"
+    fi
 }
 
 verify_binary() {
