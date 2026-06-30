@@ -1,0 +1,145 @@
+diff --git a/backend/internal/config/config.go b/backend/internal/config/config.go
+index 02b3a913..c221eb95 100644
+--- a/backend/internal/config/config.go
++++ b/backend/internal/config/config.go
+@@ -610,6 +610,9 @@ type GatewayConfig struct {
+ 	// 等待上游响应头的超时时间（秒），0表示无超时
+ 	// 注意：这不影响流式数据传输，只控制等待响应头的时间
+ 	ResponseHeaderTimeout int `mapstructure:"response_header_timeout"`
++	// 首响应 failover 保护超时（秒），0表示禁用
++	// 用于上游长时间不返回响应头且尚未写客户端时切换账号/返回错误。
++	UpstreamFirstResponseFailoverTimeout int `mapstructure:"upstream_first_response_failover_timeout"`
+ 	// 请求体最大字节数，用于网关请求体大小限制
+ 	MaxBodySize int64 `mapstructure:"max_body_size"`
+ 	// 非流式上游响应体读取上限（字节），用于防止无界读取导致内存放大
+@@ -1685,6 +1688,7 @@ func setDefaults() {
+ 
+ 	// Gateway
+ 	viper.SetDefault("gateway.response_header_timeout", 600) // 600秒(10分钟)等待上游响应头，LLM高负载时可能排队较久
++	viper.SetDefault("gateway.upstream_first_response_failover_timeout", 20)
+ 	viper.SetDefault("gateway.log_upstream_error_body", true)
+ 	viper.SetDefault("gateway.log_upstream_error_body_max_bytes", 2048)
+ 	viper.SetDefault("gateway.inject_beta_for_apikey", false)
+@@ -2544,6 +2548,13 @@ func (c *Config) Validate() error {
+ 	if c.Gateway.MaxLineSize != 0 && c.Gateway.MaxLineSize < 1024*1024 {
+ 		return fmt.Errorf("gateway.max_line_size must be at least 1MB")
+ 	}
++	if c.Gateway.UpstreamFirstResponseFailoverTimeout < 0 {
++		return fmt.Errorf("gateway.upstream_first_response_failover_timeout must be non-negative")
++	}
++	if c.Gateway.UpstreamFirstResponseFailoverTimeout != 0 &&
++		(c.Gateway.UpstreamFirstResponseFailoverTimeout < 5 || c.Gateway.UpstreamFirstResponseFailoverTimeout > 300) {
++		return fmt.Errorf("gateway.upstream_first_response_failover_timeout must be 0 or between 5-300 seconds")
++	}
+ 	if c.Gateway.UsageRecord.WorkerCount <= 0 {
+ 		return fmt.Errorf("gateway.usage_record.worker_count must be positive")
+ 	}
+diff --git a/backend/internal/service/gateway_forward_as_chat_completions.go b/backend/internal/service/gateway_forward_as_chat_completions.go
+index cfade5ec..11217101 100644
+--- a/backend/internal/service/gateway_forward_as_chat_completions.go
++++ b/backend/internal/service/gateway_forward_as_chat_completions.go
+@@ -126,7 +126,7 @@ func (s *GatewayService) ForwardAsChatCompletions(
+ 	}
+ 
+ 	// 11. Send request
+-	resp, err := doWithFirstResponseFailover(ctx, upstreamReq, func(req *http.Request) (*http.Response, error) {
++	resp, err := doWithFirstResponseFailover(ctx, upstreamReq, s.upstreamFirstResponseFailoverTimeout(), func(req *http.Request) (*http.Response, error) {
+ 		return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+ 	})
+ 	if err != nil {
+diff --git a/backend/internal/service/gateway_forward_as_responses.go b/backend/internal/service/gateway_forward_as_responses.go
+index bd75c471..54c37e93 100644
+--- a/backend/internal/service/gateway_forward_as_responses.go
++++ b/backend/internal/service/gateway_forward_as_responses.go
+@@ -123,7 +123,7 @@ func (s *GatewayService) ForwardAsResponses(
+ 	}
+ 
+ 	// 11. Send request
+-	resp, err := doWithFirstResponseFailover(ctx, upstreamReq, func(req *http.Request) (*http.Response, error) {
++	resp, err := doWithFirstResponseFailover(ctx, upstreamReq, s.upstreamFirstResponseFailoverTimeout(), func(req *http.Request) (*http.Response, error) {
+ 		return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+ 	})
+ 	if err != nil {
+diff --git a/backend/internal/service/gateway_service.go b/backend/internal/service/gateway_service.go
+index 36f30ad8..74565f5f 100644
+--- a/backend/internal/service/gateway_service.go
++++ b/backend/internal/service/gateway_service.go
+@@ -3967,7 +3967,7 @@ const (
+ 	maxRetryElapsed = 10 * time.Second
+ 
+ 	// 首响应保护：上游长时间不返回响应头时，若尚未写客户端，则尽快切换账号。
+-	upstreamFirstResponseFailoverTimeout = 12 * time.Second
++	defaultUpstreamFirstResponseFailoverTimeout = 20 * time.Second
+ )
+ 
+ func (s *GatewayService) shouldRetryUpstreamError(account *Account, statusCode int) bool {
+@@ -4041,8 +4041,26 @@ func upstreamFirstResponseFailoverError(err error) *UpstreamFailoverError {
+ 
+ type upstreamDoFunc func(req *http.Request) (*http.Response, error)
+ 
+-func doWithFirstResponseFailover(ctx context.Context, req *http.Request, do upstreamDoFunc) (*http.Response, error) {
+-	if req == nil || do == nil || upstreamFirstResponseFailoverTimeout <= 0 {
++func resolveUpstreamFirstResponseFailoverTimeout(cfg *config.Config) time.Duration {
++	if cfg == nil {
++		return defaultUpstreamFirstResponseFailoverTimeout
++	}
++	seconds := cfg.Gateway.UpstreamFirstResponseFailoverTimeout
++	if seconds <= 0 {
++		return 0
++	}
++	return time.Duration(seconds) * time.Second
++}
++
++func (s *GatewayService) upstreamFirstResponseFailoverTimeout() time.Duration {
++	if s == nil {
++		return defaultUpstreamFirstResponseFailoverTimeout
++	}
++	return resolveUpstreamFirstResponseFailoverTimeout(s.cfg)
++}
++
++func doWithFirstResponseFailover(ctx context.Context, req *http.Request, timeout time.Duration, do upstreamDoFunc) (*http.Response, error) {
++	if req == nil || do == nil || timeout <= 0 {
+ 		if do == nil {
+ 			return nil, errors.New("nil upstream do function")
+ 		}
+@@ -4075,7 +4093,7 @@ func doWithFirstResponseFailover(ctx context.Context, req *http.Request, do upst
+ 		}{resp: resp, err: err}
+ 	}()
+ 
+-	timer := time.NewTimer(upstreamFirstResponseFailoverTimeout)
++	timer := time.NewTimer(timeout)
+ 	defer func() {
+ 		if !timer.Stop() {
+ 			select {
+@@ -4805,7 +4823,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
+ 		}
+ 
+ 		// 发送请求
+-		resp, err = doWithFirstResponseFailover(ctx, upstreamReq, func(req *http.Request) (*http.Response, error) {
++		resp, err = doWithFirstResponseFailover(ctx, upstreamReq, s.upstreamFirstResponseFailoverTimeout(), func(req *http.Request) (*http.Response, error) {
+ 			return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, tlsProfile)
+ 		})
+ 		if err != nil {
+@@ -5305,7 +5323,7 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
+ 			return nil, err
+ 		}
+ 
+-		resp, err = doWithFirstResponseFailover(ctx, upstreamReq, func(req *http.Request) (*http.Response, error) {
++		resp, err = doWithFirstResponseFailover(ctx, upstreamReq, s.upstreamFirstResponseFailoverTimeout(), func(req *http.Request) (*http.Response, error) {
+ 			return s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
+ 		})
+ 		if err != nil {
+diff --git a/deploy/config.example.yaml b/deploy/config.example.yaml
+index 440032be..b248fd2b 100644
+--- a/deploy/config.example.yaml
++++ b/deploy/config.example.yaml
+@@ -149,6 +149,9 @@ gateway:
+   # Timeout for waiting upstream response headers (seconds)
+   # 等待上游响应头超时时间（秒）
+   response_header_timeout: 600
++  # First-response failover timeout before switching accounts/returning an error (seconds, 0=disable)
++  # 上游首响应 failover 保护超时（秒，0=禁用）
++  upstream_first_response_failover_timeout: 20
+   # Max request body size in bytes (default: 256MB)
+   # 请求体最大字节数（默认 256MB）
+   max_body_size: 268435456
