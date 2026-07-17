@@ -6,27 +6,22 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.1.50.5"
+        default: "1.2.6"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
         default: "PIXEL-API/PixelAPI"
       pixel_source_version:
-        description: Upstream Pixel source tag or branch
+        description: Upstream Pixel source tag, branch, or commit
         required: true
-        default: "main"
+        default: "9bc297283834e9dc59792e9059ad7cdf398d870c"
       image_playground_url:
         description: Default image playground URL injected into the Pixel frontend
         required: true
         default: "https://tp.kelisiai.pro"
-      release_flavor:
-        description: "Release flavor: official or forwarder"
-        required: true
-        default: "official"
   push:
     tags:
       - "v*-pixel"
-      - "v*-forwarder-pixel"
 
 permissions:
   contents: write
@@ -35,11 +30,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.1.50.5' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.2.6' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
-      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'main' }}
+      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '9bc297283834e9dc59792e9059ad7cdf398d870c' }}
       IMAGE_PLAYGROUND_URL: ${{ github.event.inputs.image_playground_url || 'https://tp.kelisiai.pro' }}
-      RELEASE_FLAVOR: ${{ github.event.inputs.release_flavor || 'official' }}
     steps:
       - name: Download installer repo
         run: |
@@ -51,79 +45,27 @@ jobs:
         run: |
           tag="${GITHUB_REF_NAME}"
           version="${tag#v}"
-          release_flavor="official"
-          if printf '%s\n' "${tag}" | grep -q -- '-forwarder-pixel$'; then
-            release_flavor="forwarder"
-          fi
-          version="${version%-forwarder-pixel}"
           version="${version%-pixel}"
-          source_version="${version}"
-          if printf '%s\n' "${version}" | grep -Eq '^1\.0\.20\.[0-9]+$'; then
-            source_version="1.0.20"
-          elif printf '%s\n' "${version}" | grep -Eq '^1\.0\.26(\.[0-9]+)?$'; then
-            source_version="1.0.26"
-          elif printf '%s\n' "${version}" | grep -Eq '^1\.0\.29(\.[0-9]+)?$'; then
-            source_version="codex/pixel-1.0.27-401-fix-test"
-          elif printf '%s\n' "${version}" | grep -Eq '^1\.0\.32(\.[0-9]+)?$'; then
-            source_version="codex/pixel-1.0.27-401-fix-test"
-          elif printf '%s\n' "${version}" | grep -Eq '^1\.1\.28\.[0-9]+$'; then
-            source_version="1.1.28"
-          elif printf '%s\n' "${version}" | grep -Eq '^1\.1\.50\.[0-9]+$'; then
-            source_version="main"
-          fi
           echo "PIXEL_VERSION=${version}" >> "$GITHUB_ENV"
-          echo "PIXEL_SOURCE_VERSION=${source_version}" >> "$GITHUB_ENV"
-          echo "RELEASE_FLAVOR=${release_flavor}" >> "$GITHUB_ENV"
 
       - name: Download Pixel source
         run: |
           set -euo pipefail
-          if curl -fsSL "https://github.com/${PIXEL_SOURCE_REPO}/archive/refs/tags/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz; then
-            echo "Downloaded Pixel tag ${PIXEL_SOURCE_VERSION}"
-          else
-            curl -fsSL "https://github.com/${PIXEL_SOURCE_REPO}/archive/refs/heads/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz
-            echo "Downloaded Pixel branch ${PIXEL_SOURCE_VERSION}"
-          fi
+          curl -fsSL "https://github.com/${PIXEL_SOURCE_REPO}/archive/${PIXEL_SOURCE_VERSION}.tar.gz" -o pixel.tar.gz
+          echo "Downloaded Pixel source ${PIXEL_SOURCE_VERSION}"
           mkdir pixel-src
           tar -xzf pixel.tar.gz -C pixel-src --strip-components=1
 
-      - name: Apply Pixel compatibility patches and overlays
+      - name: Verify official Pixel source
         run: |
           set -euo pipefail
-          overlay_key="${PIXEL_SOURCE_VERSION//\//_}"
-          if [ "${RELEASE_FLAVOR}" = "official" ]; then
-            hotfix_patch="patches/pixel-${PIXEL_SOURCE_VERSION}-official-${PIXEL_VERSION}.patch"
-            if [ -f "$hotfix_patch" ]; then
-              echo "Applying official hotfix patch ${hotfix_patch}."
-              git apply --directory=pixel-src "$hotfix_patch"
-            else
-              echo "Using upstream ${PIXEL_SOURCE_VERSION} source without custom patches or overlays."
-            fi
-            exit 0
-          fi
-          patch_file="patches/pixel-${PIXEL_SOURCE_VERSION}-subsite-forwarder.patch"
-          if [ -f "$patch_file" ]; then
-            git apply --directory=pixel-src "$patch_file"
-          elif [ "${PIXEL_SOURCE_VERSION}" = "upgrade/v0.1.121-merge" ]; then
-            echo "Using upstream ${PIXEL_SOURCE_VERSION} source as the forwarder base."
-          elif [ -d "overlays/${overlay_key}" ]; then
-            echo "Using upstream ${PIXEL_SOURCE_VERSION} with overlay ${overlay_key}."
-          else
-            echo "::error::Missing compatibility patch: ${patch_file}"
-            echo "Refusing to build an unpatched forwarder release."
+          test -f pixel-src/backend/cmd/server/VERSION
+          source_version="$(tr -d '\r\n' < pixel-src/backend/cmd/server/VERSION)"
+          if [ "${source_version}" != "${PIXEL_VERSION}" ]; then
+            echo "::error::Official source version ${source_version} does not match release version ${PIXEL_VERSION}."
             exit 1
           fi
-          for overlay_dir in "overlays/${overlay_key}" "overlays/upgrade_v0.1.121-merge"; do
-            if [ -d "$overlay_dir" ]; then
-              cp -a "${overlay_dir}/." pixel-src/
-            fi
-          done
-          if [ ! -f pixel-src/backend/internal/handler/subsite_forwarder.go ] ||
-             ! grep -q "SUBSITE_FORWARD_NO_CANDIDATE" pixel-src/backend/internal/handler/subsite_forwarder.go; then
-            echo "::error::Subsite Relay capability is missing after patch/overlay application."
-            echo "Refusing to publish an incomplete forwarder release."
-            exit 1
-          fi
+          echo "Using upstream ${PIXEL_SOURCE_REPO}@${PIXEL_SOURCE_VERSION} without custom patches or overlays."
 
       - name: Setup Node.js
         run: |
@@ -162,9 +104,10 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
+          source_commit="${PIXEL_SOURCE_VERSION:0:7}"
+          build_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
           for arch in amd64 arm64; do
             out="package-${arch}"
-            agent_out="subsite-agent-package-${arch}"
             mkdir -p "$out"
             echo "::group::Build server linux/${arch}"
             (
@@ -173,7 +116,7 @@ jobs:
                 -tags=embed \
                 -p=1 \
                 -trimpath \
-                -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.BuildType=release" \
+                -ldflags="-s -w -X main.Version=${PIXEL_VERSION} -X main.Commit=${source_commit} -X main.Date=${build_date} -X main.BuildType=release" \
                 -o "../../${out}/sub2api" \
                 ./cmd/server
             )
@@ -182,28 +125,6 @@ jobs:
             cp pixel-src/README.md "$out/README.md"
             cp pixel-src/LICENSE "$out/LICENSE"
             tar -C "$out" -czf "dist/sub2api_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
-
-            if [ -d pixel-src/backend/cmd/subsite-agent ]; then
-              mkdir -p "$agent_out/deploy"
-              echo "::group::Build subsite agent linux/${arch}"
-              (
-                cd pixel-src/backend
-                GOOS=linux GOARCH="$arch" CGO_ENABLED=0 go build \
-                  -p=1 \
-                  -trimpath \
-                  -ldflags="-s -w" \
-                  -o "../../${agent_out}/sub2api-subsite-agent" \
-                  ./cmd/subsite-agent
-              )
-              echo "::endgroup::"
-              cp pixel-src/deploy/sub2api-subsite-agent.service "$agent_out/deploy/sub2api-subsite-agent.service"
-              cp pixel-src/deploy/subsite-agent.env.example "$agent_out/deploy/subsite-agent.env.example"
-              cp pixel-src/README.md "$agent_out/README.md"
-              cp pixel-src/LICENSE "$agent_out/LICENSE"
-              tar -C "$agent_out" -czf "dist/sub2api-subsite-agent_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
-            else
-              echo "Skipping subsite agent linux/${arch}: pixel-src/backend/cmd/subsite-agent is not present in ${PIXEL_SOURCE_VERSION}."
-            fi
           done
           (
             cd dist
@@ -215,18 +136,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag_suffix="pixel"
           release_title="Pixel ${PIXEL_VERSION} official binaries"
-          release_note="without custom patches or overlays"
-          if [ "${RELEASE_FLAVOR}" = "forwarder" ]; then
-            tag_suffix="forwarder-pixel"
-            release_title="Pixel ${PIXEL_VERSION} Sub2API forwarder binaries"
-            release_note="with the subsite forwarder patch/overlay"
-          fi
-          tag="v${PIXEL_VERSION}-${tag_suffix}"
+          tag="v${PIXEL_VERSION}-pixel"
           body_file="$(mktemp)"
           cat > "$body_file" <<EOF
-          Prebuilt Sub2API-compatible binaries built from \`${PIXEL_SOURCE_REPO}\` source \`${PIXEL_SOURCE_VERSION}\` ${release_note}. Published as \`${PIXEL_VERSION}\`.
+          Prebuilt Sub2API-compatible binaries built from official \`${PIXEL_SOURCE_REPO}\` source \`${PIXEL_SOURCE_VERSION}\` without custom patches or overlays. Published as \`${PIXEL_VERSION}\`.
 
           Install:
           \`\`\`bash
