@@ -122,6 +122,7 @@ jobs:
             )
             echo "::endgroup::"
             cp -R pixel-src/deploy "$out/deploy"
+            rm -f "$out/deploy/.env.subsite.example"
             cp pixel-src/README.md "$out/README.md"
             cp pixel-src/LICENSE "$out/LICENSE"
             tar -C "$out" -czf "dist/sub2api_${PIXEL_VERSION}_linux_${arch}.tar.gz" .
