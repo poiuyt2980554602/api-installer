@@ -6,7 +6,7 @@ on:
       pixel_version:
         description: Release version to publish
         required: true
-        default: "1.2.29"
+        default: "1.2.31"
       pixel_source_repo:
         description: Upstream Pixel source repository
         required: true
@@ -14,7 +14,7 @@ on:
       pixel_source_version:
         description: Upstream Pixel source tag, branch, or commit
         required: true
-        default: "d768069b93b147982a7468993325f0441268eb9c"
+        default: "5b52d0dc542fad78c9eedec9010a6d4e8046d5ac"
       image_playground_url:
         description: Default image playground URL injected into the Pixel frontend
         required: true
@@ -30,9 +30,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     env:
-      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.2.29' }}
+      PIXEL_VERSION: ${{ github.event.inputs.pixel_version || '1.2.31' }}
       PIXEL_SOURCE_REPO: ${{ github.event.inputs.pixel_source_repo || 'PIXEL-API/PixelAPI' }}
-      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || 'd768069b93b147982a7468993325f0441268eb9c' }}
+      PIXEL_SOURCE_VERSION: ${{ github.event.inputs.pixel_source_version || '5b52d0dc542fad78c9eedec9010a6d4e8046d5ac' }}
       IMAGE_PLAYGROUND_URL: ${{ github.event.inputs.image_playground_url || 'https://tp.kelisiai.pro' }}
     steps:
       - name: Download installer repo
